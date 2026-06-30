@@ -2,21 +2,30 @@ import {
   Activity,
   Bell,
   CalendarDays,
+  Check,
+  Clock3,
   Coins,
+  Copy,
   Database,
   Download,
+  Eye,
+  EyeOff,
   Film,
   Gauge,
+  HardDrive,
   Lock,
   LogOut,
+  MessageSquare,
   Percent,
   RefreshCw,
   Search,
   Settings,
   ShieldCheck,
   SlidersHorizontal,
+  Star,
   Upload,
   UserRound,
+  Users,
   Wrench
 } from "lucide-react";
 import { FormEvent, ReactNode, useEffect, useMemo, useState } from "react";
@@ -278,28 +287,19 @@ function AuthForm(props: {
 
 function DashboardPage() {
   const { data, loading, reload } = useLoad<any>(() => api("/api/dashboard"), []);
-  const [query, setQuery] = useState("");
-  const [torrents, setTorrents] = useState<any[]>([]);
-  const [searching, setSearching] = useState(false);
-  const [searchError, setSearchError] = useState("");
   const [refreshingMTeam, setRefreshingMTeam] = useState(false);
   const [testingMTeam, setTestingMTeam] = useState(false);
   const [mteamStatusOverride, setMteamStatusOverride] = useState<{ success: boolean; message: string } | null>(null);
   const [dashboardError, setDashboardError] = useState("");
 
-  async function runMTeamSearch(event: FormEvent) {
-    event.preventDefault();
-    setSearching(true);
-    setSearchError("");
-    try {
-      const result = await api<{ items: any[] }>(`/api/search/mteam?q=${encodeURIComponent(query)}`);
-      setTorrents(result.items);
-    } catch (err) {
-      setSearchError((err as Error).message);
-    } finally {
-      setSearching(false);
-    }
-  }
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      reload()
+        .then(() => setDashboardError(""))
+        .catch((err) => setDashboardError((err as Error).message));
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   async function refreshDashboard() {
     if (refreshingMTeam) return;
@@ -352,18 +352,6 @@ function DashboardPage() {
       />
       {dashboardError && <p className="error">{dashboardError}</p>}
 
-      <Panel title="M-Team 站内查询">
-        <form className="searchbar" onSubmit={runMTeamSearch}>
-          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索电影、剧集、年份、制作组或关键词" />
-          <button className="primary" disabled={searching}><Search size={18} /> {searching ? "查询中..." : "查询"}</button>
-        </form>
-        {searchError && <p className="error">{searchError}</p>}
-        <div className="table-list">
-          {torrents.map((item) => <ResourceRow item={item} key={item.id} />)}
-          {!torrents.length && <p className="muted">输入关键词后可直接查询馒头站点资源。</p>}
-        </div>
-      </Panel>
-
       <Panel title="下载器">
         <div className="cards-row">
           {data.qbs.map((qb: any) => qb.locked ? <LockedCard key={qb.id} title={qb.name} message={qb.message} /> : <DownloaderCard key={qb.id} qb={qb} />)}
@@ -412,11 +400,11 @@ function MTeamSnapshotPanel({
       </div>
       <div className="mteam-stat-grid">
         <InfoTile icon={UserRound} label="用户等级" value={mteam.user_level ?? "User"} />
-        <InfoTile icon={Coins} label="积分" value={numberLabel(mteam.bonus)} delta={mteam.bonus_delta_label} />
+        <InfoTile icon={Coins} label="魔力值" value={numberLabel(mteam.bonus)} delta={mteam.bonus_delta_label} />
         <InfoTile icon={Percent} label="分享率" value={numberLabel(mteam.ratio, 3)} delta={mteam.ratio_delta_label} negative={String(mteam.ratio_delta_label ?? "").startsWith("-")} />
-        <InfoTile icon={Upload} label="总上传量" value={formatBytes(mteam.upload_total)} delta={mteam.upload_delta_label} />
+        <InfoTile icon={Upload} label="总上传量" value={formatBytesFixed(mteam.upload_total, 2)} delta={mteam.upload_delta_label} />
         <InfoTile icon={Download} label="总下载量" value={formatBytes(mteam.download_total)} delta={mteam.download_delta_label} />
-        <InfoTile icon={Activity} label="总做种数" value={String(mteam.seed_count ?? mteam.active_uploads ?? 0)} delta={mteam.seed_count_delta_label} />
+        <InfoTile icon={Activity} label="当前活跃上传/下载" value={<ActiveTransferCounts upload={mteam.active_uploads ?? 0} download={mteam.active_downloads ?? 0} />} />
         <InfoTile icon={Database} label="总做种体积" value={formatBytes(mteam.seed_size ?? 0)} delta={mteam.seed_size_delta_label} negative={String(mteam.seed_size_delta_label ?? "").startsWith("-")} />
         <InfoTile icon={CalendarDays} label="加入时间" value={mteam.joined_at ?? "-"} />
       </div>
@@ -437,7 +425,22 @@ function MTeamSnapshotPanel({
   );
 }
 
-function InfoTile({ icon: Icon, label, value, delta, negative }: { icon: typeof Film; label: string; value: string; delta?: string; negative?: boolean }) {
+function ActiveTransferCounts({ upload, download }: { upload: number; download: number }) {
+  return (
+    <span className="transfer-counts" aria-label={`活跃上传 ${upload}，活跃下载 ${download}`}>
+      <span className="transfer-count upload" title="活跃上传">
+        <Upload size={16} />
+        {upload}
+      </span>
+      <span className="transfer-count download" title="活跃下载">
+        <Download size={16} />
+        {download}
+      </span>
+    </span>
+  );
+}
+
+function InfoTile({ icon: Icon, label, value, delta, negative }: { icon: typeof Film; label: string; value: ReactNode; delta?: string; negative?: boolean }) {
   return (
     <div className="info-tile">
       <div>
@@ -452,6 +455,14 @@ function InfoTile({ icon: Icon, label, value, delta, negative }: { icon: typeof 
 
 function DiscoverPage() {
   const { data, error, loading } = useLoad<any>(() => api("/api/discover/lists"), []);
+  const [query, setQuery] = useState("");
+  const [media, setMedia] = useState<any[]>([]);
+  const [torrents, setTorrents] = useState<any[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState("");
+  const [hasSearched, setHasSearched] = useState(false);
+  const [resourceSort, setResourceSort] = useState("seeders");
+  const [resourceSortDirection, setResourceSortDirection] = useState<"asc" | "desc">("desc");
   const lists = data ? [
     { title: "流行趋势", items: data.trending },
     { title: "热门电影", items: data.popular_movies },
@@ -459,9 +470,49 @@ function DiscoverPage() {
     { title: "Top Rated 电影", items: data.top_rated_movies },
     { title: "Top Rated 剧集", items: data.top_rated_tv }
   ] : [];
+  const sortedTorrents = useMemo(() => sortResources(torrents, resourceSort, resourceSortDirection), [torrents, resourceSort, resourceSortDirection]);
+
+  async function runSearch(event: FormEvent) {
+    event.preventDefault();
+    const keyword = query.trim();
+    if (!keyword) return;
+    setSearching(true);
+    setSearchError("");
+    setHasSearched(true);
+    const [mediaResult, torrentResult] = await Promise.allSettled([
+      api<{ items: any[] }>(`/api/search/media?q=${encodeURIComponent(keyword)}`),
+      api<{ items: any[] }>(`/api/search/mteam?q=${encodeURIComponent(keyword)}`)
+    ]);
+    if (mediaResult.status === "fulfilled") setMedia(mediaResult.value.items);
+    else setMedia([]);
+    if (torrentResult.status === "fulfilled") setTorrents(torrentResult.value.items);
+    else setTorrents([]);
+    const errors = [mediaResult, torrentResult]
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => (result.reason as Error).message);
+    setSearchError(errors.join("\n"));
+    setSearching(false);
+  }
 
   return (
     <div className="grid-page">
+      <form className="searchbar" onSubmit={runSearch}>
+        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索电影、剧集、年份、制作组或关键词" />
+        <button className="primary" disabled={searching}><Search size={18} /> {searching ? "搜索中..." : "搜索"}</button>
+      </form>
+      {searchError && <p className="error">{searchError}</p>}
+      {hasSearched && (
+        <div className="discover-search-results">
+          <MediaSearchResults items={media} />
+          <MTeamResourceResults
+            items={sortedTorrents}
+            sortBy={resourceSort}
+            sortDirection={resourceSortDirection}
+            onSortBy={setResourceSort}
+            onSortDirection={setResourceSortDirection}
+          />
+        </div>
+      )}
       {loading && <Panel title="发现"><p>正在从 TMDB 加载片单...</p></Panel>}
       {error && <Panel title="TMDB 获取失败"><p className="error">{error}</p></Panel>}
       {data && !data.configured && <Panel title="需要配置 TMDB"><p>{data.message}</p><p className="muted">进入“设置”，在 TMDB 配置里填写 API Key 或 Bearer Token，保存并启用后再回到发现页。</p></Panel>}
@@ -503,6 +554,15 @@ function DownloadsPage() {
   const [downloader, setDownloader] = useState("qb1");
   const [grantOpen, setGrantOpen] = useState(false);
   const { data, error, reload } = useLoad<any>(() => api(`/api/qb/${downloader}/torrents`), [downloader]);
+  const { data: summary, error: summaryError, reload: reloadSummary } = useLoad<any>(() => api(`/api/qb/${downloader}/summary`), [downloader]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      reload().catch(() => undefined);
+      reloadSummary().catch(() => undefined);
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [downloader]);
 
   return (
     <div className="grid-page">
@@ -510,7 +570,10 @@ function DownloadsPage() {
         {["qb1", "qb2", "qb3"].map((id) => <button className={downloader === id ? "active" : ""} onClick={() => setDownloader(id)} key={id}>{id.toUpperCase()}</button>)}
       </div>
       {error && downloader === "qb2" && <Panel title="qB 2 已锁定"><p>私有下载器需要管理员验证。</p><button className="primary" onClick={() => setGrantOpen(true)}><Lock size={16} /> 验证管理员</button></Panel>}
+      {error && downloader !== "qb2" && <p className="error">{error}</p>}
       {grantOpen && <AdminGrant onDone={() => { setGrantOpen(false); reload(); }} />}
+      {summary && <Panel title={`${downloader.toUpperCase()} 实时状态`}><div className="cards-row"><DownloaderCard qb={summary} /></div></Panel>}
+      {summaryError && !error && <p className="error">{summaryError}</p>}
       {data && <Panel title={`${downloader.toUpperCase()} 任务`}><div className="table-list">{data.items.map((item: any) => <TorrentRow item={item} downloader={downloader} key={item.hash} />)}</div></Panel>}
     </div>
   );
@@ -550,7 +613,7 @@ function SettingsPage() {
   return (
     <div className="grid-page">
       <Panel title="运行时凭据中心">
-        <p className="muted">凭据由后端加密保存，保存后前端只会看到脱敏摘要。</p>
+        <p className="muted">凭据由后端加密保存；保存过的 API、账号、密码和路径会直接回填在输入框里，可显示或复制。</p>
       </Panel>
       {data.providers.map((provider: any) => <IntegrationEditor provider={provider} onChanged={reload} key={provider.provider} />)}
     </div>
@@ -566,7 +629,7 @@ function IntegrationEditor({ provider, onChanged }: { provider: any; onChanged: 
     ai: "AI",
     wechat_claw: "微信爪爪"
   };
-  const [text, setText] = useState("");
+  const [text, setText] = useState(String(provider.saved_payload?.endpoint ?? ""));
   const payload = useMemo(() => ({ endpoint: text || "mock://service", timeout: 10 }), [text]);
 
   async function save(path = "") {
@@ -583,13 +646,12 @@ function IntegrationEditor({ provider, onChanged }: { provider: any; onChanged: 
   return (
     <Panel title={`${providerNames[provider.provider] ?? provider.provider} 配置`}>
       <div className="integration">
-        <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder="粘贴接口地址、请求头、密钥或 webhook 配置" />
+        <CopyableTextarea value={text} onChange={setText} placeholder="粘贴接口地址、请求头、密钥或 webhook 配置" />
         <div className="actions">
           <button onClick={draft}>保存草稿</button>
           <button onClick={() => save("/test")}>保存并测试</button>
           <button onClick={() => save(provider.enabled ? "/disable" : "/enable")}>{provider.enabled ? "停用" : "启用"}</button>
         </div>
-        <RedactedSummary provider={provider} />
       </div>
     </Panel>
   );
@@ -597,17 +659,19 @@ function IntegrationEditor({ provider, onChanged }: { provider: any; onChanged: 
 
 function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
   const label = provider.provider.toUpperCase();
+  const saved = provider.saved_payload ?? {};
+  const savedMapping = Array.isArray(saved.path_mappings) ? saved.path_mappings[0] ?? {} : {};
   const [form, setForm] = useState<QbForm>({
-    name: label,
-    base_url: "",
-    username: "",
-    password: "",
-    timeout: "10",
-    default_save_path: "",
-    category: "",
-    tags: "",
-    path_from: "",
-    path_to: ""
+    name: String(saved.name ?? label),
+    base_url: String(saved.base_url ?? ""),
+    username: String(saved.username ?? ""),
+    password: String(saved.password ?? ""),
+    timeout: String(saved.timeout ?? "10"),
+    default_save_path: String(saved.default_save_path ?? ""),
+    category: String(saved.category ?? ""),
+    tags: Array.isArray(saved.tags) ? saved.tags.join(",") : String(saved.tags ?? ""),
+    path_from: String(savedMapping.from ?? ""),
+    path_to: String(savedMapping.to ?? "")
   });
   const [busy, setBusy] = useState("");
   const [localError, setLocalError] = useState("");
@@ -693,34 +757,34 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
         </div>
         <div className="settings-grid">
           <label>显示名称
-            <input value={form.name} onChange={(event) => updateField("name", event.target.value)} placeholder="例如 主下载器 / 动漫下载器" />
+            <CopyableInput value={form.name} onChange={(value) => updateField("name", value)} placeholder="例如 主下载器 / 动漫下载器" />
           </label>
           <label>qB WebUI 地址（必填）
-            <input value={form.base_url} onChange={(event) => updateField("base_url", event.target.value)} placeholder="例如 http://192.168.1.20:8080" />
+            <CopyableInput value={form.base_url} onChange={(value) => updateField("base_url", value)} placeholder="例如 http://192.168.1.20:8080" />
           </label>
           <label>用户名（必填）
-            <input value={form.username} onChange={(event) => updateField("username", event.target.value)} placeholder="qB WebUI 用户名" autoComplete="off" />
+            <CopyableInput value={form.username} onChange={(value) => updateField("username", value)} placeholder="qB WebUI 用户名" autoComplete="off" />
           </label>
           <label>密码（必填）
-            <input type="password" value={form.password} onChange={(event) => updateField("password", event.target.value)} placeholder="qB WebUI 密码" autoComplete="new-password" />
+            <SecretInput value={form.password} onChange={(value) => updateField("password", value)} placeholder="qB WebUI 密码" autoComplete="new-password" />
           </label>
           <label>超时时间（秒）
-            <input value={form.timeout} onChange={(event) => updateField("timeout", event.target.value)} inputMode="numeric" placeholder="10" />
+            <CopyableInput value={form.timeout} onChange={(value) => updateField("timeout", value)} inputMode="numeric" placeholder="10" />
           </label>
           <label>默认保存路径（可选）
-            <input value={form.default_save_path} onChange={(event) => updateField("default_save_path", event.target.value)} placeholder="例如 /downloads/media 或 D:\\Downloads" />
+            <CopyableInput value={form.default_save_path} onChange={(value) => updateField("default_save_path", value)} placeholder="例如 /downloads/media 或 D:\\Downloads" />
           </label>
           <label>默认分类（可选）
-            <input value={form.category} onChange={(event) => updateField("category", event.target.value)} placeholder="例如 movie / tv / anime" />
+            <CopyableInput value={form.category} onChange={(value) => updateField("category", value)} placeholder="例如 movie / tv / anime" />
           </label>
           <label>默认标签（可选，逗号分隔）
-            <input value={form.tags} onChange={(event) => updateField("tags", event.target.value)} placeholder="例如 pt-media-hub,mteam" />
+            <CopyableInput value={form.tags} onChange={(value) => updateField("tags", value)} placeholder="例如 pt-media-hub,mteam" />
           </label>
           <label>下载器路径前缀（可选）
-            <input value={form.path_from} onChange={(event) => updateField("path_from", event.target.value)} placeholder="例如 /downloads" />
+            <CopyableInput value={form.path_from} onChange={(value) => updateField("path_from", value)} placeholder="例如 /downloads" />
           </label>
           <label>本机/NAS 路径前缀（可选）
-            <input value={form.path_to} onChange={(event) => updateField("path_to", event.target.value)} placeholder="例如 Z:\\downloads 或 /volume1/downloads" />
+            <CopyableInput value={form.path_to} onChange={(value) => updateField("path_to", value)} placeholder="例如 Z:\\downloads 或 /volume1/downloads" />
           </label>
         </div>
         <div className="field-help">
@@ -735,21 +799,22 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
         {!provider.enabled && !canEnable && <p className="muted">请先“保存并测试”，测试成功后再启用这个 qB 下载器。</p>}
         {localError && <p className="error">{localError}</p>}
         <TestResultCard result={result} emptyProvider={label} />
-        <RedactedSummary provider={provider} />
       </div>
     </Panel>
   );
 }
 
 function MTeamIntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
+  const saved = provider.saved_payload ?? {};
+  const savedHeaders = saved.headers ?? {};
   const [form, setForm] = useState<MTeamForm>({
-    base_url: "https://kp.m-team.cc",
-    api_key: "",
-    cookie: "",
-    user_agent: "PT-Media-Hub",
-    authorization: "",
-    passkey: "",
-    timeout: "10"
+    base_url: String(saved.base_url ?? "https://kp.m-team.cc"),
+    api_key: String(saved.api_key ?? ""),
+    cookie: String(savedHeaders.Cookie ?? ""),
+    user_agent: String(savedHeaders["User-Agent"] ?? "PT-Media-Hub"),
+    authorization: String(savedHeaders.Authorization ?? ""),
+    passkey: String(saved.passkey ?? ""),
+    timeout: String(saved.timeout ?? "10")
   });
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [busy, setBusy] = useState("");
@@ -786,7 +851,7 @@ function MTeamIntegrationEditor({ provider, onChanged }: { provider: any; onChan
         provider: "mteam",
         mode: "mock",
         message: "草稿已保存。",
-        explanation: "M-Team 凭据已经加密保存到后端，页面只显示脱敏摘要。",
+        explanation: "M-Team 凭据已经加密保存到后端，并会回填到当前输入框。",
         next_step: "点击“保存并测试”确认站点链接状态。"
       });
       onChanged();
@@ -829,26 +894,26 @@ function MTeamIntegrationEditor({ provider, onChanged }: { provider: any; onChan
       <div className="integration tmdb-editor">
         <div className="notice info">
           <strong>用来读取馒头站点的用户数据与资源查询</strong>
-          <span>真实 API 需要 M-Team API Key；Cookie 和 Passkey 只作为兼容字段保存。敏感字段保存后只显示脱敏摘要。</span>
+          <span>真实 API 需要 M-Team API Key；Cookie 和 Passkey 只作为兼容字段保存。敏感字段默认用星号遮住，可点眼睛查看。</span>
         </div>
         <div className="settings-grid">
           <label>站点地址
-            <input value={form.base_url} onChange={(event) => updateField("base_url", event.target.value)} placeholder="https://kp.m-team.cc" />
+            <CopyableInput value={form.base_url} onChange={(value) => updateField("base_url", value)} placeholder="https://kp.m-team.cc" />
           </label>
           <label>API Key
-            <input value={form.api_key} onChange={(event) => updateField("api_key", event.target.value)} placeholder="从 M-Team 个人资料复制 API Key" autoComplete="off" />
+            <SecretInput value={form.api_key} onChange={(value) => updateField("api_key", value)} placeholder="从 M-Team 个人资料复制 API Key" autoComplete="off" />
           </label>
           <label>User-Agent
-            <input value={form.user_agent} onChange={(event) => updateField("user_agent", event.target.value)} placeholder="浏览器或 PT-Media-Hub" />
+            <CopyableInput value={form.user_agent} onChange={(value) => updateField("user_agent", value)} placeholder="浏览器或 PT-Media-Hub" />
           </label>
           <label>Cookie
-            <input value={form.cookie} onChange={(event) => updateField("cookie", event.target.value)} placeholder="从浏览器复制完整 Cookie" autoComplete="off" />
+            <SecretInput value={form.cookie} onChange={(value) => updateField("cookie", value)} placeholder="从浏览器复制完整 Cookie" autoComplete="off" />
           </label>
           <label>Passkey
-            <input value={form.passkey} onChange={(event) => updateField("passkey", event.target.value)} placeholder="可选，下载链接使用；不是 API Key" autoComplete="off" />
+            <SecretInput value={form.passkey} onChange={(value) => updateField("passkey", value)} placeholder="可选，下载链接使用；不是 API Key" autoComplete="off" />
           </label>
           <label>超时时间（秒）
-            <input value={form.timeout} onChange={(event) => updateField("timeout", event.target.value)} inputMode="numeric" placeholder="10" />
+            <CopyableInput value={form.timeout} onChange={(value) => updateField("timeout", value)} inputMode="numeric" placeholder="10" />
           </label>
         </div>
         <button className="inline-tool" type="button" onClick={() => setShowAdvanced((value) => !value)}>
@@ -856,7 +921,7 @@ function MTeamIntegrationEditor({ provider, onChanged }: { provider: any; onChan
         </button>
         {showAdvanced && (
           <label>Authorization
-            <input value={form.authorization} onChange={(event) => updateField("authorization", event.target.value)} placeholder="可选，例如 Bearer token" autoComplete="off" />
+            <SecretInput value={form.authorization} onChange={(value) => updateField("authorization", value)} placeholder="可选，例如 Bearer token" autoComplete="off" />
           </label>
         )}
         <div className="actions">
@@ -867,20 +932,20 @@ function MTeamIntegrationEditor({ provider, onChanged }: { provider: any; onChan
         {!provider.enabled && !canEnable && <p className="muted">请先“保存并测试”，测试成功后再启用 M-Team。</p>}
         {localError && <p className="error">{localError}</p>}
         <TestResultCard result={result} emptyProvider="M-Team" />
-        <RedactedSummary provider={provider} />
       </div>
     </Panel>
   );
 }
 
 function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
+  const saved = provider.saved_payload ?? {};
   const [form, setForm] = useState<TmdbForm>({
-    api_key: "",
-    bearer_token: "",
-    language: "zh-CN",
-    region: "CN",
-    timeout: "12",
-    endpoint: ""
+    api_key: String(saved.api_key ?? ""),
+    bearer_token: String(saved.bearer_token ?? ""),
+    language: String(saved.language ?? "zh-CN"),
+    region: String(saved.region ?? "CN"),
+    timeout: String(saved.timeout ?? "12"),
+    endpoint: String(saved.endpoint ?? "")
   });
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [busy, setBusy] = useState("");
@@ -915,7 +980,7 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
         mode: "real",
         can_enable: false,
         message: "草稿已保存。",
-        explanation: "密钥已经加密保存到后端，页面不会再显示完整密钥。",
+        explanation: "密钥已经加密保存到后端，并会回填到当前输入框。",
         next_step: "如果你还没有测试，请点击“保存并测试”。测试成功后再启用 TMDB。"
       });
       onChanged();
@@ -958,23 +1023,23 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
       <div className="integration tmdb-editor">
         <div className="notice info">
           <strong>用来获取“发现”页的真实影视片单</strong>
-          <span>API Key 和 Bearer Token 填其中一个即可；两个都填时会优先使用 Bearer Token。密钥保存后只显示脱敏摘要。</span>
+          <span>API Key 和 Bearer Token 填其中一个即可；两个都填时会优先使用 Bearer Token。密钥默认用星号遮住，可点眼睛查看。</span>
         </div>
         <div className="settings-grid">
           <label>API Key
-            <input value={form.api_key} onChange={(event) => updateField("api_key", event.target.value)} placeholder="例如 32 位左右的 TMDB API Key" autoComplete="off" />
+            <SecretInput value={form.api_key} onChange={(value) => updateField("api_key", value)} placeholder="例如 32 位左右的 TMDB API Key" autoComplete="off" />
           </label>
           <label>Bearer Token
-            <input value={form.bearer_token} onChange={(event) => updateField("bearer_token", event.target.value)} placeholder="以 eyJ 开头的一长串访问令牌" autoComplete="off" />
+            <SecretInput value={form.bearer_token} onChange={(value) => updateField("bearer_token", value)} placeholder="以 eyJ 开头的一长串访问令牌" autoComplete="off" />
           </label>
           <label>语言
-            <input value={form.language} onChange={(event) => updateField("language", event.target.value)} placeholder="zh-CN" />
+            <CopyableInput value={form.language} onChange={(value) => updateField("language", value)} placeholder="zh-CN" />
           </label>
           <label>地区
-            <input value={form.region} onChange={(event) => updateField("region", event.target.value)} placeholder="CN" />
+            <CopyableInput value={form.region} onChange={(value) => updateField("region", value)} placeholder="CN" />
           </label>
           <label>超时时间（秒）
-            <input value={form.timeout} onChange={(event) => updateField("timeout", event.target.value)} inputMode="numeric" placeholder="12" />
+            <CopyableInput value={form.timeout} onChange={(value) => updateField("timeout", value)} inputMode="numeric" placeholder="12" />
           </label>
         </div>
         {form.api_key.trim() && form.bearer_token.trim() && <p className="muted">已同时填写 API Key 和 Bearer Token，测试和发现页会优先使用 Bearer Token。</p>}
@@ -983,7 +1048,7 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
         </button>
         {showAdvanced && (
           <label>TMDB 接口地址
-            <input value={form.endpoint} onChange={(event) => updateField("endpoint", event.target.value)} placeholder="默认 https://api.themoviedb.org/3，通常不用修改" />
+            <CopyableInput value={form.endpoint} onChange={(value) => updateField("endpoint", value)} placeholder="默认 https://api.themoviedb.org/3，通常不用修改" />
           </label>
         )}
         <div className="actions">
@@ -994,7 +1059,6 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
         {!provider.enabled && !canEnable && <p className="muted">请先“保存并测试”，测试成功后才能启用 TMDB。</p>}
         {localError && <p className="error">{localError}</p>}
         <TestResultCard result={result} emptyProvider="TMDB" />
-        <RedactedSummary provider={provider} />
       </div>
     </Panel>
   );
@@ -1021,14 +1085,92 @@ function TestResultCard({ result, emptyProvider }: { result?: IntegrationTestRes
   );
 }
 
-function RedactedSummary({ provider }: { provider: any }) {
-  if (Object.keys(provider.redacted_summary ?? {}).length === 0) return null;
+function CopyableInput(props: {
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  inputMode?: "text" | "numeric" | "decimal" | "tel" | "search" | "email" | "url";
+  autoComplete?: string;
+}) {
   return (
-    <div className="redacted-summary">
-      <strong>已保存的信息</strong>
-      <pre>{JSON.stringify(provider.redacted_summary, null, 2)}</pre>
+    <div className="input-with-tools">
+      <input value={props.value} onChange={(event) => props.onChange(event.target.value)} placeholder={props.placeholder} inputMode={props.inputMode} autoComplete={props.autoComplete} />
+      <div className="input-tools">
+        <CopyButton text={props.value} label="复制" iconOnly />
+      </div>
     </div>
   );
+}
+
+function SecretInput(props: {
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  autoComplete?: string;
+}) {
+  const [visible, setVisible] = useState(false);
+  const displayed = visible || !props.value ? props.value : "*".repeat(Math.min(Math.max(props.value.length, 8), 48));
+  return (
+    <div className="input-with-tools sensitive">
+      <input
+        value={displayed}
+        onChange={(event) => props.onChange(event.target.value)}
+        placeholder={props.placeholder}
+        autoComplete={props.autoComplete}
+        readOnly={!visible && Boolean(props.value)}
+      />
+      <div className="input-tools">
+        <button className="icon-tool" type="button" onClick={() => setVisible((current) => !current)} title={visible ? "隐藏明文" : "显示明文"} aria-label={visible ? "隐藏明文" : "显示明文"}>
+          {visible ? <EyeOff size={15} /> : <Eye size={15} />}
+        </button>
+        <CopyButton text={props.value} label="复制" iconOnly />
+      </div>
+    </div>
+  );
+}
+
+function CopyableTextarea({ value, onChange, placeholder }: { value: string; onChange: (value: string) => void; placeholder?: string }) {
+  return (
+    <div className="input-with-tools textarea-tools">
+      <textarea value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} />
+      <div className="input-tools">
+        <CopyButton text={value} label="复制" iconOnly />
+      </div>
+    </div>
+  );
+}
+
+function CopyButton({ text, label, compact = false, iconOnly = false }: { text: string; label: string; compact?: boolean; iconOnly?: boolean }) {
+  const [copied, setCopied] = useState(false);
+
+  async function copy() {
+    await copyToClipboard(text);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1200);
+  }
+
+  return (
+    <button className={iconOnly ? "copy-button icon-only" : compact ? "copy-button compact" : "copy-button"} type="button" onClick={copy} title={copied ? "已复制" : label} aria-label={copied ? "已复制" : label}>
+      {copied ? <Check size={15} /> : <Copy size={15} />}
+      {!iconOnly && <span>{copied ? "已复制" : label}</span>}
+    </button>
+  );
+}
+
+async function copyToClipboard(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  document.body.removeChild(textarea);
 }
 
 function DiagnosticsPage() {
@@ -1053,11 +1195,160 @@ function Metric({ title, value, source }: { title: string; value: string; source
 }
 
 function DownloaderCard({ qb }: { qb: any }) {
-  return <div className="data-card"><h3>{qb.name}</h3><p>下载 {formatSpeed(qb.download_speed)}</p><p>上传 {formatSpeed(qb.upload_speed)}</p><small>{qb.source}</small></div>;
+  return (
+    <div className="data-card">
+      <h3>{qb.name}</h3>
+      <div className="downloader-live-row">
+        <span>活跃资源</span>
+        <ActiveTransferCounts upload={qb.active_uploads ?? 0} download={qb.active_downloads ?? 0} />
+      </div>
+      <p>下载 {formatSpeed(qb.download_speed)}</p>
+      <p>上传 {formatSpeed(qb.upload_speed)}</p>
+      <small>{qb.source}</small>
+    </div>
+  );
 }
 
 function LockedCard({ title, message }: { title: string; message: string }) {
   return <div className="data-card locked"><Lock size={20} /><h3>{title}</h3><p>{message}</p></div>;
+}
+
+function MediaSearchResults({ items = [] }: { items: any[] }) {
+  return (
+    <Panel title="TMDB 媒体结果">
+      <div className="media-result-grid">
+        {items.map((item) => <MediaResultCard item={item} key={item.id} />)}
+        {!items.length && <p className="muted">没有搜索到 TMDB 媒体，或 TMDB 尚未启用。</p>}
+      </div>
+    </Panel>
+  );
+}
+
+function MediaResultCard({ item }: { item: any }) {
+  const cast = (item.cast ?? []).slice(0, 5).join(" / ");
+  const genres = (item.genres ?? []).slice(0, 4);
+  const meta = [
+    item.media_type === "tv" ? "剧集" : "电影",
+    item.year,
+    item.runtime ? `${item.runtime} 分钟` : "",
+    item.original_language ? String(item.original_language).toUpperCase() : ""
+  ].filter(Boolean).join(" / ");
+
+  return (
+    <article className="media-result-card">
+      {item.backdrop && <img className="media-backdrop" src={item.backdrop} alt="" />}
+      <div className="media-card-shade" />
+      <img className="media-poster" src={item.poster} alt="" />
+      <div className="media-card-body">
+        <div className="media-card-heading">
+          <div>
+            <h3>{item.title}</h3>
+            <span>{item.original_title && item.original_title !== item.title ? item.original_title : meta}</span>
+          </div>
+          <span className="rating-badge"><Star size={15} /> {numberLabel(item.rating ?? 0, 1)}</span>
+        </div>
+        <div className="media-meta-row">
+          <InfoPill icon={Film} text={meta} />
+          <InfoPill icon={Users} text={`${item.vote_count ?? 0} 票`} />
+          {item.popularity ? <InfoPill icon={Activity} text={`热度 ${item.popularity}`} /> : null}
+        </div>
+        {genres.length > 0 && <div className="chip-row">{genres.map((genre: string) => <span className="soft-chip" key={genre}>{genre}</span>)}</div>}
+        <p className="media-overview">{item.overview || "暂无简介。"}</p>
+        <div className="media-credit-grid">
+          <span><strong>导演</strong>{item.director || "-"}</span>
+          <span><strong>主演</strong>{cast || "-"}</span>
+          {item.release_date && <span><strong>上映</strong>{item.release_date}</span>}
+          {item.imdb_id && <span><strong>IMDb</strong>{item.imdb_id}</span>}
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function MTeamResourceResults({
+  items = [],
+  sortBy,
+  sortDirection,
+  onSortBy,
+  onSortDirection
+}: {
+  items: any[];
+  sortBy: string;
+  sortDirection: "asc" | "desc";
+  onSortBy: (value: string) => void;
+  onSortDirection: (value: "asc" | "desc") => void;
+}) {
+  return (
+    <section className="panel">
+      <div className="resource-panel-header">
+        <h2>M-Team 资源结果</h2>
+        <div className="resource-sort-tools">
+          <label>
+            <span>排序</span>
+            <select value={sortBy} onChange={(event) => onSortBy(event.target.value)}>
+              <option value="seeders">做种</option>
+              <option value="downloads">下载</option>
+              <option value="size_bytes">体积</option>
+            </select>
+          </label>
+          <div className="segmented compact">
+            <button className={sortDirection === "desc" ? "active" : ""} type="button" onClick={() => onSortDirection("desc")}>降序</button>
+            <button className={sortDirection === "asc" ? "active" : ""} type="button" onClick={() => onSortDirection("asc")}>升序</button>
+          </div>
+        </div>
+      </div>
+      <div className="mteam-resource-list">
+        {items.map((item) => <MTeamResourceCard item={item} key={item.id} />)}
+        {!items.length && <p className="muted">没有搜索到 M-Team 资源，或 M-Team 尚未启用。</p>}
+      </div>
+    </section>
+  );
+}
+
+function MTeamResourceCard({ item }: { item: any }) {
+  async function download() {
+    await api("/api/qb/qb1/torrents", { method: "POST", body: JSON.stringify({ payload: item }) });
+    alert("已提交到 qB 1。");
+  }
+
+  return (
+    <article className="mteam-resource-card">
+      <div className="resource-main">
+        <div className="resource-title-line">
+          <strong>{item.title}</strong>
+          {item.promotion_label && <span className="free-chip" title={promotionTitle(item)}>{item.promotion_label}</span>}
+        </div>
+        <div className="chip-row">
+          {(item.labels ?? []).map((label: string) => <span className="resource-chip" key={label}>{label}</span>)}
+          {item.resolution && item.resolution !== "-" && <span className="resource-chip">{item.resolution}</span>}
+          {item.codec && item.codec !== "-" && <span className="resource-chip">{item.codec}</span>}
+          {item.audio_codec && <span className="resource-chip">{item.audio_codec}</span>}
+          {item.hdr && <span className="resource-chip">{item.hdr}</span>}
+        </div>
+        {item.subtitle && <p className="resource-subtitle">{item.subtitle}</p>}
+        <div className="resource-meta-grid">
+          <InfoPill icon={HardDrive} text={item.size || "-"} tone="size" />
+          <InfoPill icon={Upload} text={`做种 ${item.seeders ?? 0}`} tone="seed" />
+          <InfoPill icon={Download} text={`下载 ${item.downloads ?? 0}`} tone="down" />
+          <InfoPill icon={Users} text={`完成 ${item.completed ?? 0}`} />
+          <InfoPill icon={MessageSquare} text={`评论 ${item.comments ?? 0}`} />
+          <InfoPill icon={Clock3} text={formatDateLabel(item.published_at)} />
+        </div>
+      </div>
+      <aside className="resource-side">
+        <div className="score-stack">
+          {item.douban_rating && <span className="score-badge douban">豆 {item.douban_rating}</span>}
+          {item.imdb_rating && <span className="score-badge imdb">IMDb {item.imdb_rating}</span>}
+        </div>
+        {item.group && <span className="resource-group">{item.group}</span>}
+        <button onClick={download}>下载到 qB 1</button>
+      </aside>
+    </article>
+  );
+}
+
+function InfoPill({ icon: Icon, text, tone }: { icon: typeof Film; text: string; tone?: "up" | "down" | "size" | "seed" }) {
+  return <span className={tone ? `info-pill ${tone}` : "info-pill"}><Icon size={14} />{text}</span>;
 }
 
 function PosterRail({ title, items = [] }: { title: string; items: any[] }) {
@@ -1067,7 +1358,7 @@ function PosterRail({ title, items = [] }: { title: string; items: any[] }) {
 function ResourceRow({ item }: { item: any }) {
   async function download() {
     await api("/api/qb/qb1/torrents", { method: "POST", body: JSON.stringify({ payload: item }) });
-    alert("已提交到 qB 1 Mock 适配器。");
+    alert("已提交到 qB 1。");
   }
 
   return <div className="row"><strong>{item.title}</strong><span>{item.resolution} / {item.codec} / {item.size} / 做种 {item.seeders}</span><button onClick={download}>下载到 qB 1</button></div>;
@@ -1076,7 +1367,7 @@ function ResourceRow({ item }: { item: any }) {
 function TorrentRow({ item, downloader }: { item: any; downloader: string }) {
   async function mutate(action: string) {
     await api(`/api/qb/${downloader}/torrents/${item.hash}/${action}`, { method: "POST", body: JSON.stringify({ payload: {} }) });
-    alert(`${action} 已被 Mock 适配器接受。`);
+    alert(`${action} 已提交到 qB。`);
   }
 
   return <div className="row"><strong>{item.name}</strong><span>{Math.round(item.progress * 100)}% / {formatSpeed(item.download_speed)} / {item.state}</span><div className="actions"><button onClick={() => mutate("pause")}>暂停</button><button onClick={() => mutate("resume")}>继续</button><button onClick={() => mutate("tags")}>打标签</button></div></div>;
@@ -1085,6 +1376,40 @@ function TorrentRow({ item, downloader }: { item: any; downloader: string }) {
 function numberLabel(value: number, digits = 0): string {
   if (typeof value !== "number" || Number.isNaN(value)) return "-";
   return value.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+
+function formatBytesFixed(value: number, digits: number): string {
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  let current = Number(value || 0);
+  for (const unit of units) {
+    if (current < 1024 || unit === units[units.length - 1]) return `${current.toFixed(digits)} ${unit}`;
+    current /= 1024;
+  }
+  return `${current.toFixed(digits)} PB`;
+}
+
+function formatDateLabel(value: string): string {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value).slice(0, 10);
+  return date.toLocaleString(undefined, { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
+function sortResources(items: any[], sortBy: string, direction: "asc" | "desc"): any[] {
+  const multiplier = direction === "asc" ? 1 : -1;
+  return [...items].sort((left, right) => {
+    const a = Number(left?.[sortBy] ?? 0);
+    const b = Number(right?.[sortBy] ?? 0);
+    if (a === b) return String(left.title ?? "").localeCompare(String(right.title ?? ""));
+    return (a - b) * multiplier;
+  });
+}
+
+function promotionTitle(item: any): string {
+  const parts = [];
+  if (item.promotion_until) parts.push(`截止：${formatDateLabel(item.promotion_until)}`);
+  if (item.discount) parts.push(`原始枚举：${item.discount}`);
+  return parts.join(" / ") || "促销";
 }
 
 const pages: Record<NavKey, (props: { user: User }) => ReactNode> = {

@@ -1,5 +1,6 @@
 .env
 .agents/
+.npm-cache/
 data/
 backend/data/
 backend/.pytest_cache/
