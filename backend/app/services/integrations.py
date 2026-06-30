@@ -20,6 +20,31 @@ def normalize_payload(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
         kv_headers = normalized.pop("headers", {}) or {}
         parsed = parse_raw_headers(raw_headers)
         normalized["headers"] = {**kv_headers, **parsed}
+        for key in ["base_url", "api_base_url", "api_key", "passkey"]:
+            if key in normalized and isinstance(normalized[key], str):
+                normalized[key] = normalized[key].strip()
+        if not normalized.get("base_url"):
+            normalized["base_url"] = "https://kp.m-team.cc"
+        if not normalized.get("timeout"):
+            normalized["timeout"] = 10
+        normalized = {key: value for key, value in normalized.items() if value not in ("", None, {})}
+    if provider in {"qb1", "qb2", "qb3"}:
+        for key in ["name", "base_url", "username", "password", "default_save_path", "category", "path_from", "path_to"]:
+            if key in normalized and isinstance(normalized[key], str):
+                normalized[key] = normalized[key].strip()
+        if not normalized.get("timeout"):
+            normalized["timeout"] = 10
+        tags = normalized.get("tags")
+        if isinstance(tags, str):
+            normalized["tags"] = [item.strip() for item in tags.split(",") if item.strip()]
+        path_mappings = normalized.get("path_mappings") or []
+        if isinstance(path_mappings, list):
+            normalized["path_mappings"] = [
+                {"from": str(item.get("from") or "").strip(), "to": str(item.get("to") or "").strip()}
+                for item in path_mappings
+                if isinstance(item, dict) and (item.get("from") or item.get("to"))
+            ]
+        normalized = {key: value for key, value in normalized.items() if value not in ("", None, [], {})}
     if provider == "tmdb":
         raw_settings = normalized.pop("raw_settings", "")
         if raw_settings:
@@ -69,6 +94,22 @@ def upsert_config(
             for key in ("api_key", "bearer_token"):
                 if key not in normalized and previous.get(key):
                     normalized[key] = previous[key]
+        if provider == "mteam" and row.encrypted_payload:
+            previous = json.loads(decrypt_text(row.encrypted_payload))
+            previous_headers = previous.get("headers", {})
+            current_headers = normalized.get("headers", {})
+            for key in ("Cookie", "Authorization", "User-Agent"):
+                if key not in current_headers and previous_headers.get(key):
+                    current_headers[key] = previous_headers[key]
+            if current_headers:
+                normalized["headers"] = current_headers
+            for key in ("api_key", "passkey"):
+                if key not in normalized and previous.get(key):
+                    normalized[key] = previous[key]
+        if provider in {"qb1", "qb2", "qb3"} and row.encrypted_payload:
+            previous = json.loads(decrypt_text(row.encrypted_payload))
+            if "password" not in normalized and previous.get("password"):
+                normalized["password"] = previous["password"]
     row.encrypted_payload = encrypt_text(json.dumps(normalized, ensure_ascii=True))
     row.redacted_summary = redact_payload(normalized)
     row.last_tested_at = None

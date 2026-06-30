@@ -1,4 +1,3 @@
-from app.adapters.mock import MockTrackerAdapter
+from app.adapters.mteam.client import MTeamAdapter, MTeamApiError, MTeamConfigError
 
-__all__ = ["MockTrackerAdapter"]
-
+__all__ = ["MTeamAdapter", "MTeamApiError", "MTeamConfigError"]

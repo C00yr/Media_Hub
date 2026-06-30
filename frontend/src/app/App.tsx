@@ -1,15 +1,22 @@
 import {
   Activity,
   Bell,
+  CalendarDays,
+  Coins,
+  Database,
   Download,
   Film,
   Gauge,
   Lock,
   LogOut,
+  Percent,
+  RefreshCw,
   Search,
   Settings,
   ShieldCheck,
   SlidersHorizontal,
+  Upload,
+  UserRound,
   Wrench
 } from "lucide-react";
 import { FormEvent, ReactNode, useEffect, useMemo, useState } from "react";
@@ -17,14 +24,7 @@ import { api, formatBytes, formatSpeed, getToken, setToken } from "../api/client
 
 type User = { username: string; role: string };
 type NavKey = "discover" | "search" | "dashboard" | "downloads" | "stats" | "notifications" | "settings" | "diagnostics";
-type TmdbForm = {
-  api_key: string;
-  bearer_token: string;
-  language: string;
-  region: string;
-  timeout: string;
-  endpoint: string;
-};
+
 type IntegrationTestResult = {
   success?: boolean;
   provider?: string;
@@ -36,6 +36,38 @@ type IntegrationTestResult = {
   http_status?: number | null;
   can_enable?: boolean;
   trace_id?: string;
+};
+
+type TmdbForm = {
+  api_key: string;
+  bearer_token: string;
+  language: string;
+  region: string;
+  timeout: string;
+  endpoint: string;
+};
+
+type MTeamForm = {
+  base_url: string;
+  api_key: string;
+  cookie: string;
+  user_agent: string;
+  authorization: string;
+  passkey: string;
+  timeout: string;
+};
+
+type QbForm = {
+  name: string;
+  base_url: string;
+  username: string;
+  password: string;
+  timeout: string;
+  default_save_path: string;
+  category: string;
+  tags: string;
+  path_from: string;
+  path_to: string;
 };
 
 const navItems: { key: NavKey; label: string; icon: typeof Film; admin?: boolean }[] = [
@@ -64,18 +96,37 @@ function useLoad<T>(loader: () => Promise<T>, deps: unknown[]) {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+
   useEffect(() => {
     let alive = true;
     setLoading(true);
+    setError("");
     loader()
       .then((value) => alive && setData(value))
-      .catch((err) => alive && setError(err.message))
+      .catch((err) => alive && setError((err as Error).message))
       .finally(() => alive && setLoading(false));
     return () => {
       alive = false;
     };
   }, deps);
-  return { data, error, loading, reload: () => loader().then(setData) };
+
+  return {
+    data,
+    error,
+    loading,
+    reload: () => {
+      setError("");
+      return loader()
+        .then((value) => {
+          setData(value);
+          return value;
+        })
+        .catch((err) => {
+          setError((err as Error).message);
+          throw err;
+        });
+    }
+  };
 }
 
 export function App() {
@@ -159,6 +210,7 @@ function SetupPage({ onDone }: { onDone: (user: User) => void }) {
   const [username, setUsername] = useState("admin");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+
   async function submit(event: FormEvent) {
     event.preventDefault();
     setError("");
@@ -173,6 +225,7 @@ function SetupPage({ onDone }: { onDone: (user: User) => void }) {
       setError((err as Error).message);
     }
   }
+
   return <AuthForm title="创建管理员" username={username} password={password} error={error} submitLabel="初始化" onUsername={setUsername} onPassword={setPassword} onSubmit={submit} />;
 }
 
@@ -180,6 +233,7 @@ function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
   const [username, setUsername] = useState("admin");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+
   async function submit(event: FormEvent) {
     event.preventDefault();
     setError("");
@@ -194,6 +248,7 @@ function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
       setError((err as Error).message);
     }
   }
+
   return <AuthForm title="登录" username={username} password={password} error={error} submitLabel="登录" onUsername={setUsername} onPassword={setPassword} onSubmit={submit} />;
 }
 
@@ -222,8 +277,61 @@ function AuthForm(props: {
 }
 
 function DashboardPage() {
-  const { data, loading } = useLoad<any>(() => api("/api/dashboard"), []);
+  const { data, loading, reload } = useLoad<any>(() => api("/api/dashboard"), []);
+  const [query, setQuery] = useState("");
+  const [torrents, setTorrents] = useState<any[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState("");
+  const [refreshingMTeam, setRefreshingMTeam] = useState(false);
+  const [testingMTeam, setTestingMTeam] = useState(false);
+  const [mteamStatusOverride, setMteamStatusOverride] = useState<{ success: boolean; message: string } | null>(null);
+  const [dashboardError, setDashboardError] = useState("");
+
+  async function runMTeamSearch(event: FormEvent) {
+    event.preventDefault();
+    setSearching(true);
+    setSearchError("");
+    try {
+      const result = await api<{ items: any[] }>(`/api/search/mteam?q=${encodeURIComponent(query)}`);
+      setTorrents(result.items);
+    } catch (err) {
+      setSearchError((err as Error).message);
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  async function refreshDashboard() {
+    if (refreshingMTeam) return;
+    setRefreshingMTeam(true);
+    setDashboardError("");
+    try {
+      await reload();
+      setMteamStatusOverride(null);
+    } catch (err) {
+      setDashboardError((err as Error).message);
+    } finally {
+      setRefreshingMTeam(false);
+    }
+  }
+
+  async function testMTeamConnection() {
+    if (testingMTeam) return;
+    setTestingMTeam(true);
+    setDashboardError("");
+    try {
+      const result = await api<{ success: boolean; message: string }>("/api/mteam/test", { method: "POST" });
+      setMteamStatusOverride({ success: result.success, message: result.message });
+    } catch (err) {
+      setMteamStatusOverride({ success: false, message: (err as Error).message });
+      setDashboardError((err as Error).message);
+    } finally {
+      setTestingMTeam(false);
+    }
+  }
+
   if (loading || !data) return <Panel title="仪表盘"><p>正在加载运行数据...</p></Panel>;
+
   return (
     <div className="grid-page">
       <section className="metric-grid">
@@ -232,19 +340,112 @@ function DashboardPage() {
         <Metric title="NAS 剩余空间" value={data.overview.nas_free_space_label} source="NAS 磁盘快照" />
         <Metric title="活跃任务" value={`${data.overview.download_tasks + data.overview.upload_tasks}`} source="qB 原始数据" />
       </section>
-      <Panel title="M-Team 原始数据">
-        <div className="metric-grid compact">
-          <Metric title="上传量" value={formatBytes(data.mteam.upload_total)} source={data.mteam.source} />
-          <Metric title="下载量" value={formatBytes(data.mteam.download_total)} source={data.mteam.source} />
-          <Metric title="魔力值" value={data.mteam.bonus.toLocaleString()} source={data.mteam.bonus_per_hour_label} />
-          <Metric title="分享率" value={data.mteam.ratio.toFixed(2)} source={data.mteam.source} />
+
+      <MTeamSnapshotPanel
+        mteam={data.mteam}
+        connection={data.mteam_connection}
+        onRefresh={refreshDashboard}
+        refreshing={refreshingMTeam}
+        onTestConnection={testMTeamConnection}
+        testingConnection={testingMTeam}
+        statusOverride={mteamStatusOverride}
+      />
+      {dashboardError && <p className="error">{dashboardError}</p>}
+
+      <Panel title="M-Team 站内查询">
+        <form className="searchbar" onSubmit={runMTeamSearch}>
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索电影、剧集、年份、制作组或关键词" />
+          <button className="primary" disabled={searching}><Search size={18} /> {searching ? "查询中..." : "查询"}</button>
+        </form>
+        {searchError && <p className="error">{searchError}</p>}
+        <div className="table-list">
+          {torrents.map((item) => <ResourceRow item={item} key={item.id} />)}
+          {!torrents.length && <p className="muted">输入关键词后可直接查询馒头站点资源。</p>}
         </div>
       </Panel>
+
       <Panel title="下载器">
         <div className="cards-row">
           {data.qbs.map((qb: any) => qb.locked ? <LockedCard key={qb.id} title={qb.name} message={qb.message} /> : <DownloaderCard key={qb.id} qb={qb} />)}
         </div>
       </Panel>
+    </div>
+  );
+}
+
+function MTeamSnapshotPanel({
+  mteam,
+  connection,
+  onRefresh,
+  refreshing,
+  onTestConnection,
+  testingConnection,
+  statusOverride
+}: {
+  mteam: any;
+  connection: any;
+  onRefresh: () => void;
+  refreshing: boolean;
+  onTestConnection: () => void;
+  testingConnection: boolean;
+  statusOverride: { success: boolean; message: string } | null;
+}) {
+  const history = mteam.traffic_history ?? [];
+  const maxTraffic = Math.max(1, ...history.map((point: any) => Math.max(point.upload_total ?? 0, point.download_total ?? 0)));
+  const connected = statusOverride ? statusOverride.success : Boolean(connection?.enabled && connection?.last_test_success);
+  const statusLabel = testingConnection ? "正在测试" : refreshing ? "正在刷新" : connected ? "连接正常" : "连接异常";
+  const statusTitle = statusOverride?.message ?? connection?.message ?? statusLabel;
+
+  return (
+    <section className="panel">
+      <div className="mteam-panel-header">
+        <h2>站点用户数据 - 馒头</h2>
+        <div className="mteam-status-tools" title={statusTitle}>
+          <button className="status-dot-button" onClick={onTestConnection} disabled={testingConnection} title="测试 M-Team 连通性" aria-label="测试 M-Team 连通性">
+            <span className={connected ? "status-dot online" : "status-dot offline"} />
+          </button>
+          <span className={connected ? "status-text online" : "status-text offline"}>{statusLabel}</span>
+          <button className={refreshing ? "refresh-icon-button spinning" : "refresh-icon-button"} onClick={onRefresh} disabled={refreshing} title="重新抓取站点数据" aria-label="重新抓取站点数据">
+            <RefreshCw size={17} />
+          </button>
+        </div>
+      </div>
+      <div className="mteam-stat-grid">
+        <InfoTile icon={UserRound} label="用户等级" value={mteam.user_level ?? "User"} />
+        <InfoTile icon={Coins} label="积分" value={numberLabel(mteam.bonus)} delta={mteam.bonus_delta_label} />
+        <InfoTile icon={Percent} label="分享率" value={numberLabel(mteam.ratio, 3)} delta={mteam.ratio_delta_label} negative={String(mteam.ratio_delta_label ?? "").startsWith("-")} />
+        <InfoTile icon={Upload} label="总上传量" value={formatBytes(mteam.upload_total)} delta={mteam.upload_delta_label} />
+        <InfoTile icon={Download} label="总下载量" value={formatBytes(mteam.download_total)} delta={mteam.download_delta_label} />
+        <InfoTile icon={Activity} label="总做种数" value={String(mteam.seed_count ?? mteam.active_uploads ?? 0)} delta={mteam.seed_count_delta_label} />
+        <InfoTile icon={Database} label="总做种体积" value={formatBytes(mteam.seed_size ?? 0)} delta={mteam.seed_size_delta_label} negative={String(mteam.seed_size_delta_label ?? "").startsWith("-")} />
+        <InfoTile icon={CalendarDays} label="加入时间" value={mteam.joined_at ?? "-"} />
+      </div>
+      <div className="traffic-chart">
+        <h3>历史流量</h3>
+        <div className="traffic-bars">
+          {history.map((point: any) => (
+            <div className="traffic-day" key={point.date} title={`${point.date} 上传 ${formatBytes(point.upload_total)} / 下载 ${formatBytes(point.download_total)}`}>
+              <span className="traffic-upload" style={{ height: `${Math.max(8, (point.upload_total / maxTraffic) * 160)}px` }} />
+              <span className="traffic-download" style={{ height: `${Math.max(6, (point.download_total / maxTraffic) * 160)}px` }} />
+              <small>{String(point.date).slice(5).replace("-", "/")}</small>
+            </div>
+          ))}
+        </div>
+        <div className="legend"><span className="dot upload" />上传量<span className="dot download" />下载量</div>
+      </div>
+    </section>
+  );
+}
+
+function InfoTile({ icon: Icon, label, value, delta, negative }: { icon: typeof Film; label: string; value: string; delta?: string; negative?: boolean }) {
+  return (
+    <div className="info-tile">
+      <div>
+        <small>{label}</small>
+        <strong>{value}</strong>
+        {delta && <span className={negative ? "delta negative" : "delta"}>{delta}</span>}
+      </div>
+      <span className="tile-icon"><Icon size={18} /></span>
     </div>
   );
 }
@@ -258,11 +459,12 @@ function DiscoverPage() {
     { title: "Top Rated 电影", items: data.top_rated_movies },
     { title: "Top Rated 剧集", items: data.top_rated_tv }
   ] : [];
+
   return (
     <div className="grid-page">
       {loading && <Panel title="发现"><p>正在从 TMDB 加载片单...</p></Panel>}
       {error && <Panel title="TMDB 获取失败"><p className="error">{error}</p></Panel>}
-      {data && !data.configured && <Panel title="需要配置 TMDB"><p>{data.message}</p><p className="muted">进入“设置”，在 tmdb 配置里填写 api_key 或 bearer_token，保存并启用后再回到发现页。</p></Panel>}
+      {data && !data.configured && <Panel title="需要配置 TMDB"><p>{data.message}</p><p className="muted">进入“设置”，在 TMDB 配置里填写 API Key 或 Bearer Token，保存并启用后再回到发现页。</p></Panel>}
       {lists.map((list) => <PosterRail title={list.title} items={list.items} key={list.title} />)}
     </div>
   );
@@ -272,6 +474,7 @@ function SearchPage() {
   const [query, setQuery] = useState("");
   const [media, setMedia] = useState<any[]>([]);
   const [torrents, setTorrents] = useState<any[]>([]);
+
   async function runSearch(event: FormEvent) {
     event.preventDefault();
     const [mediaResult, torrentResult] = await Promise.all([
@@ -281,6 +484,7 @@ function SearchPage() {
     setMedia(mediaResult.items);
     setTorrents(torrentResult.items);
   }
+
   return (
     <div className="grid-page">
       <form className="searchbar" onSubmit={runSearch}>
@@ -299,6 +503,7 @@ function DownloadsPage() {
   const [downloader, setDownloader] = useState("qb1");
   const [grantOpen, setGrantOpen] = useState(false);
   const { data, error, reload } = useLoad<any>(() => api(`/api/qb/${downloader}/torrents`), [downloader]);
+
   return (
     <div className="grid-page">
       <div className="segmented">
@@ -315,6 +520,7 @@ function AdminGrant({ onDone }: { onDone: () => void }) {
   const [username, setUsername] = useState("admin");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+
   async function verify() {
     try {
       await api("/api/auth/admin-verify", { method: "POST", body: JSON.stringify({ username, password }) });
@@ -323,6 +529,7 @@ function AdminGrant({ onDone }: { onDone: () => void }) {
       setError((err as Error).message);
     }
   }
+
   return <Panel title="管理员验证"><div className="form-grid"><input value={username} onChange={(event) => setUsername(event.target.value)} /><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} /><button className="primary" onClick={verify}>授权 15 分钟</button>{error && <p className="error">{error}</p>}</div></Panel>;
 }
 
@@ -339,10 +546,11 @@ function NotificationsPage() {
 function SettingsPage() {
   const { data, reload } = useLoad<any>(() => api("/api/admin/integrations"), []);
   if (!data) return <Panel title="设置"><p>正在加载...</p></Panel>;
+
   return (
     <div className="grid-page">
       <Panel title="运行时凭据中心">
-        <p className="muted">草稿由后端加密保存，保存后前端只会看到脱敏摘要。</p>
+        <p className="muted">凭据由后端加密保存，保存后前端只会看到脱敏摘要。</p>
       </Panel>
       {data.providers.map((provider: any) => <IntegrationEditor provider={provider} onChanged={reload} key={provider.provider} />)}
     </div>
@@ -350,36 +558,28 @@ function SettingsPage() {
 }
 
 function IntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
+  if (provider.provider === "mteam") return <MTeamIntegrationEditor provider={provider} onChanged={onChanged} />;
   if (provider.provider === "tmdb") return <TmdbIntegrationEditor provider={provider} onChanged={onChanged} />;
+  if (["qb1", "qb2", "qb3"].includes(provider.provider)) return <QbIntegrationEditor provider={provider} onChanged={onChanged} />;
 
   const providerNames: Record<string, string> = {
-    mteam: "M-Team",
-    qb1: "qB 1",
-    qb2: "qB 2",
-    qb3: "qB 3",
-    tmdb: "TMDB",
     ai: "AI",
     wechat_claw: "微信爪爪"
   };
-  const defaults: Record<string, string> = {
-    mteam: "Cookie: replace-me\nUser-Agent: PT-Media-Hub",
-    tmdb: "api_key: \nbearer_token: \nlanguage: zh-CN\nregion: CN\ntimeout: 12"
-  };
-  const [text, setText] = useState(defaults[provider.provider] ?? "");
-  const payload = useMemo(() => {
-    if (provider.provider === "mteam") return { raw_headers: text, timeout: 10 };
-    if (provider.provider === "tmdb") return { raw_settings: text };
-    return { endpoint: text || "mock://service", timeout: 10 };
-  }, [provider.provider, text]);
+  const [text, setText] = useState("");
+  const payload = useMemo(() => ({ endpoint: text || "mock://service", timeout: 10 }), [text]);
+
   async function save(path = "") {
     const body = path === "/enable" || path === "/disable" ? undefined : JSON.stringify({ payload });
     await api(`/api/admin/integrations/${provider.provider}${path}`, { method: "POST", body });
     onChanged();
   }
+
   async function draft() {
     await api(`/api/admin/integrations/${provider.provider}`, { method: "PUT", body: JSON.stringify({ payload }) });
     onChanged();
   }
+
   return (
     <Panel title={`${providerNames[provider.provider] ?? provider.provider} 配置`}>
       <div className="integration">
@@ -389,8 +589,285 @@ function IntegrationEditor({ provider, onChanged }: { provider: any; onChanged: 
           <button onClick={() => save("/test")}>保存并测试</button>
           <button onClick={() => save(provider.enabled ? "/disable" : "/enable")}>{provider.enabled ? "停用" : "启用"}</button>
         </div>
-        <pre>{JSON.stringify(provider.redacted_summary, null, 2)}</pre>
-        {provider.last_test_result && <small>最近测试：{provider.last_test_result.message} / 轨迹 {provider.last_test_result.trace_id}</small>}
+        <RedactedSummary provider={provider} />
+      </div>
+    </Panel>
+  );
+}
+
+function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
+  const label = provider.provider.toUpperCase();
+  const [form, setForm] = useState<QbForm>({
+    name: label,
+    base_url: "",
+    username: "",
+    password: "",
+    timeout: "10",
+    default_save_path: "",
+    category: "",
+    tags: "",
+    path_from: "",
+    path_to: ""
+  });
+  const [busy, setBusy] = useState("");
+  const [localError, setLocalError] = useState("");
+  const [localResult, setLocalResult] = useState<IntegrationTestResult | null>(provider.last_test_result);
+  const result = localResult ?? provider.last_test_result;
+  const canEnable = result?.success === true;
+
+  function updateField(key: keyof QbForm, value: string) {
+    setForm((current) => ({ ...current, [key]: value }));
+  }
+
+  function payload() {
+    const mapping = form.path_from.trim() && form.path_to.trim()
+      ? [{ from: form.path_from.trim(), to: form.path_to.trim() }]
+      : [];
+    return {
+      name: form.name.trim() || label,
+      base_url: form.base_url.trim(),
+      username: form.username.trim(),
+      password: form.password,
+      timeout: Number(form.timeout) || 10,
+      default_save_path: form.default_save_path.trim(),
+      category: form.category.trim(),
+      tags: form.tags.split(",").map((item) => item.trim()).filter(Boolean),
+      path_mappings: mapping
+    };
+  }
+
+  async function saveDraft() {
+    setBusy("draft");
+    setLocalError("");
+    try {
+      await api(`/api/admin/integrations/${provider.provider}`, { method: "PUT", body: JSON.stringify({ payload: payload() }) });
+      setLocalResult({
+        success: false,
+        provider: provider.provider,
+        mode: "real",
+        message: "草稿已保存。",
+        explanation: "qB 凭据已经加密保存到后端。实时读取任务前，请点击“保存并测试”。",
+        next_step: "确认 qB WebUI 地址、账号和密码可用后再启用。"
+      });
+      onChanged();
+    } catch (err) {
+      setLocalError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function saveAndTest() {
+    setBusy("test");
+    setLocalError("");
+    try {
+      const updated = await api<any>(`/api/admin/integrations/${provider.provider}/test`, { method: "POST", body: JSON.stringify({ payload: payload() }) });
+      setLocalResult(updated.last_test_result);
+      onChanged();
+    } catch (err) {
+      setLocalError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function toggleEnabled() {
+    setBusy("enable");
+    setLocalError("");
+    try {
+      await api(`/api/admin/integrations/${provider.provider}${provider.enabled ? "/disable" : "/enable"}`, { method: "POST" });
+      onChanged();
+    } catch (err) {
+      setLocalError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <Panel title={`${label} 配置`}>
+      <div className="integration tmdb-editor">
+        <div className="notice info">
+          <strong>用于实时读取 qBittorrent WebUI 中的下载器状态和任务列表</strong>
+          <span>必填：WebUI 地址、用户名、密码。保存路径、分类、标签和路径映射是添加任务与后续整理媒体文件时使用的可选项。</span>
+        </div>
+        <div className="settings-grid">
+          <label>显示名称
+            <input value={form.name} onChange={(event) => updateField("name", event.target.value)} placeholder="例如 主下载器 / 动漫下载器" />
+          </label>
+          <label>qB WebUI 地址（必填）
+            <input value={form.base_url} onChange={(event) => updateField("base_url", event.target.value)} placeholder="例如 http://192.168.1.20:8080" />
+          </label>
+          <label>用户名（必填）
+            <input value={form.username} onChange={(event) => updateField("username", event.target.value)} placeholder="qB WebUI 用户名" autoComplete="off" />
+          </label>
+          <label>密码（必填）
+            <input type="password" value={form.password} onChange={(event) => updateField("password", event.target.value)} placeholder="qB WebUI 密码" autoComplete="new-password" />
+          </label>
+          <label>超时时间（秒）
+            <input value={form.timeout} onChange={(event) => updateField("timeout", event.target.value)} inputMode="numeric" placeholder="10" />
+          </label>
+          <label>默认保存路径（可选）
+            <input value={form.default_save_path} onChange={(event) => updateField("default_save_path", event.target.value)} placeholder="例如 /downloads/media 或 D:\\Downloads" />
+          </label>
+          <label>默认分类（可选）
+            <input value={form.category} onChange={(event) => updateField("category", event.target.value)} placeholder="例如 movie / tv / anime" />
+          </label>
+          <label>默认标签（可选，逗号分隔）
+            <input value={form.tags} onChange={(event) => updateField("tags", event.target.value)} placeholder="例如 pt-media-hub,mteam" />
+          </label>
+          <label>下载器路径前缀（可选）
+            <input value={form.path_from} onChange={(event) => updateField("path_from", event.target.value)} placeholder="例如 /downloads" />
+          </label>
+          <label>本机/NAS 路径前缀（可选）
+            <input value={form.path_to} onChange={(event) => updateField("path_to", event.target.value)} placeholder="例如 Z:\\downloads 或 /volume1/downloads" />
+          </label>
+        </div>
+        <div className="field-help">
+          <strong>实际需要你提供：</strong>
+          <span>局域网地址就是 qB WebUI 地址；账号密码用于登录 Web API；储存地址用于添加新任务时指定保存位置；映射路径用于以后把 qB 返回的路径对应到 NAS/本机媒体库路径。</span>
+        </div>
+        <div className="actions">
+          <button onClick={saveDraft} disabled={busy !== ""}>{busy === "draft" ? "正在保存..." : "保存草稿"}</button>
+          <button className="primary" onClick={saveAndTest} disabled={busy !== ""}>{busy === "test" ? "正在测试..." : "保存并测试"}</button>
+          <button onClick={toggleEnabled} disabled={busy !== "" || (!provider.enabled && !canEnable)}>{provider.enabled ? "停用" : "启用"}</button>
+        </div>
+        {!provider.enabled && !canEnable && <p className="muted">请先“保存并测试”，测试成功后再启用这个 qB 下载器。</p>}
+        {localError && <p className="error">{localError}</p>}
+        <TestResultCard result={result} emptyProvider={label} />
+        <RedactedSummary provider={provider} />
+      </div>
+    </Panel>
+  );
+}
+
+function MTeamIntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
+  const [form, setForm] = useState<MTeamForm>({
+    base_url: "https://kp.m-team.cc",
+    api_key: "",
+    cookie: "",
+    user_agent: "PT-Media-Hub",
+    authorization: "",
+    passkey: "",
+    timeout: "10"
+  });
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [busy, setBusy] = useState("");
+  const [localResult, setLocalResult] = useState<IntegrationTestResult | null>(provider.last_test_result);
+  const [localError, setLocalError] = useState("");
+  const result = localResult ?? provider.last_test_result;
+  const canEnable = result?.provider === "mteam" && result?.success === true;
+
+  function updateField(key: keyof MTeamForm, value: string) {
+    setForm((current) => ({ ...current, [key]: value }));
+  }
+
+  function payload() {
+    const headers: Record<string, string> = {};
+    if (form.cookie.trim()) headers.Cookie = form.cookie.trim();
+    if (form.user_agent.trim()) headers["User-Agent"] = form.user_agent.trim();
+    if (form.authorization.trim()) headers.Authorization = form.authorization.trim();
+    return {
+      base_url: form.base_url.trim() || "https://kp.m-team.cc",
+      api_key: form.api_key.trim(),
+      headers,
+      passkey: form.passkey.trim(),
+      timeout: Number(form.timeout) || 10
+    };
+  }
+
+  async function saveDraft() {
+    setBusy("draft");
+    setLocalError("");
+    try {
+      await api(`/api/admin/integrations/mteam`, { method: "PUT", body: JSON.stringify({ payload: payload() }) });
+      setLocalResult({
+        success: false,
+        provider: "mteam",
+        mode: "mock",
+        message: "草稿已保存。",
+        explanation: "M-Team 凭据已经加密保存到后端，页面只显示脱敏摘要。",
+        next_step: "点击“保存并测试”确认站点链接状态。"
+      });
+      onChanged();
+    } catch (err) {
+      setLocalError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function saveAndTest() {
+    setBusy("test");
+    setLocalError("");
+    try {
+      const updated = await api<any>(`/api/admin/integrations/mteam/test`, { method: "POST", body: JSON.stringify({ payload: payload() }) });
+      setLocalResult(updated.last_test_result);
+      onChanged();
+    } catch (err) {
+      setLocalError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function toggleEnabled() {
+    setBusy("enable");
+    setLocalError("");
+    try {
+      await api(`/api/admin/integrations/mteam${provider.enabled ? "/disable" : "/enable"}`, { method: "POST" });
+      onChanged();
+    } catch (err) {
+      setLocalError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <Panel title="M-Team 配置">
+      <div className="integration tmdb-editor">
+        <div className="notice info">
+          <strong>用来读取馒头站点的用户数据与资源查询</strong>
+          <span>真实 API 需要 M-Team API Key；Cookie 和 Passkey 只作为兼容字段保存。敏感字段保存后只显示脱敏摘要。</span>
+        </div>
+        <div className="settings-grid">
+          <label>站点地址
+            <input value={form.base_url} onChange={(event) => updateField("base_url", event.target.value)} placeholder="https://kp.m-team.cc" />
+          </label>
+          <label>API Key
+            <input value={form.api_key} onChange={(event) => updateField("api_key", event.target.value)} placeholder="从 M-Team 个人资料复制 API Key" autoComplete="off" />
+          </label>
+          <label>User-Agent
+            <input value={form.user_agent} onChange={(event) => updateField("user_agent", event.target.value)} placeholder="浏览器或 PT-Media-Hub" />
+          </label>
+          <label>Cookie
+            <input value={form.cookie} onChange={(event) => updateField("cookie", event.target.value)} placeholder="从浏览器复制完整 Cookie" autoComplete="off" />
+          </label>
+          <label>Passkey
+            <input value={form.passkey} onChange={(event) => updateField("passkey", event.target.value)} placeholder="可选，下载链接使用；不是 API Key" autoComplete="off" />
+          </label>
+          <label>超时时间（秒）
+            <input value={form.timeout} onChange={(event) => updateField("timeout", event.target.value)} inputMode="numeric" placeholder="10" />
+          </label>
+        </div>
+        <button className="inline-tool" type="button" onClick={() => setShowAdvanced((value) => !value)}>
+          <SlidersHorizontal size={16} /> {showAdvanced ? "隐藏高级设置" : "显示高级设置"}
+        </button>
+        {showAdvanced && (
+          <label>Authorization
+            <input value={form.authorization} onChange={(event) => updateField("authorization", event.target.value)} placeholder="可选，例如 Bearer token" autoComplete="off" />
+          </label>
+        )}
+        <div className="actions">
+          <button onClick={saveDraft} disabled={busy !== ""}>{busy === "draft" ? "正在保存..." : "保存草稿"}</button>
+          <button className="primary" onClick={saveAndTest} disabled={busy !== ""}>{busy === "test" ? "正在测试..." : "保存并测试"}</button>
+          <button onClick={toggleEnabled} disabled={busy !== "" || (!provider.enabled && !canEnable)}>{provider.enabled ? "停用" : "启用"}</button>
+        </div>
+        {!provider.enabled && !canEnable && <p className="muted">请先“保存并测试”，测试成功后再启用 M-Team。</p>}
+        {localError && <p className="error">{localError}</p>}
+        <TestResultCard result={result} emptyProvider="M-Team" />
+        <RedactedSummary provider={provider} />
       </div>
     </Panel>
   );
@@ -516,27 +993,23 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
         </div>
         {!provider.enabled && !canEnable && <p className="muted">请先“保存并测试”，测试成功后才能启用 TMDB。</p>}
         {localError && <p className="error">{localError}</p>}
-        <TestResultCard result={result} />
-        {Object.keys(provider.redacted_summary ?? {}).length > 0 && (
-          <div className="redacted-summary">
-            <strong>已保存的信息</strong>
-            <pre>{JSON.stringify(provider.redacted_summary, null, 2)}</pre>
-          </div>
-        )}
+        <TestResultCard result={result} emptyProvider="TMDB" />
+        <RedactedSummary provider={provider} />
       </div>
     </Panel>
   );
 }
 
-function TestResultCard({ result }: { result?: IntegrationTestResult | null }) {
+function TestResultCard({ result, emptyProvider }: { result?: IntegrationTestResult | null; emptyProvider: string }) {
   if (!result) {
     return (
       <div className="result-card neutral">
         <strong>还没有测试结果</strong>
-        <span>填写 API Key 或 Bearer Token 后，点击“保存并测试”。</span>
+        <span>填写 {emptyProvider} 配置后，点击“保存并测试”。</span>
       </div>
     );
   }
+
   return (
     <div className={result.success ? "result-card success" : "result-card failed"}>
       <strong>{result.message ?? (result.success ? "测试成功" : "测试失败")}</strong>
@@ -548,10 +1021,21 @@ function TestResultCard({ result }: { result?: IntegrationTestResult | null }) {
   );
 }
 
+function RedactedSummary({ provider }: { provider: any }) {
+  if (Object.keys(provider.redacted_summary ?? {}).length === 0) return null;
+  return (
+    <div className="redacted-summary">
+      <strong>已保存的信息</strong>
+      <pre>{JSON.stringify(provider.redacted_summary, null, 2)}</pre>
+    </div>
+  );
+}
+
 function DiagnosticsPage() {
   const health = useLoad<any>(() => api("/api/diagnostics/health"), []);
   const traces = useLoad<any>(() => api("/api/diagnostics/traces"), []);
   const [exportPayload, setExportPayload] = useState<any | null>(null);
+
   return (
     <div className="grid-page">
       <Panel title="健康概览"><div className="table-list">{(health.data?.modules ?? []).map((item: any) => <div className="row" key={item.module}><strong>{item.module}</strong><span>{item.status}</span><small>{item.enabled ? "已启用" : "已停用"}</small></div>)}</div></Panel>
@@ -585,6 +1069,7 @@ function ResourceRow({ item }: { item: any }) {
     await api("/api/qb/qb1/torrents", { method: "POST", body: JSON.stringify({ payload: item }) });
     alert("已提交到 qB 1 Mock 适配器。");
   }
+
   return <div className="row"><strong>{item.title}</strong><span>{item.resolution} / {item.codec} / {item.size} / 做种 {item.seeders}</span><button onClick={download}>下载到 qB 1</button></div>;
 }
 
@@ -593,7 +1078,13 @@ function TorrentRow({ item, downloader }: { item: any; downloader: string }) {
     await api(`/api/qb/${downloader}/torrents/${item.hash}/${action}`, { method: "POST", body: JSON.stringify({ payload: {} }) });
     alert(`${action} 已被 Mock 适配器接受。`);
   }
+
   return <div className="row"><strong>{item.name}</strong><span>{Math.round(item.progress * 100)}% / {formatSpeed(item.download_speed)} / {item.state}</span><div className="actions"><button onClick={() => mutate("pause")}>暂停</button><button onClick={() => mutate("resume")}>继续</button><button onClick={() => mutate("tags")}>打标签</button></div></div>;
+}
+
+function numberLabel(value: number, digits = 0): string {
+  if (typeof value !== "number" || Number.isNaN(value)) return "-";
+  return value.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
 }
 
 const pages: Record<NavKey, (props: { user: User }) => ReactNode> = {
