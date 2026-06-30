@@ -14,16 +14,36 @@ POSTERS = [
 
 class MockTrackerAdapter(TrackerAdapter):
     def get_user_stats(self) -> dict[str, Any]:
+        upload_total = 9.03 * 1024**4
+        download_total = 749.99 * 1024**3
         return {
-            "upload_total": 12.8 * 1024**4,
-            "download_total": 3.4 * 1024**4,
-            "bonus": 98234.5,
-            "ratio": 3.76,
-            "active_uploads": 42,
-            "active_downloads": 3,
+            "user_level": "User",
+            "upload_total": upload_total,
+            "upload_delta_label": "+122.38 GB",
+            "download_total": download_total,
+            "download_delta_label": "+22.67 GB",
+            "bonus": 11167.0,
+            "bonus_delta_label": "+816.6",
+            "ratio": 12.329,
+            "ratio_delta_label": "-0.216",
+            "seed_count": 14,
+            "seed_count_delta_label": "+0",
+            "seed_size": 313.77 * 1024**3,
+            "seed_size_delta_label": "-35.23 GB",
+            "joined_at": "2026-06-12",
+            "active_uploads": 14,
+            "active_downloads": 0,
             "bonus_per_hour_label": "最近 1 小时魔力增量（应用计算）",
             "source": "M-Team 原始数据（Mock）",
             "updated_at": datetime.utcnow().isoformat(),
+            "traffic_history": [
+                {
+                    "date": f"2026-06-{day:02d}",
+                    "upload_total": (8.74 + max(day - 26, 0) * 0.08 + index * 0.01) * 1024**4,
+                    "download_total": (0.48 + max(day - 28, 0) * 0.08 + index * 0.01) * 1024**4,
+                }
+                for index, day in enumerate(range(15, 31))
+            ],
         }
 
     def search_torrents(self, query: str, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
