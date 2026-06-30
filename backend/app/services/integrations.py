@@ -181,8 +181,8 @@ def set_enabled(db: Session, provider: str, enabled: bool, actor_user_id: int) -
     return row
 
 
-def serialize_config(row: IntegrationConfig) -> dict[str, Any]:
-    return {
+def serialize_config(row: IntegrationConfig, include_plain_payload: bool = False) -> dict[str, Any]:
+    data = {
         "provider": row.provider,
         "config_version": row.config_version,
         "enabled": row.enabled,
@@ -191,3 +191,6 @@ def serialize_config(row: IntegrationConfig) -> dict[str, Any]:
         "last_test_result": row.last_test_result,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
     }
+    if include_plain_payload:
+        data["saved_payload"] = json.loads(decrypt_text(row.encrypted_payload)) if row.encrypted_payload else {}
+    return data

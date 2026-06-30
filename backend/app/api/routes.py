@@ -7,8 +7,9 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.adapters.mock import MockMetadataAdapter, MockQbittorrentAdapter
+from app.adapters.mock import MockMetadataAdapter
 from app.adapters.mteam import MTeamAdapter, MTeamApiError, MTeamConfigError
+from app.adapters.qbittorrent import QbittorrentApiError, QbittorrentConfigError, QbittorrentWebAdapter
 from app.adapters.tmdb import TmdbAdapter
 from app.adapters.tmdb.client import TmdbConfigError
 from app.api.deps import get_current_user, has_qb2_grant, require_admin
@@ -165,6 +166,72 @@ def qb_config_test_result(provider: str, trace: str, config: dict[str, Any], row
     }
 
 
+def qb_test_result(success: bool, provider: str, trace: str, message: str, explanation: str, next_step: str, error_type: str | None = None, http_status: int | None = None, can_enable: bool | None = None, detail: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "success": success,
+        "provider": provider,
+        "mode": "real",
+        "http_status": http_status,
+        "duration_ms": 0,
+        "message": message,
+        "explanation": explanation,
+        "next_step": next_step,
+        "error_type": error_type,
+        "can_enable": success if can_enable is None else can_enable,
+        "trace_id": trace,
+        "detail": detail or {},
+    }
+
+
+def classify_qb_test_error(provider: str, exc: Exception, trace: str) -> dict[str, Any]:
+    if isinstance(exc, QbittorrentConfigError):
+        return qb_test_result(
+            False,
+            provider,
+            trace,
+            "qB 配置还缺少必填项。",
+            "真实 qB Web API 需要 WebUI 地址、用户名和密码。",
+            "请填好 WebUI 地址、用户名和密码后再测试。",
+            "missing_required_fields",
+            can_enable=False,
+        )
+    if isinstance(exc, QbittorrentApiError):
+        http_status = exc.http_status
+        if http_status in (401, 403):
+            return qb_test_result(
+                False,
+                provider,
+                trace,
+                "qB 登录失败。",
+                "qB WebUI 拒绝了当前账号密码，或 WebUI 禁止了该来源登录。",
+                "请检查用户名、密码、WebUI 地址，以及 qBittorrent WebUI 的 CSRF/Host Header/反向代理设置。",
+                "invalid_credentials",
+                http_status,
+                False,
+            )
+        return qb_test_result(
+            False,
+            provider,
+            trace,
+            "qB 连接测试失败。",
+            str(exc),
+            "请确认这台机器能访问 qB WebUI 地址，然后重新测试。",
+            "qb_api_error",
+            http_status,
+            False,
+        )
+    return qb_test_result(
+        False,
+        provider,
+        trace,
+        "qB 连接测试失败。",
+        str(exc),
+        "请检查 qB WebUI 地址、账号密码和网络连通性后再测试。",
+        "unknown_error",
+        can_enable=False,
+    )
+
+
 def mteam_test_result(success: bool, trace: str, message: str, explanation: str, next_step: str, error_type: str | None = None, http_status: int | None = None, can_enable: bool | None = None) -> dict[str, Any]:
     return {
         "success": success,
@@ -282,6 +349,54 @@ def get_mteam_adapter_or_error(db: Session) -> MTeamAdapter:
         raise HTTPException(status_code=409, detail="M-Team API Key 未配置。") from exc
 
 
+def qb_placeholder_state(downloader_id: str, row: IntegrationConfig | None, message: str | None = None) -> dict[str, Any]:
+    index = downloader_id.replace("qb", "")
+    configured = bool(row and row.encrypted_payload)
+    enabled = bool(row and row.enabled)
+    name = (row.redacted_summary or {}).get("name") if row else None
+    return {
+        "id": downloader_id,
+        "name": name or f"qB {index}",
+        "online": False,
+        "configured": configured,
+        "enabled": enabled,
+        "download_speed": 0,
+        "upload_speed": 0,
+        "active_downloads": 0,
+        "active_uploads": 0,
+        "paused": 0,
+        "errors": 0,
+        "free_space": 0,
+        "source": "qB Web API 未启用",
+        "updated_at": datetime.utcnow().isoformat(),
+        "message": message or ("配置已保存，请在设置中测试并启用。" if configured else "请先在设置中配置 qB WebUI。"),
+    }
+
+
+def get_qb_adapter_or_error(db: Session, downloader_id: str) -> QbittorrentWebAdapter:
+    if downloader_id not in {"qb1", "qb2", "qb3"}:
+        raise HTTPException(status_code=404, detail="未知下载器")
+    row = get_config(db, downloader_id)
+    if not row or not row.encrypted_payload:
+        raise HTTPException(status_code=409, detail=f"{downloader_id.upper()} 尚未配置")
+    if not row.enabled:
+        raise HTTPException(status_code=409, detail=f"{downloader_id.upper()} 尚未启用，请先在设置中测试并启用")
+    try:
+        return QbittorrentWebAdapter(get_decrypted_config(db, downloader_id) or {})
+    except QbittorrentConfigError as exc:
+        raise HTTPException(status_code=409, detail="qB WebUI 地址、用户名或密码未配置") from exc
+
+
+def get_qb_state_for_dashboard(db: Session, downloader_id: str) -> dict[str, Any]:
+    row = get_config(db, downloader_id)
+    if not row or not row.encrypted_payload or not row.enabled:
+        return qb_placeholder_state(downloader_id, row)
+    try:
+        return QbittorrentWebAdapter(get_decrypted_config(db, downloader_id) or {}).get_server_state(downloader_id)
+    except Exception as exc:
+        return qb_placeholder_state(downloader_id, row, f"qB 真实数据读取失败：{exc}")
+
+
 @router.get("/setup/status")
 def setup_status(db: Session = Depends(get_db)) -> dict[str, Any]:
     return {"initialized": db.query(User).count() > 0}
@@ -342,9 +457,9 @@ def list_integrations(_: User = Depends(require_admin), db: Session = Depends(ge
     existing = {row.provider: row for row in db.query(IntegrationConfig).all()}
     return {
         "providers": [
-            serialize_config(existing[provider])
+            serialize_config(existing[provider], include_plain_payload=True)
             if provider in existing
-            else {"provider": provider, "config_version": 0, "enabled": False, "redacted_summary": {}, "last_tested_at": None, "last_test_result": None, "updated_at": None}
+            else {"provider": provider, "config_version": 0, "enabled": False, "redacted_summary": {}, "saved_payload": {}, "last_tested_at": None, "last_test_result": None, "updated_at": None}
             for provider in PROVIDERS
         ]
     }
@@ -390,7 +505,20 @@ def test_integration(provider: str, request: IntegrationPayload | None = None, u
         result["config_version"] = row.config_version if row else 0
     elif provider in {"qb1", "qb2", "qb3"}:
         config = get_decrypted_config(db, provider) or {}
-        result = qb_config_test_result(provider, test_trace_id, config, row)
+        try:
+            detail = QbittorrentWebAdapter(config).test_connection()
+            result = qb_test_result(
+                True,
+                provider,
+                test_trace_id,
+                "qB 连接成功。",
+                f"应用已经成功登录 qB WebUI，并读取到版本 {detail.get('version') or 'unknown'}。",
+                "你现在可以启用这个 qB 下载器，仪表盘和下载页会读取真实实时数据。",
+                detail=detail,
+            )
+        except Exception as exc:
+            result = classify_qb_test_error(provider, exc, test_trace_id)
+        result["config_version"] = row.config_version if row else 0
     else:
         result = mock_test_result(provider, test_trace_id, row)
     return serialize_config(record_test_result(db, provider, result, actor_user_id=user.id))
@@ -410,6 +538,11 @@ def enable_integration(provider: str, user: User = Depends(require_admin), db: S
         result = row.last_test_result if row else None
         if not result or result.get("provider") != "mteam" or result.get("mode") != "real" or result.get("success") is not True:
             raise HTTPException(status_code=409, detail="请先点击“保存并测试”，确认 M-Team 配置可用后再启用。")
+    if provider in {"qb1", "qb2", "qb3"}:
+        row = get_config(db, provider)
+        result = row.last_test_result if row else None
+        if not result or result.get("provider") != provider or result.get("mode") != "real" or result.get("success") is not True or result.get("can_enable") is not True:
+            raise HTTPException(status_code=409, detail="请先点击“保存并测试”，确认 qB WebUI 连接成功后再启用。")
     return serialize_config(set_enabled(db, provider, True, actor_user_id=user.id))
 
 
@@ -428,7 +561,6 @@ def integration_audit(provider: str, _: User = Depends(require_admin), db: Sessi
 
 @router.get("/dashboard")
 def dashboard(authorization: str | None = Header(default=None), db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
-    qb = MockQbittorrentAdapter()
     mteam_row = get_config(db, "mteam")
     connection = mteam_connection_payload(mteam_row)
     mteam = empty_mteam_stats()
@@ -445,7 +577,7 @@ def dashboard(authorization: str | None = Header(default=None), db: Session = De
         if downloader_id == "qb2" and not qb2_allowed:
             qbs.append({"id": "qb2", "name": "qB 2", "locked": True, "message": "私有下载器需要管理员验证。"})
         else:
-            qbs.append(qb.get_server_state(downloader_id))
+            qbs.append(get_qb_state_for_dashboard(db, downloader_id))
     return {
         "overview": {
             "total_download_speed": sum(item.get("download_speed", 0) for item in qbs),
@@ -486,21 +618,30 @@ def mteam_quick_test(db: Session = Depends(get_db), _: User = Depends(get_curren
 def qb_summary(downloader_id: str, authorization: str | None = Header(default=None), db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
     if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
         raise HTTPException(status_code=403, detail="qB 2 需要管理员验证")
-    return MockQbittorrentAdapter().get_server_state(downloader_id)
+    try:
+        return get_qb_adapter_or_error(db, downloader_id).get_server_state(downloader_id)
+    except QbittorrentApiError as exc:
+        raise HTTPException(status_code=502, detail=f"qB 数据获取失败：{exc}") from exc
 
 
 @router.get("/qb/{downloader_id}/torrents")
 def qb_torrents(downloader_id: str, authorization: str | None = Header(default=None), db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
     if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
         raise HTTPException(status_code=403, detail="qB 2 需要管理员验证")
-    return {"items": MockQbittorrentAdapter().get_torrents(downloader_id)}
+    try:
+        return {"items": get_qb_adapter_or_error(db, downloader_id).get_torrents(downloader_id)}
+    except QbittorrentApiError as exc:
+        raise HTTPException(status_code=502, detail=f"qB 任务列表获取失败：{exc}") from exc
 
 
 @router.post("/qb/{downloader_id}/torrents")
 def qb_add_torrent(downloader_id: str, request: QbActionPayload, authorization: str | None = Header(default=None), user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
         raise HTTPException(status_code=403, detail="qB 2 需要管理员验证")
-    result = MockQbittorrentAdapter().add_torrent(downloader_id, request.payload)
+    try:
+        result = get_qb_adapter_or_error(db, downloader_id).add_torrent(downloader_id, request.payload)
+    except QbittorrentApiError as exc:
+        raise HTTPException(status_code=502, detail=f"qB 添加任务失败：{exc}") from exc
     db.add(DownloadAction(trace_id=result["trace_id"], downloader_id=downloader_id, action="add", actor_user_id=user.id, status="accepted"))
     db.commit()
     return result
@@ -512,7 +653,10 @@ def qb_mutate(downloader_id: str, torrent_hash: str, action: str, request: QbAct
         raise HTTPException(status_code=404, detail="不支持的操作")
     if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
         raise HTTPException(status_code=403, detail="qB 2 需要管理员验证")
-    result = MockQbittorrentAdapter().mutate_torrent(downloader_id, torrent_hash, action, request.payload)
+    try:
+        result = get_qb_adapter_or_error(db, downloader_id).mutate_torrent(downloader_id, torrent_hash, action, request.payload)
+    except QbittorrentApiError as exc:
+        raise HTTPException(status_code=502, detail=f"qB 操作失败：{exc}") from exc
     db.add(DownloadAction(trace_id=result["trace_id"], downloader_id=downloader_id, action=action, target_hash=torrent_hash, actor_user_id=user.id))
     db.commit()
     return result
@@ -530,7 +674,10 @@ def qb_delete(downloader_id: str, torrent_hash: str, confirm_token: str = Query(
     if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
         raise HTTPException(status_code=403, detail="qB 2 需要管理员验证")
     action = "delete_files" if delete_files else "delete"
-    result = MockQbittorrentAdapter().mutate_torrent(downloader_id, torrent_hash, action, {"delete_files": delete_files})
+    try:
+        result = get_qb_adapter_or_error(db, downloader_id).mutate_torrent(downloader_id, torrent_hash, action, {"delete_files": delete_files})
+    except QbittorrentApiError as exc:
+        raise HTTPException(status_code=502, detail=f"qB 删除任务失败：{exc}") from exc
     db.add(DownloadAction(trace_id=result["trace_id"], downloader_id=downloader_id, action=action, target_hash=torrent_hash, actor_user_id=user.id))
     db.commit()
     return result
@@ -548,7 +695,13 @@ def discover_lists(_: User = Depends(get_current_user), db: Session = Depends(ge
 
 
 @router.get("/search/media")
-def search_media(q: str = Query(default=""), _: User = Depends(get_current_user)) -> dict[str, Any]:
+def search_media(q: str = Query(default=""), db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
+    config_row = get_config(db, "tmdb")
+    if config_row and config_row.enabled:
+        try:
+            return {"items": TmdbAdapter(get_decrypted_config(db, "tmdb") or {}).search_media(q)}
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"TMDB 搜索失败：{exc}") from exc
     return {"items": MockMetadataAdapter().search_media(q)}
 
 

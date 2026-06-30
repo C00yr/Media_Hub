@@ -1,6 +1,6 @@
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -74,8 +74,8 @@ class MTeamAdapter(TrackerAdapter):
             "seed_size": seed_size,
             "seed_size_delta_label": None,
             "joined_at": _date_label(joined_at),
-            "active_uploads": seed_count,
-            "active_downloads": seeding_stats["leech_count"],
+            "active_uploads": seeding_stats["active_uploads"],
+            "active_downloads": seeding_stats["active_downloads"],
             "seedtime_seconds": int(_float_from_any(data.get("seedtime")) or 0),
             "leechtime_seconds": int(_float_from_any(data.get("leechtime")) or 0),
             "allow_download": bool(data.get("allowDownload", True)),
@@ -123,14 +123,14 @@ class MTeamAdapter(TrackerAdapter):
         return {"torrent_id": torrent_id, "download_url": f"{self.base_url}/api/torrent/download/{torrent_id}"}
 
     def _get_seeding_stats(self, user_id: str) -> dict[str, Any]:
-        stats = {"seed_count": 0, "seed_size": 0.0, "leech_count": 0, "items": []}
+        stats = {"seed_count": 0, "seed_size": 0.0, "active_uploads": 0, "active_downloads": 0, "items": []}
         if not user_id:
             return stats
         peer_status = self._optional_request("POST", "/api/tracker/myPeerStatus", {"uid": user_id})
         peer_data = peer_status.get("data") if isinstance(peer_status, dict) else {}
         if isinstance(peer_data, dict):
-            stats["seed_count"] = int(_float_from_any(peer_data.get("seeder")) or 0)
-            stats["leech_count"] = int(_float_from_any(peer_data.get("leecher")) or 0)
+            stats["active_uploads"] = int(_float_from_any(peer_data.get("seeder")) or 0)
+            stats["active_downloads"] = int(_float_from_any(peer_data.get("leecher")) or 0)
 
         page_number = 1
         page_size = 200
@@ -179,20 +179,42 @@ class MTeamAdapter(TrackerAdapter):
             return {}
 
     def _normalize_torrent(self, item: dict[str, Any]) -> dict[str, Any]:
+        flat = _flatten(item)
         title = _string_from_any(_pick(item, "name", "title", "smallDescr", "subtitle")) or "M-Team 资源"
+        subtitle = _string_from_any(_pick(item, "smallDescr", "subtitle", "description") or _find_value(flat, "smallDescr", "subtitle", "description"))
         status = item.get("status") if isinstance(item.get("status"), dict) else {}
         size_value = _pick(item, "size", "fileSize", "torrentSize")
+        torrent_id = str(_pick(item, "id", "torrentId", "tid") or _find_value(flat, "id", "torrentId", "tid") or title)
+        category = _display_text(_pick(item, "category", "categoryName", "browseType") or _find_value(flat, "categoryName", "browseType", "category"))
+        labels = _torrent_labels(item, title, subtitle, flat)
+        promotion = _promotion_info(item, flat)
         return {
-            "id": str(_pick(item, "id", "torrentId", "tid") or title),
+            "id": torrent_id,
             "title": title,
+            "subtitle": subtitle,
             "resolution": _string_from_any(_pick(item, "standard", "resolution")) or _guess_resolution(title),
             "codec": _string_from_any(_pick(item, "videoCodec", "codec")) or _guess_codec(title),
             "hdr": _string_from_any(_pick(item, "hdr", "processing")) or "",
+            "audio_codec": _string_from_any(_pick(item, "audioCodec", "audio") or _find_value(flat, "audioCodec", "audio")) or _guess_audio(title),
             "size": _size_label(size_value),
-            "group": _string_from_any(_pick(item, "team", "group", "author")) or "",
+            "size_bytes": _bytes_from_any(size_value),
+            "group": _display_text(_pick(item, "team", "group", "author")) or "",
+            "category": category,
+            "labels": labels,
+            "discount": promotion["raw_type"],
+            "promotion_type": promotion["type"],
+            "promotion_label": promotion["label"],
+            "promotion_until": promotion["until"],
+            "promotion_remaining": promotion["remaining"],
+            "imdb_rating": _rating_label(_pick(item, "imdbRating", "imdb_rate") or _find_value(flat, "imdbRating", "imdbRate")),
+            "douban_rating": _rating_label(_pick(item, "doubanRating", "douban_rate") or _find_value(flat, "doubanRating", "doubanRate")),
             "seeders": int(_float_from_any(_pick(item, "seeders", "seedCount", default=status.get("seeders"))) or 0),
             "downloads": int(_float_from_any(_pick(item, "leechers", "downloaders", "downloads", default=status.get("leechers"))) or 0),
+            "completed": int(_float_from_any(_pick(item, "completed", "snatched", "finish", "finishCount") or _find_value(flat, "completed", "snatched", "finishCount")) or 0),
+            "comments": int(_float_from_any(_pick(item, "comments", "commentCount") or _find_value(flat, "commentCount", "comments")) or 0),
             "published_at": _string_from_any(_pick(item, "createdDate", "createdAt", "publishDate", "releaseDate")) or "",
+            "download_url": f"{self.base_url}/api/torrent/download/{torrent_id}" if torrent_id else "",
+            "raw_summary": _compact_raw_summary(item),
         }
 
     def _first_success(self, attempts: list[tuple[str, str, dict[str, Any] | None]]) -> dict[str, Any]:
@@ -321,6 +343,15 @@ def _string_from_any(value: Any) -> str:
     return str(value)
 
 
+def _display_text(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in ("name", "title", "label", "value", "id"):
+            if value.get(key) not in (None, ""):
+                return str(value[key])
+        return ""
+    return _string_from_any(value)
+
+
 def _date_label(value: str) -> str:
     if not value:
         return "-"
@@ -372,6 +403,140 @@ def _guess_resolution(title: str) -> str:
 def _guess_codec(title: str) -> str:
     match = re.search(r"(H\.?265|H\.?264|HEVC|AVC|AV1|x265|x264)", title, re.IGNORECASE)
     return match.group(1) if match else "-"
+
+
+def _guess_audio(title: str) -> str:
+    match = re.search(r"(TrueHD|DTS[-\s]?HD|DTS|Atmos|AAC|FLAC|LPCM|DDP?\.?5\.1|DDP?\.?7\.1)", title, re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def _rating_label(value: Any) -> str:
+    rating = _float_from_any(value)
+    return f"{rating:.1f}" if rating > 0 else ""
+
+
+def _torrent_labels(item: dict[str, Any], title: str, subtitle: str, flat: dict[str, Any]) -> list[str]:
+    text = f"{title} {subtitle}".lower()
+    labels: list[str] = []
+    category = _display_text(_pick(item, "category", "categoryName", "browseType") or _find_value(flat, "categoryName", "browseType"))
+    if category:
+        labels.append(category)
+    checks = [
+        ("4K", r"\b(2160p|4k|uhd)\b"),
+        ("1080p", r"\b1080p\b"),
+        ("720p", r"\b720p\b"),
+        ("HDR10", r"\bhdr10\b|\bhdr\b"),
+        ("DoVi", r"\bdovi\b|dolby vision"),
+        ("中字", r"中字|ch[si]|cns|cht"),
+        ("原盘", r"remux|blu-?ray|原盘"),
+        ("WEB-DL", r"web-?dl"),
+        ("FREE", r"\bfree\b|免费"),
+    ]
+    for label, pattern in checks:
+        if re.search(pattern, text, re.IGNORECASE):
+            labels.append(label)
+    tags = item.get("tags") if isinstance(item.get("tags"), list) else []
+    for tag in tags:
+        name = _display_text(tag)
+        if name:
+            labels.append(name)
+    result = []
+    for label in labels:
+        if label and label not in result:
+            result.append(label)
+    return result[:8]
+
+
+def _promotion_info(item: dict[str, Any], flat: dict[str, Any]) -> dict[str, str]:
+    raw_type = _string_from_any(
+        _pick(item, "discount", "statusDiscount", "discountType", "promotion", "promotionType")
+        or _find_value(flat, "discount", "statusDiscount", "discountType", "promotion", "promotionType")
+    ).strip()
+    explicit_free_until = (
+        _pick(item, "freeUntil", "freeEndTime", "freeDeadline", "freeDeadlineDate")
+        or _find_value(flat, "freeUntil", "freeEndTime", "freeDeadline", "freeDeadlineDate")
+    )
+    generic_until = (
+        explicit_free_until
+        or _pick(item, "discountEndTime", "promotionEndTime", "promotionUntil", "discountUntil")
+        or _find_value(flat, "discountEndTime", "promotionEndTime", "promotionUntil", "discountUntil")
+    )
+    until = _iso_datetime_label(generic_until)
+    remaining = _time_left_label(generic_until)
+    normalized = raw_type.upper().replace("-", "_").replace(" ", "_")
+
+    if explicit_free_until or normalized in {"FREE", "PERCENT_100", "FREE_100", "FREE100", "ZERO", "PERCENT_0"}:
+        label = "FREE"
+        promo_type = "free"
+    elif normalized.startswith("PERCENT_"):
+        percent = normalized.removeprefix("PERCENT_")
+        label = f"{percent}%"
+        promo_type = "percent"
+    elif normalized in {"HALF", "HALF_DOWN", "HALFDOWNLOAD"}:
+        label = "50%"
+        promo_type = "percent"
+    elif normalized in {"DOUBLE", "TWO_X", "X2", "DOUBLE_UPLOAD"}:
+        label = "2X"
+        promo_type = "multiplier"
+    elif normalized and normalized not in {"NORMAL", "NONE", "NO"}:
+        label = raw_type
+        promo_type = "custom"
+    else:
+        label = ""
+        promo_type = ""
+
+    if label == "FREE" and remaining:
+        label = f"FREE {remaining}"
+    elif label and remaining and promo_type != "custom":
+        label = f"{label} {remaining}"
+    return {"raw_type": raw_type, "type": promo_type, "label": label, "until": until, "remaining": remaining}
+
+
+def _iso_datetime_label(value: Any) -> str:
+    parsed = _parse_datetime(value)
+    return parsed.isoformat() if parsed else ""
+
+
+def _time_left_label(value: Any) -> str:
+    parsed = _parse_datetime(value)
+    if not parsed:
+        return ""
+    seconds = int((parsed - datetime.now(timezone.utc)).total_seconds())
+    if seconds <= 0:
+        return ""
+    days, rest = divmod(seconds, 86400)
+    hours = rest // 3600
+    if days > 0:
+        return f"{days}d {hours}h"
+    minutes = (rest % 3600) // 60
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        if re.fullmatch(r"\d{10,13}", text):
+            seconds = float(text)
+        else:
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            except ValueError:
+                return None
+    if seconds > 10_000_000_000:
+        seconds /= 1000
+    try:
+        return datetime.fromtimestamp(seconds, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _extract_items(data: Any) -> list[dict[str, Any]]:
