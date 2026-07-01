@@ -3,7 +3,7 @@ from socket import timeout as SocketTimeout
 from typing import Any
 from urllib.error import HTTPError, URLError
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -15,7 +15,7 @@ from app.adapters.tmdb.client import TmdbConfigError
 from app.api.deps import get_current_user, has_qb2_grant, require_admin
 from app.auth.security import create_access_token, decode_token, hash_password, verify_password
 from app.config.settings import get_settings
-from app.db.session import get_db
+from app.db.session import SessionLocal, get_db
 from app.diagnostics.tracing import TraceRecorder
 from app.models.entities import (
     ConfigAuditLog,
@@ -23,8 +23,10 @@ from app.models.entities import (
     DiagnosticExport,
     DownloadAction,
     IntegrationConfig,
+    MTeamSnapshot,
     Notification,
     QbSnapshot,
+    Setting,
     User,
     UserSession,
 )
@@ -43,6 +45,7 @@ from app.utils.redaction import redact_payload
 
 router = APIRouter()
 settings = get_settings()
+PRELOAD_PREFIX = "preload."
 
 
 class SetupAdminRequest(BaseModel):
@@ -69,14 +72,78 @@ class QbActionPayload(BaseModel):
     confirm_token: str | None = None
 
 
-def bytes_label(value: float) -> str:
+def bytes_label(value: float, digits: int = 1) -> str:
     units = ["B", "KB", "MB", "GB", "TB", "PB"]
     current = float(value)
     for unit in units:
         if current < 1024 or unit == units[-1]:
-            return f"{current:.1f} {unit}"
+            return f"{current:.{digits}f} {unit}"
         current /= 1024
-    return f"{current:.1f} PB"
+    return f"{current:.{digits}f} PB"
+
+
+def preload_cache_key(name: str) -> str:
+    return f"{PRELOAD_PREFIX}{name}"
+
+
+def get_preload_cache(db: Session, name: str) -> dict[str, Any] | None:
+    row = db.query(Setting).filter(Setting.key == preload_cache_key(name)).one_or_none()
+    if not row or not isinstance(row.value, dict) or "payload" not in row.value:
+        return None
+    return row.value
+
+
+def set_preload_cache(db: Session, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+    row = db.query(Setting).filter(Setting.key == preload_cache_key(name)).one_or_none()
+    value = {"payload": payload, "cached_at": datetime.utcnow().isoformat(), "name": name}
+    if row is None:
+        row = Setting(key=preload_cache_key(name), value=value)
+        db.add(row)
+    else:
+        row.value = value
+        row.updated_at = datetime.utcnow()
+    db.commit()
+    return value
+
+
+def with_preload_meta(payload: dict[str, Any], cache: dict[str, Any] | None, preloaded: bool) -> dict[str, Any]:
+    result = dict(payload)
+    result["_preload"] = {
+        "preloaded": preloaded,
+        "cached_at": cache.get("cached_at") if cache else None,
+        "refreshing": preloaded,
+    }
+    return result
+
+
+def refresh_dashboard_preload_task() -> None:
+    db = SessionLocal()
+    try:
+        refresh_dashboard_preload(db)
+    except Exception:
+        pass
+    finally:
+        db.close()
+
+
+def refresh_discover_preload_task() -> None:
+    db = SessionLocal()
+    try:
+        refresh_discover_preload(db)
+    except Exception:
+        pass
+    finally:
+        db.close()
+
+
+def refresh_download_preload_task(downloader_id: str) -> None:
+    db = SessionLocal()
+    try:
+        refresh_download_preload(db, downloader_id)
+    except Exception:
+        pass
+    finally:
+        db.close()
 
 
 def tmdb_test_result(success: bool, trace: str, message: str, explanation: str, next_step: str, error_type: str | None = None, http_status: int | None = None) -> dict[str, Any]:
@@ -397,6 +464,141 @@ def get_qb_state_for_dashboard(db: Session, downloader_id: str) -> dict[str, Any
         return qb_placeholder_state(downloader_id, row, f"qB 真实数据读取失败：{exc}")
 
 
+def nas_free_space_from_qbs(qbs: list[dict[str, Any]]) -> dict[str, Any]:
+    qb1 = next((item for item in qbs if item.get("id") == "qb1" and item.get("online") and float(item.get("free_space") or 0) > 0), None)
+    if not qb1:
+        return {
+            "nas_free_space": 0,
+            "nas_free_space_label": "-",
+            "nas_free_space_source": "qB1",
+        }
+    free_space = float(qb1.get("free_space") or 0)
+    return {
+        "nas_free_space": free_space,
+        "nas_free_space_label": bytes_label(free_space, 2),
+        "nas_free_space_source": "qB1",
+    }
+
+
+TRAFFIC_DIMENSIONS = ("hour", "day", "week", "month", "year")
+
+
+def build_mteam_traffic_series(db: Session) -> dict[str, list[dict[str, Any]]]:
+    points = mteam_snapshot_delta_points(db)
+    return {dimension: aggregate_traffic_points(points, dimension) for dimension in TRAFFIC_DIMENSIONS}
+
+
+def mteam_snapshot_delta_points(db: Session, limit: int = 5000) -> list[dict[str, Any]]:
+    rows = list(
+        reversed(
+            db.query(MTeamSnapshot)
+            .filter(MTeamSnapshot.source != "mock")
+            .order_by(MTeamSnapshot.captured_at.desc())
+            .limit(limit)
+            .all()
+        )
+    )
+    points = []
+    previous: MTeamSnapshot | None = None
+    for row in rows:
+        if previous is None:
+            previous = row
+            continue
+        points.append(
+            {
+                "captured_at": row.captured_at,
+                "upload_total": max(0.0, float(row.upload_total or 0) - float(previous.upload_total or 0)),
+                "download_total": max(0.0, float(row.download_total or 0) - float(previous.download_total or 0)),
+                "source": "app_calculated",
+            }
+        )
+        previous = row
+    return points
+
+
+def aggregate_traffic_points(points: list[dict[str, Any]], dimension: str) -> list[dict[str, Any]]:
+    buckets: dict[datetime, dict[str, float]] = {}
+    for point in points:
+        captured_at = point.get("captured_at")
+        if not isinstance(captured_at, datetime):
+            continue
+        period = traffic_period_start(captured_at, dimension)
+        if period not in buckets:
+            buckets[period] = {"upload_total": 0.0, "download_total": 0.0}
+        buckets[period]["upload_total"] += float(point.get("upload_total") or 0)
+        buckets[period]["download_total"] += float(point.get("download_total") or 0)
+    return [
+        {
+            "date": period.date().isoformat(),
+            "label": traffic_period_label(period, dimension),
+            "dimension": dimension,
+            "upload_total": totals["upload_total"],
+            "download_total": totals["download_total"],
+        }
+        for period, totals in sorted(buckets.items())
+    ]
+
+
+def traffic_period_start(value: datetime, dimension: str) -> datetime:
+    if dimension == "hour":
+        return datetime(value.year, value.month, value.day, value.hour)
+    day = datetime(value.year, value.month, value.day)
+    if dimension == "week":
+        return day - timedelta(days=day.weekday())
+    if dimension == "month":
+        return datetime(value.year, value.month, 1)
+    if dimension == "year":
+        return datetime(value.year, 1, 1)
+    return day
+
+
+def traffic_period_label(value: datetime, dimension: str) -> str:
+    if dimension == "hour":
+        return value.strftime("%m/%d %H:00")
+    if dimension == "year":
+        return value.strftime("%Y")
+    if dimension == "month":
+        return value.strftime("%Y/%m")
+    if dimension == "week":
+        return f"{value.strftime('%m/%d')} 周"
+    return value.strftime("%m/%d")
+
+
+def persist_dashboard_snapshots(db: Session, mteam: dict[str, Any], qbs: list[dict[str, Any]], mteam_ok: bool) -> None:
+    has_rows = False
+    if mteam_ok:
+        db.add(
+            MTeamSnapshot(
+                upload_total=float(mteam.get("upload_total") or 0),
+                download_total=float(mteam.get("download_total") or 0),
+                bonus=float(mteam.get("bonus") or 0),
+                ratio=float(mteam.get("ratio") or 0),
+                active_uploads=int(mteam.get("active_uploads") or 0),
+                active_downloads=int(mteam.get("active_downloads") or 0),
+                source="real",
+            )
+        )
+        has_rows = True
+    for qb in qbs:
+        if not qb.get("online"):
+            continue
+        db.add(
+            QbSnapshot(
+                downloader_id=str(qb.get("id") or ""),
+                download_speed=float(qb.get("download_speed") or 0),
+                upload_speed=float(qb.get("upload_speed") or 0),
+                downloaded_total=float(qb.get("downloaded_total") or 0),
+                uploaded_total=float(qb.get("uploaded_total") or 0),
+                active_downloads=int(qb.get("active_downloads") or 0),
+                active_uploads=int(qb.get("active_uploads") or 0),
+                source="real",
+            )
+        )
+        has_rows = True
+    if has_rows:
+        db.commit()
+
+
 @router.get("/setup/status")
 def setup_status(db: Session = Depends(get_db)) -> dict[str, Any]:
     return {"initialized": db.query(User).count() > 0}
@@ -559,31 +761,36 @@ def integration_audit(provider: str, _: User = Depends(require_admin), db: Sessi
     return {"items": [{"action": row.action, "config_version": row.config_version, "test_success": row.test_success, "trace_id": row.trace_id, "created_at": row.created_at.isoformat()} for row in rows]}
 
 
-@router.get("/dashboard")
-def dashboard(authorization: str | None = Header(default=None), db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
+def build_dashboard_payload(db: Session) -> dict[str, Any]:
     mteam_row = get_config(db, "mteam")
     connection = mteam_connection_payload(mteam_row)
     mteam = empty_mteam_stats()
+    mteam_ok = False
     if mteam_row and mteam_row.enabled:
         try:
             mteam = MTeamAdapter(get_decrypted_config(db, "mteam") or {}).get_user_stats()
+            mteam_ok = True
         except Exception as exc:
             connection["last_test_success"] = False
             connection["message"] = f"M-Team 真实数据读取失败：{exc}"
             mteam = empty_mteam_stats("M-Team 真实数据读取失败，请回到设置页重新测试。")
-    qbs = []
-    qb2_allowed = has_qb2_grant(db, authorization)
-    for downloader_id in ["qb1", "qb2", "qb3"]:
-        if downloader_id == "qb2" and not qb2_allowed:
-            qbs.append({"id": "qb2", "name": "qB 2", "locked": True, "message": "私有下载器需要管理员验证。"})
-        else:
-            qbs.append(get_qb_state_for_dashboard(db, downloader_id))
+    qbs = [get_qb_state_for_dashboard(db, downloader_id) for downloader_id in ["qb1", "qb2", "qb3"]]
+    nas_space = nas_free_space_from_qbs(qbs)
+    persist_dashboard_snapshots(db, mteam, qbs, mteam_ok)
+    mteam["traffic_series"] = build_mteam_traffic_series(db)
+    mteam["traffic_history"] = mteam["traffic_series"]["day"]
+    mteam["traffic_calculation"] = {
+        "source": "APP 本地累计快照",
+        "formula": "周期流量 = 周期内相邻累计快照差值之和；负增量按 0 处理，避免站点计数回退污染统计。",
+        "snapshot_interval_minutes": settings.snapshot_interval_minutes,
+    }
     return {
         "overview": {
             "total_download_speed": sum(item.get("download_speed", 0) for item in qbs),
             "total_upload_speed": sum(item.get("upload_speed", 0) for item in qbs),
-            "nas_free_space": 3.5 * 1024**4,
-            "nas_free_space_label": bytes_label(3.5 * 1024**4),
+            "nas_free_space": nas_space["nas_free_space"],
+            "nas_free_space_label": nas_space["nas_free_space_label"],
+            "nas_free_space_source": nas_space["nas_free_space_source"],
             "download_tasks": sum(item.get("active_downloads", 0) for item in qbs),
             "upload_tasks": sum(item.get("active_uploads", 0) for item in qbs),
         },
@@ -591,6 +798,48 @@ def dashboard(authorization: str | None = Header(default=None), db: Session = De
         "mteam": mteam,
         "qbs": qbs,
     }
+
+
+def refresh_dashboard_preload(db: Session) -> dict[str, Any]:
+    payload = build_dashboard_payload(db)
+    set_preload_cache(db, "dashboard", payload)
+    return payload
+
+
+def build_download_payload(db: Session, downloader_id: str) -> dict[str, Any]:
+    adapter = get_qb_adapter_or_error(db, downloader_id)
+    summary = adapter.get_server_state(downloader_id)
+    items = adapter.get_torrents(downloader_id)
+    return {
+        "downloader_id": downloader_id,
+        "summary": summary,
+        "items": items,
+        "source": "qB Web API 原始数据（Real）",
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+
+
+def refresh_download_preload(db: Session, downloader_id: str) -> dict[str, Any]:
+    payload = build_download_payload(db, downloader_id)
+    set_preload_cache(db, f"downloads.{downloader_id}", payload)
+    return payload
+
+
+@router.get("/dashboard")
+def dashboard(
+    background_tasks: BackgroundTasks,
+    cached: bool = Query(default=False),
+    refresh: bool = Query(default=False),
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    if cached and not refresh:
+        cache = get_preload_cache(db, "dashboard")
+        if cache:
+            background_tasks.add_task(refresh_dashboard_preload_task)
+            return with_preload_meta(cache["payload"], cache, True)
+    payload = refresh_dashboard_preload(db)
+    return with_preload_meta(payload, get_preload_cache(db, "dashboard"), False)
 
 
 @router.get("/mteam/stats")
@@ -614,6 +863,33 @@ def mteam_quick_test(db: Session = Depends(get_db), _: User = Depends(get_curren
         raise HTTPException(status_code=502, detail=f"M-Team 连通性测试失败：{exc}") from exc
 
 
+@router.get("/downloads/{downloader_id}/overview")
+def download_overview(
+    downloader_id: str,
+    background_tasks: BackgroundTasks,
+    cached: bool = Query(default=False),
+    refresh: bool = Query(default=False),
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    if downloader_id not in {"qb1", "qb2", "qb3"}:
+        raise HTTPException(status_code=404, detail="未知下载器")
+    if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
+        raise HTTPException(status_code=403, detail="qB 2 需要管理员验证")
+    cache_name = f"downloads.{downloader_id}"
+    if cached and not refresh:
+        cache = get_preload_cache(db, cache_name)
+        if cache:
+            background_tasks.add_task(refresh_download_preload_task, downloader_id)
+            return with_preload_meta(cache["payload"], cache, True)
+    try:
+        payload = refresh_download_preload(db, downloader_id)
+    except QbittorrentApiError as exc:
+        raise HTTPException(status_code=502, detail=f"qB 下载页数据获取失败：{exc}") from exc
+    return with_preload_meta(payload, get_preload_cache(db, cache_name), False)
+
+
 @router.get("/qb/{downloader_id}/summary")
 def qb_summary(downloader_id: str, authorization: str | None = Header(default=None), db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
     if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
@@ -632,6 +908,30 @@ def qb_torrents(downloader_id: str, authorization: str | None = Header(default=N
         return {"items": get_qb_adapter_or_error(db, downloader_id).get_torrents(downloader_id)}
     except QbittorrentApiError as exc:
         raise HTTPException(status_code=502, detail=f"qB 任务列表获取失败：{exc}") from exc
+
+
+@router.get("/qb/{downloader_id}/torrents/{torrent_hash}/detail")
+def qb_torrent_detail(downloader_id: str, torrent_hash: str, authorization: str | None = Header(default=None), db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
+    if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
+        raise HTTPException(status_code=403, detail="qB 2 需要管理员验证")
+    try:
+        return get_qb_adapter_or_error(db, downloader_id).get_torrent_detail(downloader_id, torrent_hash)
+    except QbittorrentApiError as exc:
+        raise HTTPException(status_code=502, detail=f"qB 任务详情获取失败：{exc}") from exc
+
+
+@router.post("/qb/{downloader_id}/torrents/{torrent_hash}/files/{file_id}/priority")
+def qb_file_priority(downloader_id: str, torrent_hash: str, file_id: int, request: QbActionPayload, authorization: str | None = Header(default=None), db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
+    if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
+        raise HTTPException(status_code=403, detail="qB 2 需要管理员验证")
+    try:
+        priority = int(request.payload.get("priority"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="文件优先级参数无效") from exc
+    try:
+        return get_qb_adapter_or_error(db, downloader_id).set_file_priority(downloader_id, torrent_hash, file_id, priority)
+    except QbittorrentApiError as exc:
+        raise HTTPException(status_code=502, detail=f"qB 文件优先级设置失败：{exc}") from exc
 
 
 @router.post("/qb/{downloader_id}/torrents")
@@ -683,8 +983,7 @@ def qb_delete(downloader_id: str, torrent_hash: str, confirm_token: str = Query(
     return result
 
 
-@router.get("/discover/lists")
-def discover_lists(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+def build_discover_payload(db: Session) -> dict[str, Any]:
     config_row = get_config(db, "tmdb")
     if not config_row or not config_row.enabled:
         return {"source": "tmdb", "configured": False, "message": "请先在设置中保存并启用 TMDB API Key 或 Bearer Token。", "trending": [], "popular_movies": [], "popular_tv": [], "top_rated_movies": [], "top_rated_tv": []}
@@ -692,6 +991,29 @@ def discover_lists(_: User = Depends(get_current_user), db: Session = Depends(ge
         return TmdbAdapter(get_decrypted_config(db, "tmdb") or {}).get_discover_lists()
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"TMDB 数据获取失败：{exc}") from exc
+
+
+def refresh_discover_preload(db: Session) -> dict[str, Any]:
+    payload = build_discover_payload(db)
+    set_preload_cache(db, "discover", payload)
+    return payload
+
+
+@router.get("/discover/lists")
+def discover_lists(
+    background_tasks: BackgroundTasks,
+    cached: bool = Query(default=False),
+    refresh: bool = Query(default=False),
+    _: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if cached and not refresh:
+        cache = get_preload_cache(db, "discover")
+        if cache:
+            background_tasks.add_task(refresh_discover_preload_task)
+            return with_preload_meta(cache["payload"], cache, True)
+    payload = refresh_discover_preload(db)
+    return with_preload_meta(payload, get_preload_cache(db, "discover"), False)
 
 
 @router.get("/search/media")

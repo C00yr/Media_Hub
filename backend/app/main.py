@@ -8,7 +8,7 @@ from app.api.routes import router
 from app.config.settings import get_settings
 from app.db.session import Base, engine
 from app.models import entities  # noqa: F401
-from app.tasks.scheduler import build_scheduler, capture_mock_snapshots
+from app.tasks.scheduler import build_scheduler, capture_snapshots
 
 
 settings = get_settings()
@@ -30,7 +30,7 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     def startup() -> None:
         Base.metadata.create_all(bind=engine)
-        capture_mock_snapshots()
+        capture_snapshots()
         if not scheduler.running:
             scheduler.start()
 

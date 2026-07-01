@@ -73,6 +73,36 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
             return []
         return [self._normalize_torrent(item) for item in items if isinstance(item, dict)]
 
+    def get_torrent_detail(self, downloader_id: str, torrent_hash: str) -> dict[str, Any]:
+        properties = self._json_request("GET", "/api/v2/torrents/properties", query={"hash": torrent_hash})
+        files = self._json_request("GET", "/api/v2/torrents/files", query={"hash": torrent_hash})
+        trackers = self._json_request("GET", "/api/v2/torrents/trackers", query={"hash": torrent_hash})
+        if not isinstance(properties, dict):
+            properties = {}
+        if not isinstance(files, list):
+            files = []
+        if not isinstance(trackers, list):
+            trackers = []
+        return {
+            "downloader_id": downloader_id,
+            "hash": torrent_hash,
+            "properties": self._normalize_properties(properties),
+            "files": [self._normalize_file(index, item) for index, item in enumerate(files) if isinstance(item, dict)],
+            "trackers": [self._normalize_tracker(item) for item in trackers if isinstance(item, dict)],
+            "source": "qB Web API 原始数据（Real）",
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+
+    def set_file_priority(self, downloader_id: str, torrent_hash: str, file_id: int, priority: int) -> dict[str, Any]:
+        if priority not in {0, 1, 6, 7}:
+            raise QbittorrentApiError("文件优先级只支持：不下载、普通、高、最高")
+        self._text_request(
+            "POST",
+            "/api/v2/torrents/filePrio",
+            form={"hash": torrent_hash, "id": str(file_id), "priority": str(priority)},
+        )
+        return {"accepted": True, "trace_id": trace_id("QBFILE"), "downloader_id": downloader_id, "hash": torrent_hash, "file_id": file_id, "priority": priority}
+
     def add_torrent(self, downloader_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         torrent_url = _first_text(payload, "download_url", "torrent_url", "magnet", "url", "urls")
         if not torrent_url:
@@ -133,19 +163,100 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
             "hash": str(item.get("hash") or ""),
             "name": str(item.get("name") or ""),
             "size": _float(item.get("size")),
+            "total_size": _float(item.get("total_size") or item.get("size")),
+            "amount_left": _float(item.get("amount_left")),
+            "completed": _float(item.get("completed")),
             "progress": max(0.0, min(1.0, _float(item.get("progress")))),
             "download_speed": _float(item.get("dlspeed")),
             "upload_speed": _float(item.get("upspeed")),
             "uploaded": _float(item.get("uploaded")),
             "downloaded": _float(item.get("downloaded")),
+            "uploaded_session": _float(item.get("uploaded_session")),
+            "downloaded_session": _float(item.get("downloaded_session")),
             "ratio": _float(item.get("ratio")),
+            "eta": _float(item.get("eta")),
+            "availability": _float(item.get("availability")),
+            "priority": int(_float(item.get("priority"))),
+            "num_seeds": int(_float(item.get("num_seeds"))),
+            "num_complete": int(_float(item.get("num_complete"))),
+            "num_leechs": int(_float(item.get("num_leechs"))),
+            "num_incomplete": int(_float(item.get("num_incomplete"))),
+            "download_limit": _float(item.get("dl_limit")),
+            "upload_limit": _float(item.get("up_limit")),
             "category": item.get("category") or "",
             "tags": tag_list,
             "save_path": item.get("save_path") or "",
+            "content_path": item.get("content_path") or "",
+            "tracker": item.get("tracker") or "",
             "added_at": added_at,
             "completed_at": completed_at if completed_at != "1970-01-01T00:00:00" else None,
+            "last_activity_at": _timestamp_label(item.get("last_activity")),
+            "seen_complete_at": _timestamp_label(item.get("seen_complete")),
+            "time_active": _float(item.get("time_active")),
+            "seeding_time": _float(item.get("seeding_time")),
             "state": item.get("state") or "",
             "source": "qB Web API 原始数据（Real）",
+        }
+
+    def _normalize_properties(self, item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "save_path": item.get("save_path") or "",
+            "creation_date": _timestamp_label(item.get("creation_date")),
+            "addition_date": _timestamp_label(item.get("addition_date")),
+            "completion_date": _timestamp_label(item.get("completion_date")),
+            "last_seen": _timestamp_label(item.get("last_seen")),
+            "created_by": item.get("created_by") or "",
+            "comment": item.get("comment") or "",
+            "total_size": _float(item.get("total_size")),
+            "piece_size": _float(item.get("piece_size")),
+            "pieces_have": int(_float(item.get("pieces_have"))),
+            "pieces_num": int(_float(item.get("pieces_num"))),
+            "total_wasted": _float(item.get("total_wasted")),
+            "total_uploaded": _float(item.get("total_uploaded")),
+            "total_uploaded_session": _float(item.get("total_uploaded_session")),
+            "total_downloaded": _float(item.get("total_downloaded")),
+            "total_downloaded_session": _float(item.get("total_downloaded_session")),
+            "download_limit": _float(item.get("dl_limit")),
+            "upload_limit": _float(item.get("up_limit")),
+            "download_speed": _float(item.get("dl_speed")),
+            "upload_speed": _float(item.get("up_speed")),
+            "download_speed_avg": _float(item.get("dl_speed_avg")),
+            "upload_speed_avg": _float(item.get("up_speed_avg")),
+            "eta": _float(item.get("eta")),
+            "time_elapsed": _float(item.get("time_elapsed")),
+            "seeding_time": _float(item.get("seeding_time")),
+            "connections": int(_float(item.get("nb_connections"))),
+            "connections_limit": int(_float(item.get("nb_connections_limit"))),
+            "share_ratio": _float(item.get("share_ratio")),
+            "seeds": int(_float(item.get("seeds"))),
+            "seeds_total": int(_float(item.get("seeds_total"))),
+            "peers": int(_float(item.get("peers"))),
+            "peers_total": int(_float(item.get("peers_total"))),
+            "reannounce": _float(item.get("reannounce")),
+        }
+
+    def _normalize_file(self, index: int, item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": index,
+            "name": item.get("name") or "",
+            "size": _float(item.get("size")),
+            "progress": max(0.0, min(1.0, _float(item.get("progress")))),
+            "priority": int(_float(item.get("priority"))),
+            "availability": _float(item.get("availability")),
+            "is_seed": bool(item.get("is_seed")),
+            "piece_range": item.get("piece_range") or [],
+        }
+
+    def _normalize_tracker(self, item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "url": item.get("url") or "",
+            "status": int(_float(item.get("status"))),
+            "tier": int(_float(item.get("tier"))),
+            "num_peers": int(_float(item.get("num_peers"))),
+            "num_seeds": int(_float(item.get("num_seeds"))),
+            "num_leeches": int(_float(item.get("num_leeches"))),
+            "num_downloaded": int(_float(item.get("num_downloaded"))),
+            "message": item.get("msg") or "",
         }
 
     def _torrent_command(self, paths: list[str], form: dict[str, Any]) -> None:
