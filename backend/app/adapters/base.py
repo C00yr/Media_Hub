@@ -35,6 +35,9 @@ class MetadataAdapter(ABC):
     def get_media_details(self, media_id: str, media_type: str) -> dict[str, Any]: ...
 
     @abstractmethod
+    def get_person_details(self, person_id: str) -> dict[str, Any]: ...
+
+    @abstractmethod
     def get_discover_lists(self) -> dict[str, Any]: ...
 
 
@@ -52,4 +55,3 @@ class NotificationAdapter(ABC):
 
     @abstractmethod
     def send_wechat(self, notification: dict[str, Any]) -> dict[str, Any]: ...
-

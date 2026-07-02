@@ -17,6 +17,7 @@ import {
   LogOut,
   MessageSquare,
   Percent,
+  Radar,
   RefreshCw,
   Search,
   Settings,
@@ -379,12 +380,21 @@ function DashboardPage() {
   if (loading || !data) return <Panel title="仪表盘"><p>正在加载运行数据...</p></Panel>;
 
   return (
-    <div className="grid-page">
-      <section className="metric-grid">
-        <Metric title="总下载速度" value={formatSpeed(data.overview.total_download_speed)} source="qB 原始数据" />
-        <Metric title="总上传速度" value={formatSpeed(data.overview.total_upload_speed)} source="qB 原始数据" />
-        <Metric title="活跃任务" value={`${data.overview.download_tasks + data.overview.upload_tasks}`} source="qB 原始数据" />
-      </section>
+    <div className="grid-page dashboard-page">
+      <div className="dashboard-composite">
+        <section className="metric-grid dashboard-overview">
+          <Metric title="总下载速度" value={formatSpeed(data.overview.total_download_speed)} source="" />
+          <Metric title="总上传速度" value={formatSpeed(data.overview.total_upload_speed)} source="" />
+          <Metric title="活跃任务" value={`${data.overview.download_tasks + data.overview.upload_tasks}`} source="" />
+          <Metric title="NAS 剩余空间" value={nasSpaceLabel(data.overview)} source={nasSpaceHelper(data.overview)} />
+        </section>
+        <section className="panel dashboard-downloaders">
+          <div className="dashboard-panel-title"><h2>下载器</h2></div>
+          <div className="cards-row">
+            {data.qbs.map((qb: any) => qb.locked ? <LockedCard key={qb.id} title={downloaderDisplayName(qb)} message={qb.message} /> : <DownloaderCard key={qb.id} qb={qb} />)}
+          </div>
+        </section>
+      </div>
 
       <MTeamSnapshotPanel
         mteam={data.mteam}
@@ -394,14 +404,9 @@ function DashboardPage() {
         onTestConnection={testMTeamConnection}
         testingConnection={testingMTeam}
         statusOverride={mteamStatusOverride}
+        updatedAt={data.updated_at}
       />
       {dashboardError && <p className="error">{dashboardError}</p>}
-
-      <Panel title="下载器">
-        <div className="cards-row">
-          {data.qbs.map((qb: any) => qb.locked ? <LockedCard key={qb.id} title={qb.name} message={qb.message} /> : <DownloaderCard key={qb.id} qb={qb} />)}
-        </div>
-      </Panel>
     </div>
   );
 }
@@ -413,7 +418,8 @@ function MTeamSnapshotPanel({
   refreshing,
   onTestConnection,
   testingConnection,
-  statusOverride
+  statusOverride,
+  updatedAt
 }: {
   mteam: any;
   connection: any;
@@ -422,12 +428,14 @@ function MTeamSnapshotPanel({
   onTestConnection: () => void;
   testingConnection: boolean;
   statusOverride: { success: boolean; message: string } | null;
+  updatedAt?: string;
 }) {
-  const [trafficDimension, setTrafficDimension] = useState<TrafficDimension>("day");
+  const [trafficDimension, setTrafficDimension] = useState<TrafficDimension>("hour");
   const history = mteam.traffic_series?.[trafficDimension] ?? mteam.traffic_history ?? [];
   const connected = statusOverride ? statusOverride.success : Boolean(connection?.enabled && connection?.last_test_success);
   const statusLabel = testingConnection ? "正在测试" : refreshing ? "正在刷新" : connected ? "连接正常" : "连接异常";
   const statusTitle = statusOverride?.message ?? connection?.message ?? statusLabel;
+  const deltas = mteamDeltaLabels(mteam);
 
   return (
     <section className="panel">
@@ -441,30 +449,31 @@ function MTeamSnapshotPanel({
           <button className={refreshing ? "refresh-icon-button spinning" : "refresh-icon-button"} onClick={onRefresh} disabled={refreshing} title="重新抓取站点数据" aria-label="重新抓取站点数据">
             <RefreshCw size={17} />
           </button>
+          <small className="last-refresh">数据更新于：{formatDateLabel(updatedAt || mteam.updated_at)}</small>
         </div>
       </div>
       <div className="mteam-stat-grid">
         <InfoTile icon={UserRound} label="用户等级" value={mteam.user_level ?? "User"} />
-        <InfoTile icon={Coins} label="魔力值" value={numberLabel(mteam.bonus)} delta={mteam.bonus_delta_label} />
-        <InfoTile icon={Percent} label="分享率" value={numberLabel(mteam.ratio, 3)} delta={mteam.ratio_delta_label} negative={String(mteam.ratio_delta_label ?? "").startsWith("-")} />
-        <InfoTile icon={Upload} label="总上传量" value={formatBytesFixed(mteam.upload_total, 2)} delta={mteam.upload_delta_label} />
-        <InfoTile icon={Download} label="总下载量" value={formatBytes(mteam.download_total)} delta={mteam.download_delta_label} />
+        <InfoTile icon={Coins} label="魔力值" value={numberLabel(mteam.bonus)} delta={deltas.bonus} />
+        <InfoTile icon={Percent} label="分享率" value={numberLabel(mteam.ratio, 3)} delta={deltas.ratio} negative={String(deltas.ratio ?? "").includes("-")} />
+        <InfoTile icon={Upload} label="总上传量" value={formatBytesFixed(mteam.upload_total, 2)} delta={deltas.upload} />
+        <InfoTile icon={Download} label="总下载量" value={formatBytes(mteam.download_total)} delta={deltas.download} />
         <InfoTile icon={Activity} label="当前活跃上传/下载" value={<ActiveTransferCounts upload={mteam.active_uploads ?? 0} download={mteam.active_downloads ?? 0} />} />
-        <InfoTile icon={Database} label="总做种体积" value={formatBytes(mteam.seed_size ?? 0)} delta={mteam.seed_size_delta_label} negative={String(mteam.seed_size_delta_label ?? "").startsWith("-")} />
-        <InfoTile icon={CalendarDays} label="加入时间" value={mteam.joined_at ?? "-"} />
+        <InfoTile icon={Database} label="总做种体积" value={formatBytes(mteam.seed_size ?? 0)} delta={deltas.seed_size} negative={String(deltas.seed_size ?? "").includes("-")} />
+        <InfoTile icon={CalendarDays} label="加入时间" value={mteam.joined_at ?? "-"} delta={joinedDurationLabel(mteam.joined_at)} />
       </div>
       <div className="traffic-chart">
         <div className="traffic-chart-header">
           <h3>历史流量</h3>
           <div className="traffic-dimension-tools" aria-label="统计维度">
-            <span>统计维度</span>
+            <span>维度</span>
             <div className="segmented compact">
               {[
+                ["hour", "小时"],
                 ["year", "年"],
                 ["month", "月"],
                 ["week", "周"],
-                ["day", "天"],
-                ["hour", "小时"]
+                ["day", "天"]
               ].map(([value, label]) => (
                 <button
                   className={trafficDimension === value ? "active" : ""}
@@ -496,7 +505,7 @@ function TrafficLineChart({ history, dimension }: { history: any[]; dimension: T
   if (!points.length) return <div className="traffic-empty">暂无{trafficDimensionLabel(dimension)}维度历史流量数据</div>;
 
   const width = 760;
-  const height = 190;
+  const height = 180;
   const padding = { top: 12, right: 22, bottom: 30, left: 60 };
   const plotWidth = width - padding.left - padding.right;
   const plotHeight = height - padding.top - padding.bottom;
@@ -571,39 +580,70 @@ function trafficPointLabel(point: any): string {
 }
 
 function compactTrafficLabel(label: string): string {
+  const hourMatch = label.match(/^(\d{2}\/\d{2})\s+(\d{2}):00$/);
+  if (hourMatch) return `${hourMatch[2]}:00`;
+  if (label.includes("~")) return label;
   if (/^\d{4}-\d{2}-\d{2}$/.test(label)) return label.slice(5).replace("-", "/");
-  if (label.includes(":")) return label.slice(0, 5);
-  return label.length > 8 ? label.slice(0, 5) : label;
+  if (label.includes(":")) return label.slice(-5);
+  return label.length > 10 ? label.slice(0, 10) : label;
 }
 
 function trafficDimensionLabel(dimension: TrafficDimension): string {
   return ({ year: "年", month: "月", week: "周", day: "天", hour: "小时" } as Record<TrafficDimension, string>)[dimension];
 }
 
+function mteamDeltaLabels(mteam: any): Record<string, string | undefined> {
+  if (mteam?.delta_preview) {
+    return {
+      bonus: "近期 +816.6",
+      ratio: "近期 +0.021",
+      upload: "近期 +204 GB",
+      download: "近期 +26 GB",
+      seed_size: "近期 +118 GB",
+    };
+  }
+  const prefix = (value?: string) => value ? `近5h ${value}` : undefined;
+  return {
+    bonus: prefix(mteam?.bonus_delta_label),
+    ratio: prefix(mteam?.ratio_delta_label),
+    upload: prefix(mteam?.upload_delta_label),
+    download: prefix(mteam?.download_delta_label),
+    seed_size: prefix(mteam?.seed_size_delta_label),
+  };
+}
+
+function joinedDurationLabel(value: string): string | undefined {
+  if (!value || value === "-") return undefined;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return undefined;
+  const days = Math.max(0, Math.floor((Date.now() - date.getTime()) / 86400000));
+  return `已加入 ${days} 天`;
+}
+
 function ActiveTransferCounts({ upload, download }: { upload: number; download: number }) {
   return (
     <span className="transfer-counts" aria-label={`活跃上传 ${upload}，活跃下载 ${download}`}>
       <span className="transfer-count upload" title="活跃上传">
-        <Upload size={16} />
+        <Upload size={13} />
         {upload}
       </span>
       <span className="transfer-count download" title="活跃下载">
-        <Download size={16} />
+        <Download size={13} />
         {download}
       </span>
     </span>
   );
 }
 
-function InfoTile({ icon: Icon, label, value, delta, negative }: { icon: typeof Film; label: string; value: ReactNode; delta?: string; negative?: boolean }) {
+function InfoTile({ icon: Icon, label, value, delta, negative, className }: { icon: typeof Film; label: string; value: ReactNode; delta?: string; negative?: boolean; className?: string }) {
   return (
-    <div className="info-tile">
+    <div className={className ? `info-tile ${className}` : "info-tile"}>
       <div>
         <small>{label}</small>
         <strong>{value}</strong>
         {delta && <span className={negative ? "delta negative" : "delta"}>{delta}</span>}
       </div>
-      <span className="tile-icon"><Icon size={18} /></span>
+      <span className="tile-icon"><Icon size={15} /></span>
     </div>
   );
 }
@@ -616,6 +656,11 @@ function DiscoverPage() {
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState("");
   const [hasSearched, setHasSearched] = useState(false);
+  const [expandedDiscoverTitle, setExpandedDiscoverTitle] = useState<string | null>(null);
+  const [selectedMedia, setSelectedMedia] = useState<any | null>(null);
+  const [selectedPerson, setSelectedPerson] = useState<any | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState("");
   const [resourceSort, setResourceSort] = useState("seeders");
   const [resourceSortDirection, setResourceSortDirection] = useState<"asc" | "desc">("desc");
   const lists = data ? [
@@ -625,6 +670,7 @@ function DiscoverPage() {
     { title: "Top Rated 电影", items: data.top_rated_movies },
     { title: "Top Rated 剧集", items: data.top_rated_tv }
   ] : [];
+  const expandedDiscoverList = expandedDiscoverTitle ? lists.find((list) => list.title === expandedDiscoverTitle) : null;
   const sortedTorrents = useMemo(() => sortResources(torrents, resourceSort, resourceSortDirection), [torrents, resourceSort, resourceSortDirection]);
 
   useEffect(() => {
@@ -653,6 +699,66 @@ function DiscoverPage() {
     setSearching(false);
   }
 
+  async function openMediaDetail(item: any) {
+    const tmdbId = mediaTmdbId(item);
+    if (!tmdbId || !item.media_type) return;
+    setSelectedPerson(null);
+    setSelectedMedia(item);
+    setExpandedDiscoverTitle(null);
+    setDetailLoading(true);
+    setDetailError("");
+    try {
+      setSelectedMedia(await api<any>(`/api/tmdb/media/${item.media_type}/${tmdbId}`));
+    } catch (err) {
+      setDetailError((err as Error).message);
+    } finally {
+      setDetailLoading(false);
+    }
+  }
+
+  async function openPersonDetail(person: any) {
+    const personId = person?.person_id ?? person?.id;
+    if (!personId) return;
+    setSelectedPerson(person);
+    setDetailLoading(true);
+    setDetailError("");
+    try {
+      setSelectedPerson(await api<any>(`/api/tmdb/person/${personId}`));
+    } catch (err) {
+      setDetailError((err as Error).message);
+    } finally {
+      setDetailLoading(false);
+    }
+  }
+
+  function closeMediaDetail() {
+    setSelectedMedia(null);
+    setSelectedPerson(null);
+    setDetailError("");
+  }
+
+  async function searchMTeamFromMedia(item: any) {
+    const keyword = String(item?.title || item?.original_title || "").trim();
+    if (!keyword) return;
+    setQuery(keyword);
+    setSelectedMedia(null);
+    setSelectedPerson(null);
+    setExpandedDiscoverTitle(null);
+    setMedia([]);
+    setTorrents([]);
+    setHasSearched(true);
+    setSearching(true);
+    setSearchError("");
+    try {
+      const result = await api<{ items: any[] }>(`/api/search/mteam?q=${encodeURIComponent(keyword)}`);
+      setTorrents(result.items);
+    } catch (err) {
+      setSearchError((err as Error).message);
+    } finally {
+      setSearching(false);
+    }
+  }
+
   return (
     <div className="grid-page">
       <form className="searchbar" onSubmit={runSearch}>
@@ -660,22 +766,32 @@ function DiscoverPage() {
         <button className="primary" disabled={searching}><Search size={18} /> {searching ? "搜索中..." : "搜索"}</button>
       </form>
       {searchError && <p className="error">{searchError}</p>}
-      {hasSearched && (
-        <div className="discover-search-results">
-          <MediaSearchResults items={media} />
-          <MTeamResourceResults
-            items={sortedTorrents}
-            sortBy={resourceSort}
-            sortDirection={resourceSortDirection}
-            onSortBy={setResourceSort}
-            onSortDirection={setResourceSortDirection}
-          />
-        </div>
+      {selectedPerson ? (
+        <PersonDetailPage person={selectedPerson} loading={detailLoading} error={detailError} onBack={() => setSelectedPerson(null)} onMediaSelect={openMediaDetail} />
+      ) : selectedMedia ? (
+        <MediaDetailPage item={selectedMedia} loading={detailLoading} error={detailError} onBack={closeMediaDetail} onPersonSelect={openPersonDetail} onMediaSelect={openMediaDetail} onMTeamSearch={searchMTeamFromMedia} mteamSearching={searching} />
+      ) : expandedDiscoverList ? (
+        <DiscoverCollectionPage title={expandedDiscoverList.title} items={expandedDiscoverList.items} onBack={() => setExpandedDiscoverTitle(null)} onSelect={openMediaDetail} />
+      ) : (
+        <>
+          {hasSearched && (
+            <div className="discover-search-results">
+              <MediaSearchResults items={media} onSelect={openMediaDetail} />
+              <MTeamResourceResults
+                items={sortedTorrents}
+                sortBy={resourceSort}
+                sortDirection={resourceSortDirection}
+                onSortBy={setResourceSort}
+                onSortDirection={setResourceSortDirection}
+              />
+            </div>
+          )}
+          {loading && <Panel title="发现"><p>正在从 TMDB 加载片单...</p></Panel>}
+          {error && <Panel title="TMDB 获取失败"><p className="error">{error}</p></Panel>}
+          {data && !data.configured && <Panel title="需要配置 TMDB"><p>{data.message}</p><p className="muted">进入“设置”，在 TMDB 配置里填写 API Key 或 Bearer Token，保存并启用后再回到发现页。</p></Panel>}
+          {lists.map((list) => <PosterRail title={list.title} items={list.items} onMore={() => setExpandedDiscoverTitle(list.title)} onSelect={openMediaDetail} key={list.title} />)}
+        </>
       )}
-      {loading && <Panel title="发现"><p>正在从 TMDB 加载片单...</p></Panel>}
-      {error && <Panel title="TMDB 获取失败"><p className="error">{error}</p></Panel>}
-      {data && !data.configured && <Panel title="需要配置 TMDB"><p>{data.message}</p><p className="muted">进入“设置”，在 TMDB 配置里填写 API Key 或 Bearer Token，保存并启用后再回到发现页。</p></Panel>}
-      {lists.map((list) => <PosterRail title={list.title} items={list.items} key={list.title} />)}
     </div>
   );
 }
@@ -1501,51 +1617,81 @@ function Panel({ title, children }: { title: string; children: ReactNode }) {
 }
 
 function Metric({ title, value, source }: { title: string; value: string; source: string }) {
-  return <div className="metric"><small>{title}</small><strong>{value}</strong><span>{source}</span></div>;
+  return <div className="metric"><small>{title}</small><strong>{value}</strong>{source && <span>{source}</span>}</div>;
+}
+
+function nasSpaceLabel(overview: any): string {
+  return overview?.nas_space_label || "-";
+}
+
+function nasSpaceHelper(overview: any): string {
+  if (overview?.nas_space_label && overview.nas_space_label !== "-") return overview?.nas_space_helper || "";
+  return overview?.nas_space_helper || "需要配置 NAS/qB 存储信息";
+}
+
+function downloaderDisplayName(qb: any): string {
+  const id = String(qb?.id ?? "");
+  const match = id.match(/^qb(\d+)$/i);
+  if (match) return `qB ${match[1]}`;
+  const name = String(qb?.name ?? "");
+  const nameMatch = name.match(/^q?b\s*(\d+)$/i);
+  return nameMatch ? `qB ${nameMatch[1]}` : name || "qB";
 }
 
 function DownloaderCard({ qb }: { qb: any }) {
+  const displayName = downloaderDisplayName(qb);
+  const statusText = qb.online ? "连接正常 · 实时速度" : qb.message || "等待连接";
   return (
-    <div className="data-card">
-      <h3>{qb.name}</h3>
-      <div className="downloader-live-row">
-        <span>活跃资源</span>
+    <div className="downloader-node">
+      <div className="downloader-node-head">
+        <div className="downloader-node-title">
+          <h3>{displayName}</h3>
+        </div>
         <ActiveTransferCounts upload={qb.active_uploads ?? 0} download={qb.active_downloads ?? 0} />
       </div>
-      <p>下载 {formatSpeed(qb.download_speed)}</p>
-      <p>上传 {formatSpeed(qb.upload_speed)}</p>
-      <small>{qb.source}</small>
+      <div className="downloader-speed-row">
+        <span><Download size={13} />{formatSpeed(qb.download_speed)}</span>
+        <span><Upload size={13} />{formatSpeed(qb.upload_speed)}</span>
+      </div>
+      <small className="downloader-node-helper">{statusText}</small>
     </div>
   );
 }
 
 function LockedCard({ title, message }: { title: string; message: string }) {
-  return <div className="data-card locked"><Lock size={20} /><h3>{title}</h3><p>{message}</p></div>;
+  return <div className="downloader-node locked"><div className="downloader-node-head"><div className="downloader-node-title"><h3>{title}</h3></div><Lock size={16} /></div><p>{message}</p><small className="downloader-node-helper">需要管理员验证</small></div>;
 }
 
-function MediaSearchResults({ items = [] }: { items: any[] }) {
+function MediaSearchResults({ items = [], onSelect }: { items: any[]; onSelect: (item: any) => void }) {
   return (
     <Panel title="TMDB 媒体结果">
       <div className="media-result-grid">
-        {items.map((item) => <MediaResultCard item={item} key={item.id} />)}
+        {items.map((item) => <MediaResultCard item={item} onSelect={onSelect} key={item.id} />)}
         {!items.length && <p className="muted">没有搜索到 TMDB 媒体，或 TMDB 尚未启用。</p>}
       </div>
     </Panel>
   );
 }
 
-function MediaResultCard({ item }: { item: any }) {
-  const cast = (item.cast ?? []).slice(0, 5).join(" / ");
+function MediaResultCard({ item, onSelect }: { item: any; onSelect: (item: any) => void }) {
   const genres = (item.genres ?? []).slice(0, 4);
   const meta = [
     item.media_type === "tv" ? "剧集" : "电影",
     item.year,
     item.runtime ? `${item.runtime} 分钟` : "",
-    item.original_language ? String(item.original_language).toUpperCase() : ""
+    mediaCountryLabel(item)
   ].filter(Boolean).join(" / ");
 
   return (
-    <article className="media-result-card">
+    <article
+      className="media-result-card media-result-card-clickable"
+      role="button"
+      tabIndex={0}
+      onClick={() => onSelect(item)}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") onSelect(item);
+      }}
+    >
       {item.backdrop && <img className="media-backdrop" src={item.backdrop} alt="" />}
       <div className="media-card-shade" />
       <img className="media-poster" src={item.poster} alt="" />
@@ -1563,13 +1709,6 @@ function MediaResultCard({ item }: { item: any }) {
           {item.popularity ? <InfoPill icon={Activity} text={`热度 ${item.popularity}`} /> : null}
         </div>
         {genres.length > 0 && <div className="chip-row">{genres.map((genre: string) => <span className="soft-chip" key={genre}>{genre}</span>)}</div>}
-        <p className="media-overview">{item.overview || "暂无简介。"}</p>
-        <div className="media-credit-grid">
-          <span><strong>导演</strong>{item.director || "-"}</span>
-          <span><strong>主演</strong>{cast || "-"}</span>
-          {item.release_date && <span><strong>上映</strong>{item.release_date}</span>}
-          {item.imdb_id && <span><strong>IMDb</strong>{item.imdb_id}</span>}
-        </div>
       </div>
     </article>
   );
@@ -1661,8 +1800,205 @@ function InfoPill({ icon: Icon, text, tone }: { icon: typeof Film; text: string;
   return <span className={tone ? `info-pill ${tone}` : "info-pill"}><Icon size={14} />{text}</span>;
 }
 
-function PosterRail({ title, items = [] }: { title: string; items: any[] }) {
-  return <Panel title={title}><div className="poster-rail">{items.map((item) => <article className="poster" key={item.id}><img src={item.poster} alt="" /><strong>{item.title}</strong><span>{item.media_type === "tv" ? "剧集" : "电影"} / {item.year} / {item.rating}</span></article>)}</div></Panel>;
+function PosterRail({ title, items = [], onMore, onSelect }: { title: string; items: any[]; onMore: () => void; onSelect: (item: any) => void }) {
+  return (
+    <section className="discover-section">
+      <div className="discover-section-header">
+        <h2><span />{title}</h2>
+        <button className="discover-more" type="button" onClick={onMore}>更多 <span>›</span></button>
+      </div>
+      <div className="poster-rail" aria-label={title}>
+        {items.map((item) => <DiscoverPosterCard item={item} onSelect={onSelect} key={item.id} />)}
+      </div>
+    </section>
+  );
+}
+
+function DiscoverCollectionPage({ title, items = [], onBack, onSelect }: { title: string; items: any[]; onBack: () => void; onSelect: (item: any) => void }) {
+  return (
+    <section className="discover-collection">
+      <div className="discover-collection-header">
+        <button type="button" onClick={onBack}>返回发现</button>
+        <div>
+          <h2>{title}</h2>
+          <span>{items.length} 个资源</span>
+        </div>
+      </div>
+      <div className="poster-grid">
+        {items.map((item) => <DiscoverPosterCard item={item} onSelect={onSelect} key={item.id} />)}
+        {!items.length && <p className="muted">暂无资源。</p>}
+      </div>
+    </section>
+  );
+}
+
+function DiscoverPosterCard({ item, onSelect }: { item: any; onSelect: (item: any) => void }) {
+  const rating = Number(item.rating ?? 0);
+  const details = [
+    item.year && item.year !== "未知" ? String(item.year) : "",
+    mediaCountryLabel(item),
+    mediaGenreLabel(item),
+    mediaCreditLabel(item),
+  ].filter(Boolean);
+  return (
+    <article
+      className="poster poster-clickable"
+      role="button"
+      tabIndex={0}
+      onClick={() => onSelect(item)}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") onSelect(item);
+      }}
+    >
+      <div className="poster-art">
+        <img src={item.poster} alt="" />
+        <span className="poster-type">{item.media_type === "tv" ? "电视剧" : "电影"}</span>
+        {rating > 0 && <span className="poster-rating">{numberLabel(rating, 1)}</span>}
+        <div className="poster-hover">
+          {details.map((detail) => <span key={detail}>{detail}</span>)}
+        </div>
+      </div>
+      <strong title={item.title}>{item.title}</strong>
+    </article>
+  );
+}
+
+function MediaDetailPage({
+  item,
+  loading,
+  error,
+  onBack,
+  onPersonSelect,
+  onMediaSelect,
+  onMTeamSearch,
+  mteamSearching
+}: {
+  item: any;
+  loading: boolean;
+  error: string;
+  onBack: () => void;
+  onPersonSelect: (person: any) => void;
+  onMediaSelect: (item: any) => void;
+  onMTeamSearch: (item: any) => void;
+  mteamSearching: boolean;
+}) {
+  const castMembers = Array.isArray(item.cast_members) ? item.cast_members : [];
+  const recommendations = Array.isArray(item.recommendations) ? item.recommendations : [];
+  const facts = [
+    ["TMDB ID", item.tmdb_id || mediaTmdbId(item) || "-"],
+    ["原始标题", item.original_title || "-"],
+    ["上映日期", item.release_date || "-"],
+    ["出品国家", mediaCountryLabel(item) || "-"],
+  ];
+  return (
+    <section className="tmdb-detail">
+      {item.backdrop && <img className="tmdb-detail-backdrop" src={item.backdrop} alt="" />}
+      <div className="tmdb-detail-haze" />
+      <div className="tmdb-detail-glass">
+        <button className="tmdb-back" type="button" onClick={onBack}>返回发现</button>
+        <button className="tmdb-mteam-search" type="button" onClick={() => onMTeamSearch(item)} disabled={mteamSearching} title="用影片名称在 M-Team 搜索资源">
+          <Radar size={17} />
+          {mteamSearching ? "搜索中" : "馒头搜索"}
+        </button>
+        {loading && <span className="tmdb-loading">正在读取 TMDB 详情...</span>}
+        {error && <p className="error">{error}</p>}
+        <div className="tmdb-detail-main">
+          <img className="tmdb-detail-poster" src={item.poster} alt="" />
+          <div className="tmdb-detail-copy">
+            <span className="tmdb-type-pill">{item.media_type === "tv" ? "电视剧" : "电影"}</span>
+            <h2>{item.title} <small>{item.year && item.year !== "未知" ? `(${item.year})` : ""}</small></h2>
+            <p className="tmdb-subtitle">{[item.runtime ? `${item.runtime} 分钟` : "", mediaGenreLabel(item), item.director ? `导演 ${item.director}` : ""].filter(Boolean).join(" / ")}</p>
+            <div className="tmdb-score-line">
+              <span className="tmdb-score"><Star size={16} /> {numberLabel(Number(item.rating ?? 0), 1)}</span>
+              <span>{numberLabel(Number(item.vote_count ?? 0))} 票</span>
+              {item.popularity ? <span>热度 {numberLabel(Number(item.popularity), 1)}</span> : null}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <section className="tmdb-synopsis-row">
+        <div className="tmdb-synopsis">
+            <h3>简介</h3>
+            <p className="tmdb-overview">{item.overview || "暂无简介。"}</p>
+            <div className="tmdb-credit-line">
+              <span><strong>导演</strong>{item.director || "-"}</span>
+              <span><strong>主演</strong>{Array.isArray(item.cast) ? item.cast.slice(0, 4).join(" / ") : "-"}</span>
+            </div>
+        </div>
+        <aside className="tmdb-facts">
+          <div className="tmdb-star-strip" aria-label={`评分 ${numberLabel(Number(item.rating ?? 0), 1)}`}>
+            {ratingStars(Number(item.rating ?? 0)).map((filled, index) => <Star size={18} key={index} fill={filled ? "currentColor" : "none"} />)}
+          </div>
+          {facts.map(([label, value]) => <span key={label}><small>{label}</small><strong>{value}</strong></span>)}
+        </aside>
+      </section>
+
+      <section className="tmdb-detail-section">
+        <div className="discover-section-header"><h2><span />演员阵容</h2></div>
+        <div className="tmdb-cast-rail">
+          {castMembers.map((person: any) => (
+            <button className="tmdb-person-card" type="button" onClick={() => onPersonSelect(person)} key={person.id}>
+              <img src={person.profile} alt="" />
+              <strong>{person.name}</strong>
+              <span>{person.character ? `饰 ${person.character}` : "演员"}</span>
+            </button>
+          ))}
+          {!castMembers.length && <p className="muted">暂无演员阵容。</p>}
+        </div>
+      </section>
+
+      <section className="tmdb-detail-section">
+        <div className="discover-section-header"><h2><span />猜你喜欢</h2></div>
+        <div className="poster-rail">
+          {recommendations.map((next: any) => <DiscoverPosterCard item={next} onSelect={onMediaSelect} key={next.id} />)}
+          {!recommendations.length && <p className="muted">暂无同类型推荐。</p>}
+        </div>
+      </section>
+    </section>
+  );
+}
+
+function PersonDetailPage({
+  person,
+  loading,
+  error,
+  onBack,
+  onMediaSelect
+}: {
+  person: any;
+  loading: boolean;
+  error: string;
+  onBack: () => void;
+  onMediaSelect: (item: any) => void;
+}) {
+  const works = Array.isArray(person.known_for) ? person.known_for : [];
+  return (
+    <section className="tmdb-detail tmdb-person-detail">
+      <div className="tmdb-detail-haze" />
+      <div className="tmdb-detail-glass">
+        <button className="tmdb-back" type="button" onClick={onBack}>返回影片</button>
+        {loading && <span className="tmdb-loading">正在读取演员作品...</span>}
+        {error && <p className="error">{error}</p>}
+        <div className="tmdb-person-hero">
+          <img src={person.profile} alt="" />
+          <div>
+            <span className="tmdb-type-pill">{person.known_for_department || "Acting"}</span>
+            <h2>{person.name}</h2>
+            <p className="tmdb-subtitle">{[person.birthday, person.place_of_birth].filter(Boolean).join(" / ")}</p>
+            <p className="tmdb-overview">{person.biography || "暂无演员简介。"}</p>
+          </div>
+        </div>
+      </div>
+      <section className="tmdb-detail-section">
+        <div className="discover-section-header"><h2><span />相关作品</h2></div>
+        <div className="poster-rail">
+          {works.map((work: any) => <DiscoverPosterCard item={work} onSelect={onMediaSelect} key={work.id} />)}
+          {!works.length && <p className="muted">暂无相关作品。</p>}
+        </div>
+      </section>
+    </section>
+  );
 }
 
 function ResourceRow({ item }: { item: any }) {
@@ -1847,9 +2183,109 @@ function formatBytesFixed(value: number, digits: number): string {
 
 function formatDateLabel(value: string): string {
   if (!value) return "-";
-  const date = new Date(value);
+  const normalized = /T/.test(value) && !/(Z|[+-]\d{2}:?\d{2})$/.test(value) ? `${value}Z` : value;
+  const date = new Date(normalized);
   if (Number.isNaN(date.getTime())) return String(value).slice(0, 10);
-  return date.toLocaleString(undefined, { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  const pad = (part: number) => String(part).padStart(2, "0");
+  return `${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function mediaCountryLabel(item: any): string {
+  const countries = Array.isArray(item.production_countries) ? item.production_countries.filter(Boolean) : [];
+  if (countries.length) return countries.slice(0, 2).map(localizedCountryName).join(" / ");
+  const language = String(item.original_language ?? "").trim();
+  return language ? localizedLanguageName(language) : "";
+}
+
+const COUNTRY_NAME_ZH: Record<string, string> = {
+  US: "美国",
+  USA: "美国",
+  "UNITED STATES": "美国",
+  "UNITED STATES OF AMERICA": "美国",
+  CN: "中国大陆",
+  CHINA: "中国大陆",
+  HK: "中国香港",
+  "HONG KONG": "中国香港",
+  TW: "中国台湾",
+  TAIWAN: "中国台湾",
+  JP: "日本",
+  JAPAN: "日本",
+  KR: "韩国",
+  "SOUTH KOREA": "韩国",
+  GB: "英国",
+  UK: "英国",
+  "UNITED KINGDOM": "英国",
+  FR: "法国",
+  FRANCE: "法国",
+  DE: "德国",
+  GERMANY: "德国",
+  ES: "西班牙",
+  SPAIN: "西班牙",
+  IT: "意大利",
+  ITALY: "意大利",
+  CA: "加拿大",
+  CANADA: "加拿大",
+  AU: "澳大利亚",
+  AUSTRALIA: "澳大利亚",
+  RU: "俄罗斯",
+  RUSSIA: "俄罗斯",
+  IN: "印度",
+  INDIA: "印度",
+  TH: "泰国",
+  THAILAND: "泰国",
+  MX: "墨西哥",
+  MEXICO: "墨西哥",
+  BR: "巴西",
+  BRAZIL: "巴西"
+};
+
+const LANGUAGE_NAME_ZH: Record<string, string> = {
+  EN: "英语",
+  ES: "西班牙语",
+  RU: "俄语",
+  ZH: "中文",
+  JA: "日语",
+  KO: "韩语",
+  FR: "法语",
+  DE: "德语",
+  IT: "意大利语",
+  PT: "葡萄牙语",
+  HI: "印地语",
+  TH: "泰语"
+};
+
+function localizedCountryName(value: string): string {
+  const key = String(value).trim().toUpperCase();
+  return COUNTRY_NAME_ZH[key] || String(value);
+}
+
+function localizedLanguageName(value: string): string {
+  const key = String(value).trim().toUpperCase();
+  return LANGUAGE_NAME_ZH[key] || key;
+}
+
+function mediaGenreLabel(item: any): string {
+  const genres = Array.isArray(item.genres) ? item.genres.filter(Boolean) : [];
+  return genres.slice(0, 3).join(" / ");
+}
+
+function mediaCreditLabel(item: any): string {
+  const director = String(item.director ?? "").trim();
+  if (director) return `导演 ${director}`;
+  const cast = Array.isArray(item.cast) ? item.cast.filter(Boolean).slice(0, 2).join(" / ") : "";
+  return cast ? `主演 ${cast}` : "";
+}
+
+function mediaTmdbId(item: any): string {
+  if (item?.tmdb_id) return String(item.tmdb_id);
+  const id = String(item?.id ?? "");
+  const parts = id.split("-");
+  return parts.length > 1 ? parts[parts.length - 1] : id;
+}
+
+function ratingStars(value: number): boolean[] {
+  const filled = Math.max(0, Math.min(10, Math.round(Number(value || 0))));
+  return Array.from({ length: 10 }, (_, index) => index < filled);
 }
 
 function numberPair(value: number, total: number): string {

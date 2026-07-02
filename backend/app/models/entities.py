@@ -105,10 +105,12 @@ class MTeamSnapshot(Base):
     __tablename__ = "mteam_snapshots"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_level: Mapped[str] = mapped_column(String(64), default="")
     upload_total: Mapped[float] = mapped_column(Float, default=0)
     download_total: Mapped[float] = mapped_column(Float, default=0)
     bonus: Mapped[float] = mapped_column(Float, default=0)
     ratio: Mapped[float] = mapped_column(Float, default=0)
+    seed_size: Mapped[float] = mapped_column(Float, default=0)
     active_uploads: Mapped[int] = mapped_column(Integer, default=0)
     active_downloads: Mapped[int] = mapped_column(Integer, default=0)
     source: Mapped[str] = mapped_column(String(64), default="mock")
@@ -202,4 +204,3 @@ class Setting(Base):
     key: Mapped[str] = mapped_column(String(120), unique=True)
     value: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
-

@@ -48,13 +48,15 @@ class MTeamAdapter(TrackerAdapter):
         member_count = data.get("memberCount") if isinstance(data.get("memberCount"), dict) else {}
         member_status = data.get("memberStatus") if isinstance(data.get("memberStatus"), dict) else {}
         user_id = _string_from_any(data.get("id") or _find_value(flat, "id"))
-        seeding_stats = self._get_seeding_stats(user_id)
+        profile_seed_count = int(_float_from_any(_find_value(flat, "seedCount", "seedingCount", "activeUploads", "seeders")) or 0)
+        profile_seed_size = _bytes_from_any(_find_value(flat, "seedSize", "seedingSize", "seedVolume", "seedingVolume"))
+        seeding_stats = self._get_seeding_stats(user_id, seed_count_hint=profile_seed_count, seed_size_hint=profile_seed_size)
         upload_total = _bytes_from_any(member_count.get("uploaded") or _find_value(flat, "uploaded", "uploadTotal", "totalUpload", "uploadedBytes", "uploadBytes"))
         download_total = _bytes_from_any(member_count.get("downloaded") or _find_value(flat, "downloaded", "downloadTotal", "totalDownload", "downloadedBytes", "downloadBytes"))
         bonus = _float_from_any(member_count.get("bonus") or _find_value(flat, "bonus", "bonusValue", "magic", "magicPoint", "point", "points", "credit"))
         ratio = _float_from_any(member_count.get("shareRate") or _find_value(flat, "shareRate", "ratio", "share_rate", "uploadedDownloadedRatio"))
-        seed_count = seeding_stats["seed_count"] or int(_float_from_any(_find_value(flat, "seedCount", "seedingCount", "activeUploads", "seeders")) or 0)
-        seed_size = seeding_stats["seed_size"] or _bytes_from_any(_find_value(flat, "seedSize", "seedingSize", "seedVolume", "seedingVolume"))
+        seed_count = seeding_stats["seed_count"] or profile_seed_count
+        seed_size = seeding_stats["seed_size"] or profile_seed_size
         joined_at = _string_from_any(member_status.get("createdDate") or _find_value(flat, "joinDate", "joinedAt", "createdAt", "createdDate", "registerDate"))
         user_level = _mteam_role_label(data.get("role")) or _string_from_any(_find_value(flat, "level", "memberLevel", "class", "className", "role")) or "User"
         return {
@@ -122,8 +124,8 @@ class MTeamAdapter(TrackerAdapter):
     def get_download_payload(self, torrent_id: str) -> dict[str, Any]:
         return {"torrent_id": torrent_id, "download_url": f"{self.base_url}/api/torrent/download/{torrent_id}"}
 
-    def _get_seeding_stats(self, user_id: str) -> dict[str, Any]:
-        stats = {"seed_count": 0, "seed_size": 0.0, "active_uploads": 0, "active_downloads": 0, "items": []}
+    def _get_seeding_stats(self, user_id: str, seed_count_hint: int = 0, seed_size_hint: float = 0.0) -> dict[str, Any]:
+        stats = {"seed_count": seed_count_hint, "seed_size": seed_size_hint, "active_uploads": 0, "active_downloads": 0, "items": []}
         if not user_id:
             return stats
         peer_status = self._optional_request("POST", "/api/tracker/myPeerStatus", {"uid": user_id})
@@ -131,6 +133,8 @@ class MTeamAdapter(TrackerAdapter):
         if isinstance(peer_data, dict):
             stats["active_uploads"] = int(_float_from_any(peer_data.get("seeder")) or 0)
             stats["active_downloads"] = int(_float_from_any(peer_data.get("leecher")) or 0)
+        if seed_size_hint > 0:
+            return stats
 
         page_number = 1
         page_size = 200

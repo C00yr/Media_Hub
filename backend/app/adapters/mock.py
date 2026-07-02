@@ -82,6 +82,7 @@ class MockQbittorrentAdapter(QbittorrentAdapter):
             "paused": index,
             "errors": 0,
             "free_space": 3.8 * 1024**4 - index * 100 * 1024**3,
+            "total_space": 8 * 1024**4,
             "source": "qB Web API 原始数据（Mock）",
             "updated_at": datetime.utcnow().isoformat(),
         }
@@ -116,29 +117,86 @@ class MockQbittorrentAdapter(QbittorrentAdapter):
 
 
 class MockMetadataAdapter(MetadataAdapter):
+    def _mock_cast(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": index + 1,
+                "person_id": index + 1,
+                "name": name,
+                "character": role,
+                "profile": POSTERS[index % len(POSTERS)],
+                "order": index,
+            }
+            for index, (name, role) in enumerate([
+                ("演员 A", "主角"),
+                ("演员 B", "搭档"),
+                ("演员 C", "特别出演"),
+                ("演员 D", "配角"),
+            ])
+        ]
+
     def search_media(self, query: str) -> list[dict[str, Any]]:
         return [
             {
                 "id": f"movie-{index}",
+                "tmdb_id": index + 1,
                 "media_type": "movie" if index % 2 == 0 else "tv",
                 "title": f"{query or '示例标题'} {index + 1}",
                 "original_title": f"原始标题 {index + 1}",
                 "year": 2020 + index,
+                "release_date": f"{2020 + index}-06-01",
+                "runtime": 100 + index * 4,
                 "rating": 8.1 - index * 0.2,
                 "genres": ["Drama", "Sci-Fi"],
                 "poster": POSTERS[index % len(POSTERS)],
+                "backdrop": POSTERS[(index + 1) % len(POSTERS)],
+                "production_countries": ["中国大陆"] if index % 2 == 0 else ["美国"],
+                "director": f"导演 {index + 1}",
+                "cast": [f"主演 {index + 1}", f"演员 {index + 2}"],
             }
             for index in range(6)
         ]
 
     def get_media_details(self, media_id: str, media_type: str) -> dict[str, Any]:
         return {
-            "id": media_id,
+            "id": f"{media_type}-{media_id}",
+            "tmdb_id": media_id,
             "media_type": media_type,
             "title": "示例媒体详情",
+            "original_title": "Sample Detail",
+            "year": "2026",
+            "release_date": "2026-06-01",
+            "runtime": 112,
+            "rating": 8.2,
+            "vote_count": 1024,
+            "popularity": 92.5,
+            "poster": POSTERS[0],
+            "backdrop": POSTERS[1],
             "overview": "这里是为真实 TMDB 适配器预留的详情数据结构。",
+            "genres": ["剧情", "科幻"],
+            "director": "示例导演",
             "cast": ["演员 A", "演员 B"],
-            "similar": self.search_media("相似")[:3],
+            "cast_members": self._mock_cast(),
+            "production_countries": ["中国大陆"],
+            "original_language": "zh",
+            "recommendations": self.search_media("猜你喜欢")[:6],
+        }
+
+    def get_person_details(self, person_id: str) -> dict[str, Any]:
+        return {
+            "id": person_id,
+            "person_id": person_id,
+            "name": f"示例演员 {person_id}",
+            "profile": POSTERS[int(person_id) % len(POSTERS)] if str(person_id).isdigit() else POSTERS[0],
+            "biography": "这里展示演员简介，以及由 TMDB 返回的相关作品。",
+            "birthday": "1988-01-01",
+            "deathday": "",
+            "place_of_birth": "中国",
+            "known_for_department": "Acting",
+            "also_known_as": [],
+            "gender": None,
+            "imdb_id": "",
+            "known_for": self.search_media("参演作品")[:8],
         }
 
     def get_discover_lists(self) -> dict[str, Any]:

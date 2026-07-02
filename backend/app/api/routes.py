@@ -82,6 +82,48 @@ def bytes_label(value: float, digits: int = 1) -> str:
     return f"{current:.{digits}f} PB"
 
 
+def signed_bytes_delta(value: float) -> str:
+    sign = "+" if value >= 0 else "-"
+    return f"{sign}{bytes_label(abs(value), 2)}"
+
+
+def signed_number_delta(value: float, digits: int = 1) -> str:
+    sign = "+" if value >= 0 else "-"
+    return f"{sign}{abs(value):.{digits}f}"
+
+
+def signed_int_delta(value: int) -> str:
+    sign = "+" if value >= 0 else "-"
+    return f"{sign}{abs(value)}"
+
+
+def apply_mteam_five_hour_deltas(db: Session, mteam: dict[str, Any]) -> dict[str, Any]:
+    cutoff = datetime.utcnow() - timedelta(hours=5)
+    previous = (
+        db.query(MTeamSnapshot)
+        .filter(MTeamSnapshot.source != "mock", MTeamSnapshot.captured_at <= cutoff)
+        .order_by(MTeamSnapshot.captured_at.desc())
+        .first()
+    )
+    mteam["delta_window_label"] = "近5h"
+    if previous is None:
+        mteam["delta_preview"] = True
+        return mteam
+
+    current_level = str(mteam.get("user_level") or "")
+    previous_level = str(previous.user_level or "")
+    mteam["user_level_delta_label"] = "无变化" if not previous_level or previous_level == current_level else f"{previous_level} → {current_level}"
+    mteam["upload_delta_label"] = signed_bytes_delta(float(mteam.get("upload_total") or 0) - float(previous.upload_total or 0))
+    mteam["download_delta_label"] = signed_bytes_delta(float(mteam.get("download_total") or 0) - float(previous.download_total or 0))
+    mteam["bonus_delta_label"] = signed_number_delta(float(mteam.get("bonus") or 0) - float(previous.bonus or 0), 1)
+    mteam["ratio_delta_label"] = signed_number_delta(float(mteam.get("ratio") or 0) - float(previous.ratio or 0), 3)
+    mteam["seed_size_delta_label"] = signed_bytes_delta(float(mteam.get("seed_size") or 0) - float(getattr(previous, "seed_size", 0) or 0))
+    upload_delta = int(mteam.get("active_uploads") or 0) - int(previous.active_uploads or 0)
+    download_delta = int(mteam.get("active_downloads") or 0) - int(previous.active_downloads or 0)
+    mteam["active_delta_label"] = f"上传 {signed_int_delta(upload_delta)} / 下载 {signed_int_delta(download_delta)}"
+    return mteam
+
+
 def preload_cache_key(name: str) -> str:
     return f"{PRELOAD_PREFIX}{name}"
 
@@ -434,6 +476,7 @@ def qb_placeholder_state(downloader_id: str, row: IntegrationConfig | None, mess
         "paused": 0,
         "errors": 0,
         "free_space": 0,
+        "total_space": 0,
         "source": "qB Web API 未启用",
         "updated_at": datetime.utcnow().isoformat(),
         "message": message or ("配置已保存，请在设置中测试并启用。" if configured else "请先在设置中配置 qB WebUI。"),
@@ -469,14 +512,38 @@ def nas_free_space_from_qbs(qbs: list[dict[str, Any]]) -> dict[str, Any]:
     if not qb1:
         return {
             "nas_free_space": 0,
+            "nas_total_space": 0,
+            "nas_used_space": 0,
+            "nas_usage_percent": None,
             "nas_free_space_label": "-",
-            "nas_free_space_source": "qB1",
+            "nas_free_space_source": "",
+            "nas_space_label": "-",
+            "nas_space_helper": "需要配置 NAS/qB 存储信息",
         }
     free_space = float(qb1.get("free_space") or 0)
+    total_space = float(qb1.get("total_space") or 0)
+    if total_space <= 0 or free_space > total_space:
+        return {
+            "nas_free_space": free_space,
+            "nas_total_space": 0,
+            "nas_used_space": 0,
+            "nas_usage_percent": None,
+            "nas_free_space_label": "-",
+            "nas_free_space_source": "",
+            "nas_space_label": "-",
+            "nas_space_helper": "需要配置 NAS/qB 存储信息",
+        }
+    used_space = max(0.0, total_space - free_space)
+    usage_percent = round((used_space / total_space) * 100, 1)
     return {
         "nas_free_space": free_space,
+        "nas_total_space": total_space,
+        "nas_used_space": used_space,
+        "nas_usage_percent": usage_percent,
         "nas_free_space_label": bytes_label(free_space, 2),
-        "nas_free_space_source": "qB1",
+        "nas_free_space_source": "",
+        "nas_space_label": f"{bytes_label(used_space, 2)}/{bytes_label(total_space, 2)}",
+        "nas_space_helper": f"已使用 {usage_percent}%",
     }
 
 
@@ -529,7 +596,7 @@ def aggregate_traffic_points(points: list[dict[str, Any]], dimension: str) -> li
         buckets[period]["download_total"] += float(point.get("download_total") or 0)
     return [
         {
-            "date": period.date().isoformat(),
+            "date": period.isoformat(),
             "label": traffic_period_label(period, dimension),
             "dimension": dimension,
             "upload_total": totals["upload_total"],
@@ -553,15 +620,17 @@ def traffic_period_start(value: datetime, dimension: str) -> datetime:
 
 
 def traffic_period_label(value: datetime, dimension: str) -> str:
+    display_value = value + timedelta(hours=8)
     if dimension == "hour":
-        return value.strftime("%m/%d %H:00")
+        return display_value.strftime("%m/%d %H:00")
     if dimension == "year":
-        return value.strftime("%Y")
+        return display_value.strftime("%Y")
     if dimension == "month":
-        return value.strftime("%Y/%m")
+        return display_value.strftime("%Y/%m")
     if dimension == "week":
-        return f"{value.strftime('%m/%d')} 周"
-    return value.strftime("%m/%d")
+        end = display_value + timedelta(days=6)
+        return f"{display_value.strftime('%m/%d')}~{end.strftime('%m/%d')}"
+    return display_value.strftime("%m/%d")
 
 
 def persist_dashboard_snapshots(db: Session, mteam: dict[str, Any], qbs: list[dict[str, Any]], mteam_ok: bool) -> None:
@@ -569,10 +638,12 @@ def persist_dashboard_snapshots(db: Session, mteam: dict[str, Any], qbs: list[di
     if mteam_ok:
         db.add(
             MTeamSnapshot(
+                user_level=str(mteam.get("user_level") or ""),
                 upload_total=float(mteam.get("upload_total") or 0),
                 download_total=float(mteam.get("download_total") or 0),
                 bonus=float(mteam.get("bonus") or 0),
                 ratio=float(mteam.get("ratio") or 0),
+                seed_size=float(mteam.get("seed_size") or 0),
                 active_uploads=int(mteam.get("active_uploads") or 0),
                 active_downloads=int(mteam.get("active_downloads") or 0),
                 source="real",
@@ -777,6 +848,8 @@ def build_dashboard_payload(db: Session) -> dict[str, Any]:
     qbs = [get_qb_state_for_dashboard(db, downloader_id) for downloader_id in ["qb1", "qb2", "qb3"]]
     nas_space = nas_free_space_from_qbs(qbs)
     persist_dashboard_snapshots(db, mteam, qbs, mteam_ok)
+    if mteam_ok:
+        apply_mteam_five_hour_deltas(db, mteam)
     mteam["traffic_series"] = build_mteam_traffic_series(db)
     mteam["traffic_history"] = mteam["traffic_series"]["day"]
     mteam["traffic_calculation"] = {
@@ -789,14 +862,20 @@ def build_dashboard_payload(db: Session) -> dict[str, Any]:
             "total_download_speed": sum(item.get("download_speed", 0) for item in qbs),
             "total_upload_speed": sum(item.get("upload_speed", 0) for item in qbs),
             "nas_free_space": nas_space["nas_free_space"],
+            "nas_total_space": nas_space["nas_total_space"],
+            "nas_used_space": nas_space["nas_used_space"],
+            "nas_usage_percent": nas_space["nas_usage_percent"],
             "nas_free_space_label": nas_space["nas_free_space_label"],
             "nas_free_space_source": nas_space["nas_free_space_source"],
+            "nas_space_label": nas_space["nas_space_label"],
+            "nas_space_helper": nas_space["nas_space_helper"],
             "download_tasks": sum(item.get("active_downloads", 0) for item in qbs),
             "upload_tasks": sum(item.get("active_uploads", 0) for item in qbs),
         },
         "mteam_connection": connection,
         "mteam": mteam,
         "qbs": qbs,
+        "updated_at": datetime.utcnow().isoformat(),
     }
 
 
@@ -1025,6 +1104,30 @@ def search_media(q: str = Query(default=""), db: Session = Depends(get_db), _: U
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"TMDB 搜索失败：{exc}") from exc
     return {"items": MockMetadataAdapter().search_media(q)}
+
+
+@router.get("/tmdb/media/{media_type}/{media_id}")
+def tmdb_media_detail(media_type: str, media_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
+    if media_type not in {"movie", "tv"}:
+        raise HTTPException(status_code=404, detail="不支持的 TMDB 媒体类型")
+    config_row = get_config(db, "tmdb")
+    if config_row and config_row.enabled:
+        try:
+            return TmdbAdapter(get_decrypted_config(db, "tmdb") or {}).get_media_details(media_id, media_type)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"TMDB 详情获取失败：{exc}") from exc
+    return MockMetadataAdapter().get_media_details(media_id, media_type)
+
+
+@router.get("/tmdb/person/{person_id}")
+def tmdb_person_detail(person_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
+    config_row = get_config(db, "tmdb")
+    if config_row and config_row.enabled:
+        try:
+            return TmdbAdapter(get_decrypted_config(db, "tmdb") or {}).get_person_details(person_id)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"TMDB 演员详情获取失败：{exc}") from exc
+    return MockMetadataAdapter().get_person_details(person_id)
 
 
 @router.get("/search/mteam")

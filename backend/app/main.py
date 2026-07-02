@@ -3,6 +3,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import inspect, text
 
 from app.api.routes import router
 from app.config.settings import get_settings
@@ -15,8 +16,23 @@ settings = get_settings()
 scheduler = build_scheduler(settings.snapshot_interval_minutes)
 
 
+def ensure_schema_compatibility() -> None:
+    if not settings.database_url.startswith("sqlite"):
+        return
+    inspector = inspect(engine)
+    if "mteam_snapshots" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("mteam_snapshots")}
+    with engine.begin() as connection:
+        if "user_level" not in columns:
+            connection.execute(text("ALTER TABLE mteam_snapshots ADD COLUMN user_level VARCHAR(64) DEFAULT ''"))
+        if "seed_size" not in columns:
+            connection.execute(text("ALTER TABLE mteam_snapshots ADD COLUMN seed_size FLOAT DEFAULT 0"))
+
+
 def create_app() -> FastAPI:
     Base.metadata.create_all(bind=engine)
+    ensure_schema_compatibility()
     app = FastAPI(title=settings.app_name, version=settings.app_version)
     app.add_middleware(
         CORSMiddleware,
@@ -30,6 +46,7 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     def startup() -> None:
         Base.metadata.create_all(bind=engine)
+        ensure_schema_compatibility()
         capture_snapshots()
         if not scheduler.running:
             scheduler.start()
