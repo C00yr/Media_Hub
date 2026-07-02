@@ -18,10 +18,12 @@ def capture_snapshots() -> None:
                 stats = MTeamAdapter(get_decrypted_config(db, "mteam") or {}).get_user_stats()
                 db.add(
                     MTeamSnapshot(
+                        user_level=stats.get("user_level") or "",
                         upload_total=stats["upload_total"],
                         download_total=stats["download_total"],
                         bonus=stats["bonus"],
                         ratio=stats["ratio"],
+                        seed_size=stats.get("seed_size", 0),
                         active_uploads=stats["active_uploads"],
                         active_downloads=stats["active_downloads"],
                         source="real",

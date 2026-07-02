@@ -61,6 +61,7 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
             "paused": paused,
             "errors": errors,
             "free_space": _float(state.get("free_space_on_disk")),
+            "total_space": _float(state.get("total_space") or state.get("total_disk_space")),
             "connection_status": state.get("connection_status"),
             "source": "qB Web API 原始数据（Real）",
             "updated_at": datetime.utcnow().isoformat(),
