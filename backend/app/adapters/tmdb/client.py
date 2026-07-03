@@ -1,7 +1,12 @@
+import errno
+import json
+import socket
+import threading
+from contextlib import contextmanager
 from typing import Any
+from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-import json
 
 from app.adapters.base import MetadataAdapter
 
@@ -12,6 +17,7 @@ TMDB_BACKDROP_BASE = "https://image.tmdb.org/t/p/w780"
 TMDB_PROFILE_BASE = "https://image.tmdb.org/t/p/w185"
 PLACEHOLDER_POSTER = "https://placehold.co/342x513?text=No+Poster"
 PLACEHOLDER_PROFILE = "https://placehold.co/185x278?text=No+Photo"
+_IPV4_DNS_LOCK = threading.Lock()
 
 
 class TmdbConfigError(ValueError):
@@ -112,7 +118,7 @@ class TmdbAdapter(MetadataAdapter):
         if self.bearer_token:
             headers["Authorization"] = f"Bearer {self.bearer_token}"
         request = Request(url, headers=headers)
-        with urlopen(request, timeout=self.timeout) as response:
+        with _urlopen_with_ipv4_fallback(request, timeout=self.timeout) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def _normalize_item(self, item: dict[str, Any]) -> dict[str, Any]:
@@ -185,3 +191,37 @@ class TmdbAdapter(MetadataAdapter):
                 if (related.get("media_type") or media_type) in {"movie", "tv"}
             ],
         }
+
+
+def _urlopen_with_ipv4_fallback(request: Request, timeout: int):
+    try:
+        return urlopen(request, timeout=timeout)
+    except URLError as exc:
+        if not _is_network_unreachable(exc):
+            raise
+        with _force_ipv4_dns():
+            return urlopen(request, timeout=timeout)
+
+
+def _is_network_unreachable(exc: URLError) -> bool:
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, OSError) and getattr(reason, "errno", None) == errno.ENETUNREACH:
+        return True
+    return "network is unreachable" in str(reason).lower()
+
+
+@contextmanager
+def _force_ipv4_dns():
+    with _IPV4_DNS_LOCK:
+        original_getaddrinfo = socket.getaddrinfo
+
+        def ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+            results = original_getaddrinfo(host, port, family, type, proto, flags)
+            ipv4_results = [item for item in results if item[0] == socket.AF_INET]
+            return ipv4_results or results
+
+        socket.getaddrinfo = ipv4_getaddrinfo
+        try:
+            yield
+        finally:
+            socket.getaddrinfo = original_getaddrinfo

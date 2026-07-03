@@ -4,6 +4,7 @@
 data/
 backend/data/
 backend/.pytest_cache/
+backend/pytest-cache-files-*/
 backend/**/__pycache__/
 backend/*.egg-info/
 frontend/node_modules/

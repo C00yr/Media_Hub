@@ -58,6 +58,22 @@ type TmdbForm = {
   endpoint: string;
 };
 
+type PushNoticeState = {
+  status: "running" | "success" | "error";
+  title: string;
+  step: string;
+  detail?: string;
+};
+
+type AppLogEntry = {
+  id: string;
+  at: string;
+  level: "info" | "success" | "error";
+  scope: string;
+  message: string;
+  detail?: string;
+};
+
 type MTeamForm = {
   base_url: string;
   api_key: string;
@@ -139,6 +155,57 @@ function useLoad<T>(loader: () => Promise<T>, deps: unknown[]) {
   };
 }
 
+const APP_LOG_EVENT = "ptmh-app-log";
+const APP_LOG_STORAGE_KEY = "ptmh_temp_logs";
+const SEARCH_HISTORY_STORAGE_KEY = "ptmh_search_history";
+
+function readAppLogs(): AppLogEntry[] {
+  try {
+    const value = localStorage.getItem(APP_LOG_STORAGE_KEY);
+    return value ? JSON.parse(value) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeAppLogs(logs: AppLogEntry[]) {
+  localStorage.setItem(APP_LOG_STORAGE_KEY, JSON.stringify(logs.slice(0, 120)));
+  window.dispatchEvent(new CustomEvent(APP_LOG_EVENT, { detail: logs.slice(0, 120) }));
+}
+
+function emitAppLog(entry: Omit<AppLogEntry, "id" | "at">) {
+  const next: AppLogEntry = {
+    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    at: new Date().toLocaleString(),
+    ...entry,
+  };
+  writeAppLogs([next, ...readAppLogs()]);
+}
+
+function formatAppLogs(logs: AppLogEntry[]): string {
+  return logs
+    .map((item) => `[${item.at}] [${item.level}] [${item.scope}] ${item.message}${item.detail ? `\n${item.detail}` : ""}`)
+    .join("\n\n");
+}
+
+function readSearchHistory(): string[] {
+  try {
+    const value = localStorage.getItem(SEARCH_HISTORY_STORAGE_KEY);
+    const parsed = value ? JSON.parse(value) : [];
+    return Array.isArray(parsed) ? parsed.filter((item) => typeof item === "string").slice(0, 12) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeSearchHistory(keyword: string): string[] {
+  const normalized = keyword.trim();
+  if (!normalized) return readSearchHistory();
+  const next = [normalized, ...readSearchHistory().filter((item) => item.toLowerCase() !== normalized.toLowerCase())].slice(0, 12);
+  localStorage.setItem(SEARCH_HISTORY_STORAGE_KEY, JSON.stringify(next));
+  return next;
+}
+
 export function App() {
   const [initialized, setInitialized] = useState<boolean | null>(null);
   const [user, setUser] = useState<User | null>(null);
@@ -185,13 +252,7 @@ export function App() {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <div className="brand">
-          <span className="brand-mark">PT</span>
-          <div>
-            <strong>Media Hub</strong>
-            <small>媒体中枢</small>
-          </div>
-        </div>
+        <BrandLogo subtitle="媒体中枢" />
         <nav>
           {visibleNav.map((item) => {
             const Icon = item.icon;
@@ -235,6 +296,7 @@ export function App() {
           );
         })}
       </nav>
+      <AppLogDock />
     </div>
   );
 }
@@ -243,17 +305,126 @@ function Splash() {
   return <div className="auth-shell"><div className="auth-card"><h1>PT Media Hub</h1><p>正在启动...</p></div></div>;
 }
 
+function BrandLogo({ subtitle, large = false }: { subtitle: string; large?: boolean }) {
+  return (
+    <div className={large ? "brand large" : "brand"}>
+      <span className="brand-mark" aria-hidden="true">
+        <svg className="brand-popcorn" viewBox="0 0 48 48" role="img">
+          <path className="brand-popcorn-kernel" d="M14.9 14.7c-2.7-1.1-4.1-4.3-2.8-6.9 1.4-2.8 5-3.5 7.2-1.5 1.2-3 5.1-4.1 7.7-2.2 1.8 1.3 2.5 3.5 1.8 5.5 2.8-.5 5.5 1.7 5.6 4.6.1 2.9-2.2 5.3-5.1 5.3H17.4c-2.7 0-4.2-2.4-2.5-4.8Z" />
+          <path className="brand-popcorn-cup" d="M12.5 18.5h23l-3.4 22H16l-3.5-22Z" />
+          <path className="brand-popcorn-fold" d="M20.4 19l1.1 21M27.7 19.1l-1.2 20.8" />
+          <path className="brand-popcorn-smile" d="M20.3 28.4c2.3 1.8 5.2 1.8 7.4 0" />
+        </svg>
+      </span>
+      <div className="brand-copy">
+        <strong>Media Hub</strong>
+        <small>{subtitle}</small>
+      </div>
+    </div>
+  );
+}
+
 function SidebarStorage({ summary }: { summary: any | null }) {
-  const free = Number(summary?.free_space ?? 0);
+  const storage = storageDisplay(summary);
   return (
     <section className="sidebar-storage">
       <div className="sidebar-storage-title">
         <HardDrive size={15} />
-        <span>NAS 剩余空间</span>
+        <span>存储空间</span>
       </div>
-      <strong>{free > 0 ? formatBytesFixed(free, 2) : "-"}</strong>
-      <small>默认 qB1 磁盘空间</small>
-      <div className="storage-line"><span /></div>
+      <div className="storage-line"><span style={{ width: `${storage.percent || 0}%` }} /></div>
+      <div className="sidebar-storage-row">
+        <small>{storage.helper}</small>
+        <strong>{storage.value}</strong>
+      </div>
+    </section>
+  );
+}
+
+function storageDisplay(source: any) {
+  const total = Number(source?.total_space ?? source?.nas_total_space ?? 0);
+  const free = Number(source?.free_space ?? source?.nas_free_space ?? 0);
+  const used = Number(source?.used_space ?? source?.nas_used_space ?? (total > 0 ? Math.max(0, total - free) : 0));
+  const rawPercent = typeof source?.nas_usage_percent === "number" ? Number(source.nas_usage_percent) : total > 0 ? (used / total) * 100 : 0;
+  const percent = total > 0 ? Math.max(0, Math.min(100, rawPercent)) : 0;
+  if (total > 0) {
+    return {
+      percent,
+      helper: `已用 ${formatBytesFixed(used, 1)} / ${formatBytesFixed(total, 1)}`,
+      value: `${numberLabel(percent, 0)}%`,
+    };
+  }
+  if (free > 0) {
+    return {
+      percent: 0,
+      helper: "qB1 返回的剩余空间",
+      value: formatBytesFixed(free, 2),
+    };
+  }
+  return {
+    percent: 0,
+    helper: "等待 qB1 磁盘数据",
+    value: "-",
+  };
+}
+
+function AppLogDock() {
+  const [open, setOpen] = useState(false);
+  const [logs, setLogs] = useState<AppLogEntry[]>(() => readAppLogs());
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    function sync(event: Event) {
+      const custom = event as CustomEvent<AppLogEntry[]>;
+      setLogs(custom.detail ?? readAppLogs());
+    }
+    window.addEventListener(APP_LOG_EVENT, sync);
+    window.addEventListener("storage", sync);
+    return () => {
+      window.removeEventListener(APP_LOG_EVENT, sync);
+      window.removeEventListener("storage", sync);
+    };
+  }, []);
+
+  async function copyLogs() {
+    await navigator.clipboard.writeText(formatAppLogs(logs) || "暂无日志");
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1400);
+  }
+
+  function clearLogs() {
+    writeAppLogs([]);
+    setLogs([]);
+  }
+
+  return (
+    <section className={open ? "app-log-dock open" : "app-log-dock"}>
+      <button className="app-log-toggle" type="button" onClick={() => setOpen(!open)}>
+        <MessageSquare size={16} />
+        临时日志
+        {!!logs.length && <span>{logs.length}</span>}
+      </button>
+      {open && (
+        <div className="app-log-panel">
+          <div className="app-log-header">
+            <strong>临时日志文档</strong>
+            <div>
+              <button type="button" onClick={copyLogs}><Copy size={14} />{copied ? "已复制" : "复制"}</button>
+              <button type="button" onClick={clearLogs}>清空</button>
+            </div>
+          </div>
+          <div className="app-log-list">
+            {logs.map((item) => (
+              <article className={`app-log-entry ${item.level}`} key={item.id}>
+                <span>{item.at} / {item.scope}</span>
+                <strong>{item.message}</strong>
+                {item.detail && <pre>{item.detail}</pre>}
+              </article>
+            ))}
+            {!logs.length && <p className="muted">暂无日志。下一次推送下载时会自动记录每一步。</p>}
+          </div>
+        </div>
+      )}
     </section>
   );
 }
@@ -317,7 +488,7 @@ function AuthForm(props: {
   return (
     <div className="auth-shell">
       <form className="auth-card" onSubmit={props.onSubmit}>
-        <div className="brand large"><span className="brand-mark">PT</span><div><strong>Media Hub</strong><small>面向 NAS 的媒体管理应用</small></div></div>
+        <BrandLogo subtitle="面向 NAS 的媒体管理应用" large />
         <h1>{props.title}</h1>
         <label>用户名<input value={props.username} onChange={(event) => props.onUsername(event.target.value)} /></label>
         <label>密码<input type="password" value={props.password} onChange={(event) => props.onPassword(event.target.value)} /></label>
@@ -385,8 +556,8 @@ function DashboardPage() {
         <section className="metric-grid dashboard-overview">
           <Metric title="总下载速度" value={formatSpeed(data.overview.total_download_speed)} source="" />
           <Metric title="总上传速度" value={formatSpeed(data.overview.total_upload_speed)} source="" />
-          <Metric title="活跃任务" value={`${data.overview.download_tasks + data.overview.upload_tasks}`} source="" />
-          <Metric title="NAS 剩余空间" value={nasSpaceLabel(data.overview)} source={nasSpaceHelper(data.overview)} />
+          <Metric title="活跃上传/下载" value={<ActiveTransferCounts upload={data.overview.upload_tasks ?? 0} download={data.overview.download_tasks ?? 0} />} source={`共 ${(data.overview.upload_tasks ?? 0) + (data.overview.download_tasks ?? 0)} 个活跃任务`} />
+          <StorageMetric overview={data.overview} />
         </section>
         <section className="panel dashboard-downloaders">
           <div className="dashboard-panel-title"><h2>下载器</h2></div>
@@ -656,6 +827,7 @@ function DiscoverPage() {
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState("");
   const [hasSearched, setHasSearched] = useState(false);
+  const [searchHistory, setSearchHistory] = useState<string[]>(() => readSearchHistory());
   const [expandedDiscoverTitle, setExpandedDiscoverTitle] = useState<string | null>(null);
   const [selectedMedia, setSelectedMedia] = useState<any | null>(null);
   const [selectedPerson, setSelectedPerson] = useState<any | null>(null);
@@ -679,11 +851,22 @@ function DiscoverPage() {
 
   async function runSearch(event: FormEvent) {
     event.preventDefault();
-    const keyword = query.trim();
+    await runSearchKeyword(query);
+  }
+
+  async function runSearchKeyword(value: string) {
+    const keyword = value.trim();
     if (!keyword) return;
+    setQuery(keyword);
     setSearching(true);
     setSearchError("");
     setHasSearched(true);
+    setExpandedDiscoverTitle(null);
+    setSelectedMedia(null);
+    setSelectedPerson(null);
+    setMedia([]);
+    setTorrents([]);
+    setSearchHistory(writeSearchHistory(keyword));
     const [mediaResult, torrentResult] = await Promise.allSettled([
       api<{ items: any[] }>(`/api/search/media?q=${encodeURIComponent(keyword)}`),
       api<{ items: any[] }>(`/api/search/mteam?q=${encodeURIComponent(keyword)}`)
@@ -750,6 +933,7 @@ function DiscoverPage() {
     setSearching(true);
     setSearchError("");
     try {
+      setSearchHistory(writeSearchHistory(keyword));
       const result = await api<{ items: any[] }>(`/api/search/mteam?q=${encodeURIComponent(keyword)}`);
       setTorrents(result.items);
     } catch (err) {
@@ -765,6 +949,16 @@ function DiscoverPage() {
         <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索电影、剧集、年份、制作组或关键词" />
         <button className="primary" disabled={searching}><Search size={18} /> {searching ? "搜索中..." : "搜索"}</button>
       </form>
+      {searchHistory.length > 0 && (
+        <div className="search-history-strip" aria-label="历史搜索">
+          <span>最近搜索</span>
+          {searchHistory.map((keyword) => (
+            <button type="button" key={keyword} onClick={() => runSearchKeyword(keyword)} disabled={searching}>
+              {keyword}
+            </button>
+          ))}
+        </div>
+      )}
       {searchError && <p className="error">{searchError}</p>}
       {selectedPerson ? (
         <PersonDetailPage person={selectedPerson} loading={detailLoading} error={detailError} onBack={() => setSelectedPerson(null)} onMediaSelect={openMediaDetail} />
@@ -776,9 +970,10 @@ function DiscoverPage() {
         <>
           {hasSearched && (
             <div className="discover-search-results">
-              <MediaSearchResults items={media} onSelect={openMediaDetail} />
+              <MediaSearchResults items={media} onSelect={openMediaDetail} loading={searching} />
               <MTeamResourceResults
                 items={sortedTorrents}
+                loading={searching}
                 sortBy={resourceSort}
                 sortDirection={resourceSortDirection}
                 onSortBy={setResourceSort}
@@ -800,18 +995,53 @@ function DownloadsPage() {
   const [downloader, setDownloader] = useState("qb1");
   const [grantOpen, setGrantOpen] = useState(false);
   const { data, error, loading, setData } = useLoad<any>(() => api(`/api/downloads/${downloader}/overview?cached=true`), [downloader]);
+  const downloadRequestId = useRef(0);
+  const [qb2Authorized, setQb2Authorized] = useState(false);
+  const [refreshingDownload, setRefreshingDownload] = useState(false);
 
   useEffect(() => {
-    api<any>(`/api/downloads/${downloader}/overview?refresh=true`).then(setData).catch(() => undefined);
+    refreshDownloadOverview(downloader);
     const timer = window.setInterval(() => {
-      api<any>(`/api/downloads/${downloader}/overview?refresh=true`).then(setData).catch(() => undefined);
+      refreshDownloadOverview(downloader);
     }, 5000);
     return () => window.clearInterval(timer);
   }, [downloader]);
 
-  const qb2Locked = downloader === "qb2" && Boolean(error);
-  const summary = data?.summary;
-  const items = data?.items ?? [];
+  function refreshDownloadOverview(target = downloader) {
+    const requestId = downloadRequestId.current + 1;
+    downloadRequestId.current = requestId;
+    return api<any>(`/api/downloads/${target}/overview?refresh=true`)
+      .then((value) => {
+        if (downloadRequestId.current === requestId && value?.downloader_id === target) setData(value);
+        if (target === "qb2") setQb2Authorized(true);
+        return value;
+      })
+      .catch(() => undefined);
+  }
+
+  async function manualRefreshDownloadOverview() {
+    if (refreshingDownload) return;
+    setRefreshingDownload(true);
+    try {
+      await refreshDownloadOverview(downloader);
+    } finally {
+      setRefreshingDownload(false);
+    }
+  }
+
+  async function revokeQb2Grant() {
+    await api("/api/auth/qb2-grant/revoke", { method: "POST" });
+    setQb2Authorized(false);
+    if (downloader === "qb2") {
+      setData(null);
+      setGrantOpen(false);
+    }
+  }
+
+  const visibleData = data?.downloader_id === downloader ? data : null;
+  const qb2Locked = downloader === "qb2" && !qb2Authorized && (Boolean(error) || (!loading && !visibleData));
+  const summary = visibleData?.summary;
+  const items = visibleData?.items ?? [];
 
   return (
     <div className="grid-page download-page">
@@ -821,26 +1051,38 @@ function DownloadsPage() {
           <p>查看和管理多个 qB 下载器中的真实任务。</p>
         </div>
         <div className="segmented">
-          {["qb1", "qb2", "qb3"].map((id) => <button className={downloader === id ? "active" : ""} onClick={() => setDownloader(id)} key={id}>{id.toUpperCase()}</button>)}
+          {["qb1", "qb2", "qb3"].map((id) => <button className={downloader === id ? "active" : ""} onClick={() => setDownloader(id)} key={id}>{downloaderShortLabel(id)}</button>)}
         </div>
       </div>
-      {summary && !qb2Locked && <QbSummaryCards qb={summary} count={items.length} />}
-      {qb2Locked && <Panel title="qB 2 已锁定"><p>私有下载器需要管理员验证。</p><button className="primary" onClick={() => setGrantOpen(true)}><Lock size={16} /> 验证管理员</button></Panel>}
+      {summary && !qb2Locked && <QbSummaryCards qb={summary} count={items.length} onRefresh={manualRefreshDownloadOverview} refreshing={refreshingDownload} />}
+      {downloader === "qb2" && qb2Authorized && !qb2Locked && <div className="qb-grant-strip"><span>qB2 隐私授权已开启</span><button type="button" onClick={revokeQb2Grant}>退出授权</button></div>}
+      {qb2Locked && <Panel title="qB2 已锁定"><p>私有下载器需要管理员验证。</p><button className="primary" onClick={() => setGrantOpen(true)}><Lock size={16} /> 验证管理员</button></Panel>}
       {error && downloader !== "qb2" && <p className="error">{error}</p>}
-      {grantOpen && <AdminGrant onDone={() => { setGrantOpen(false); api<any>(`/api/downloads/${downloader}/overview?refresh=true`).then(setData).catch(() => undefined); }} />}
-      {loading && !data && !error && <Panel title="下载器"><p>正在读取 qB 真实数据...</p></Panel>}
-      {data && !qb2Locked && <QbTorrentTable items={items} downloader={downloader} onChanged={() => { api<any>(`/api/downloads/${downloader}/overview?refresh=true`).then(setData).catch(() => undefined); }} />}
+      {grantOpen && <AdminGrant onDone={() => { setGrantOpen(false); setQb2Authorized(true); setData(null); refreshDownloadOverview("qb2"); }} />}
+      {loading && !visibleData && (!error || qb2Authorized) && <Panel title="下载器"><p>正在读取 qB 真实数据...</p></Panel>}
+      {visibleData && !qb2Locked && <QbTorrentTable key={downloader} items={items} downloader={downloader} onChanged={() => { refreshDownloadOverview(); }} />}
     </div>
   );
 }
 
-function QbSummaryCards({ qb, count }: { qb: any; count: number }) {
+function QbSummaryCards({ qb, count, onRefresh, refreshing }: { qb: any; count: number; onRefresh: () => void; refreshing: boolean }) {
   return (
     <div className="qb-summary-cards">
-      <SummaryCard icon={Database} label="当前下载器" value={qb.name || qb.id?.toUpperCase()} helper={qb.online ? "在线" : "离线"} tone="mint" />
+      <SummaryCard
+        icon={Database}
+        label="当前下载器"
+        value={downloaderDisplayName(qb)}
+        helper={qb.online ? "在线" : "离线"}
+        tone="mint"
+        action={(
+          <button className={refreshing ? "refresh-icon-button spinning" : "refresh-icon-button"} type="button" onClick={onRefresh} disabled={refreshing} title="刷新当前下载器" aria-label="刷新当前下载器">
+            <RefreshCw size={15} />
+          </button>
+        )}
+      />
       <SummaryCard icon={Download} label="下载速度" value={formatSpeed(qb.download_speed ?? 0)} helper="qB 实时速度" tone="teal" />
       <SummaryCard icon={Upload} label="上传速度" value={formatSpeed(qb.upload_speed ?? 0)} helper="qB 实时速度" tone="orange" />
-      <SummaryCard icon={Activity} label="活跃任务" value={`${(qb.active_downloads ?? 0) + (qb.active_uploads ?? 0)}`} helper={`共 ${count} 个任务`} tone="blue" />
+      <SummaryCard icon={Activity} label="活跃上传/下载" value={<ActiveTransferCounts upload={qb.active_uploads ?? 0} download={qb.active_downloads ?? 0} />} helper={`活跃共 ${(qb.active_downloads ?? 0) + (qb.active_uploads ?? 0)} 个 / 总 ${count} 个任务`} tone="blue" />
       <span><strong>{qb.name}</strong>{qb.online ? "在线" : "离线"}</span>
       <span><Download size={14} /> {formatSpeed(qb.download_speed)}</span>
       <span><Upload size={14} /> {formatSpeed(qb.upload_speed)}</span>
@@ -850,12 +1092,12 @@ function QbSummaryCards({ qb, count }: { qb: any; count: number }) {
   );
 }
 
-function SummaryCard({ icon: Icon, label, value, helper, tone }: { icon: typeof Film; label: string; value: string; helper: string; tone: "mint" | "teal" | "orange" | "blue" }) {
+function SummaryCard({ icon: Icon, label, value, helper, tone, action }: { icon: typeof Film; label: string; value: ReactNode; helper: string; tone: "mint" | "teal" | "orange" | "blue"; action?: ReactNode }) {
   return (
     <article className={`summary-card ${tone}`}>
       <div className="summary-card-icon"><Icon size={24} /></div>
       <div>
-        <span>{label}</span>
+        <span>{label}{action}</span>
         <strong>{value}</strong>
         <small>{helper}</small>
       </div>
@@ -873,21 +1115,13 @@ function QbTorrentTable({ items, downloader, onChanged }: { items: any[]; downlo
   const selectedItem = items.find((item) => item.hash === selectedHash) ?? null;
 
   useEffect(() => {
-    if (!items.length) {
+    if (selectedHash && !items.some((item) => item.hash === selectedHash)) {
       setSelectedHash("");
       setDetail(null);
       setDetailLoading(false);
-      return;
-    }
-    if (!selectedHash || !items.some((item) => item.hash === selectedHash)) {
-      setSelectedHash(items[0].hash);
+      setDetailError("");
     }
   }, [items, selectedHash]);
-
-  useEffect(() => {
-    if (!selectedHash) return;
-    loadDetail(selectedHash);
-  }, [downloader, selectedHash]);
 
   useEffect(() => {
     function closeMenu() {
@@ -930,7 +1164,7 @@ function QbTorrentTable({ items, downloader, onChanged }: { items: any[]; downlo
 
   async function deleteTorrent(item: any) {
     const confirmResult = await api<{ confirm_token: string }>(`/api/qb/${downloader}/torrents/${encodeURIComponent(item.hash)}/delete-confirm`, { method: "POST" });
-    const confirmed = window.confirm(`确认从 ${downloader.toUpperCase()} 删除这个任务？\n\n${item.name}\n\n默认不会删除本地文件。`);
+    const confirmed = window.confirm(`确认从 ${downloaderShortLabel(downloader)} 删除这个任务？\n\n${item.name}\n\n默认不会删除本地文件。`);
     if (!confirmed) return;
     await api(`/api/qb/${downloader}/torrents/${encodeURIComponent(item.hash)}?confirm_token=${encodeURIComponent(confirmResult.confirm_token)}&delete_files=false`, { method: "DELETE" });
     setContextMenu(null);
@@ -952,47 +1186,46 @@ function QbTorrentTable({ items, downloader, onChanged }: { items: any[]; downlo
     <>
       <section className="qb-table-panel">
         <div className="qb-table-header">
-          <h2>{downloader.toUpperCase()} 任务</h2>
-          <span>{items.length} 条资源</span>
+          <h2>{downloaderShortLabel(downloader)} 任务</h2>
+          <span>{items.length} 条任务</span>
         </div>
-        <div className="qb-table-scroll">
-          <table className="qb-table">
-            <thead>
-              <tr>
-                <th>名称</th>
-                <th>选定大小</th>
-                <th>进度</th>
-                <th>状态</th>
-                <th>种子</th>
-                <th>用户</th>
-                <th>下载速度</th>
-                <th>上传速度</th>
-                <th>剩余时间</th>
-                <th>比率</th>
-                <th>流行度</th>
-                <th>分类</th>
-                <th>标签</th>
-                <th>添加于</th>
-                <th>保存路径</th>
-              </tr>
-            </thead>
-            <tbody>
-              {items.map((item) => (
-                <QbTorrentTableRow
-                  item={item}
-                  selected={item.hash === selectedHash}
-                  onSelect={() => setSelectedHash(item.hash)}
-                  onContextMenu={(event) => {
-                    event.preventDefault();
-                    setSelectedHash(item.hash);
-                    setContextMenu({ x: event.clientX, y: event.clientY, item });
-                  }}
-                  key={item.hash}
-                />
-              ))}
-              {!items.length && <tr><td colSpan={15} className="qb-empty">当前下载器没有任务</td></tr>}
-            </tbody>
-          </table>
+        <div className="qb-task-list-wrap">
+          <div className="qb-task-grid qb-task-head" role="row">
+            <span>名称</span>
+            <span>大小</span>
+            <span>进度</span>
+            <span>状态</span>
+            <span>种子</span>
+            <span>用户</span>
+            <span>下载</span>
+            <span>上传</span>
+            <span>剩余</span>
+            <span>比率</span>
+            <span>流行度</span>
+            <span>分类</span>
+            <span>标签</span>
+            <span>添加于</span>
+            <span>路径</span>
+          </div>
+          <div className="qb-task-list">
+            {items.map((item) => (
+              <QbTorrentTableRow
+                item={item}
+                selected={item.hash === selectedHash}
+                onSelect={() => {
+                  setSelectedHash(item.hash);
+                  loadDetail(item.hash);
+                }}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  setSelectedHash(item.hash);
+                  setContextMenu({ x: event.clientX, y: event.clientY, item });
+                }}
+                key={item.hash}
+              />
+            ))}
+            {!items.length && <div className="qb-empty">当前下载器没有任务</div>}
+          </div>
         </div>
       </section>
       {contextMenu && (
@@ -1003,7 +1236,7 @@ function QbTorrentTable({ items, downloader, onChanged }: { items: any[]; downlo
         </div>
       )}
       {selectedItem && detailLoading && <QbDetailLoading item={selectedItem} />}
-      {(selectedItem || detail || detailError) && !detailLoading && (
+      {(detail || detailError) && !detailLoading && (
         <QbTorrentDetailPanel item={selectedItem} detail={detail} error={detailError} onPriorityChange={changeFilePriority} />
       )}
     </>
@@ -1084,7 +1317,7 @@ function IntegrationEditor({ provider, onChanged }: { provider: any; onChanged: 
 }
 
 function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
-  const label = provider.provider.toUpperCase();
+  const label = downloaderShortLabel(provider.provider);
   const saved = provider.saved_payload ?? {};
   const savedMapping = Array.isArray(saved.path_mappings) ? saved.path_mappings[0] ?? {} : {};
   const [form, setForm] = useState<QbForm>({
@@ -1616,26 +1849,36 @@ function Panel({ title, children }: { title: string; children: ReactNode }) {
   return <section className="panel"><h2>{title}</h2>{children}</section>;
 }
 
-function Metric({ title, value, source }: { title: string; value: string; source: string }) {
+function Metric({ title, value, source }: { title: string; value: ReactNode; source: string }) {
   return <div className="metric"><small>{title}</small><strong>{value}</strong>{source && <span>{source}</span>}</div>;
 }
 
-function nasSpaceLabel(overview: any): string {
-  return overview?.nas_space_label || "-";
-}
-
-function nasSpaceHelper(overview: any): string {
-  if (overview?.nas_space_label && overview.nas_space_label !== "-") return overview?.nas_space_helper || "";
-  return overview?.nas_space_helper || "需要配置 NAS/qB 存储信息";
+function StorageMetric({ overview }: { overview: any }) {
+  const storage = storageDisplay(overview);
+  return (
+    <div className="metric storage-metric">
+      <small><Database size={14} /> 存储空间</small>
+      <div className="storage-line"><span style={{ width: `${storage.percent || 0}%` }} /></div>
+      <div className="storage-metric-row">
+        <span>{storage.helper}</span>
+        <strong>{storage.value}</strong>
+      </div>
+    </div>
+  );
 }
 
 function downloaderDisplayName(qb: any): string {
   const id = String(qb?.id ?? "");
   const match = id.match(/^qb(\d+)$/i);
-  if (match) return `qB ${match[1]}`;
+  if (match) return `qB${match[1]}`;
   const name = String(qb?.name ?? "");
   const nameMatch = name.match(/^q?b\s*(\d+)$/i);
-  return nameMatch ? `qB ${nameMatch[1]}` : name || "qB";
+  return nameMatch ? `qB${nameMatch[1]}` : name || "qB";
+}
+
+function downloaderShortLabel(value: string): string {
+  const match = String(value || "").match(/^qb(\d+)$/i);
+  return match ? `qB${match[1]}` : String(value || "qB").replace(/^QB/i, "qB");
 }
 
 function DownloaderCard({ qb }: { qb: any }) {
@@ -1662,12 +1905,13 @@ function LockedCard({ title, message }: { title: string; message: string }) {
   return <div className="downloader-node locked"><div className="downloader-node-head"><div className="downloader-node-title"><h3>{title}</h3></div><Lock size={16} /></div><p>{message}</p><small className="downloader-node-helper">需要管理员验证</small></div>;
 }
 
-function MediaSearchResults({ items = [], onSelect }: { items: any[]; onSelect: (item: any) => void }) {
+function MediaSearchResults({ items = [], onSelect, loading }: { items: any[]; onSelect: (item: any) => void; loading?: boolean }) {
   return (
     <Panel title="TMDB 媒体结果">
       <div className="media-result-grid">
+        {loading && <SearchLoadingState title="正在搜索 TMDB 媒体" detail="正在匹配影视条目、评分、海报和演职员信息" />}
         {items.map((item) => <MediaResultCard item={item} onSelect={onSelect} key={item.id} />)}
-        {!items.length && <p className="muted">没有搜索到 TMDB 媒体，或 TMDB 尚未启用。</p>}
+        {!loading && !items.length && <p className="muted">没有搜索到 TMDB 媒体，或 TMDB 尚未启用。</p>}
       </div>
     </Panel>
   );
@@ -1716,12 +1960,14 @@ function MediaResultCard({ item, onSelect }: { item: any; onSelect: (item: any) 
 
 function MTeamResourceResults({
   items = [],
+  loading,
   sortBy,
   sortDirection,
   onSortBy,
   onSortDirection
 }: {
   items: any[];
+  loading?: boolean;
   sortBy: string;
   sortDirection: "asc" | "desc";
   onSortBy: (value: string) => void;
@@ -1747,17 +1993,75 @@ function MTeamResourceResults({
         </div>
       </div>
       <div className="mteam-resource-list">
+        {loading && <SearchLoadingState title="正在搜索 M-Team 资源" detail="正在读取资源、体积、做种、促销和评分字段" />}
         {items.map((item) => <MTeamResourceCard item={item} key={item.id} />)}
-        {!items.length && <p className="muted">没有搜索到 M-Team 资源，或 M-Team 尚未启用。</p>}
+        {!loading && !items.length && <p className="muted">没有搜索到 M-Team 资源，或 M-Team 尚未启用。</p>}
       </div>
     </section>
   );
 }
 
+function SearchLoadingState({ title, detail }: { title: string; detail: string }) {
+  return (
+    <div className="search-loading-state">
+      <span className="search-loader-ring" />
+      <div>
+        <strong>{title}</strong>
+        <small>{detail}</small>
+      </div>
+    </div>
+  );
+}
+
 function MTeamResourceCard({ item }: { item: any }) {
+  const [downloading, setDownloading] = useState(false);
+  const [pushNotice, setPushNotice] = useState<PushNoticeState | null>(null);
+  const chips = resourceChips(item);
+
   async function download() {
-    await api("/api/qb/qb1/torrents", { method: "POST", body: JSON.stringify({ payload: item }) });
-    alert("已提交到 qB 1。");
+    if (downloading) return;
+    setDownloading(true);
+    emitAppLog({
+      level: "info",
+      scope: "M-Team -> qB1",
+      message: "开始推送下载",
+      detail: `torrent_id=${item.id}\ntitle=${item.title}\nendpoint=/api/mteam/torrents/${item.id}/download-to/qb1`,
+    });
+    setPushNotice({ status: "running", title: "正在推送下载", step: "正在向 M-Team 请求种子", detail: item.title });
+    const timers = [
+      window.setTimeout(() => {
+        setPushNotice({ status: "running", title: "正在推送下载", step: "正在下载种子文件", detail: item.title });
+        emitAppLog({ level: "info", scope: "M-Team -> qB1", message: "阶段：正在下载种子文件", detail: `torrent_id=${item.id}` });
+      }, 700),
+      window.setTimeout(() => {
+        setPushNotice({ status: "running", title: "正在推送下载", step: "等待后端完成推送闭环", detail: item.title });
+        emitAppLog({ level: "info", scope: "M-Team -> qB1", message: "阶段：等待后端完成推送闭环", detail: `torrent_id=${item.id}` });
+      }, 1700),
+    ];
+    try {
+      const result = await api<any>(`/api/mteam/torrents/${encodeURIComponent(item.id)}/download-to/qb1`, { method: "POST", body: JSON.stringify({ payload: item }) });
+      playDoneSound();
+      emitAppLog({
+        level: "success",
+        scope: "M-Team -> qB1",
+        message: "推送完成",
+        detail: `torrent_id=${item.id}\nfilename=${result.filename ?? "-"}\ntrace_id=${result.trace_id ?? "-"}`,
+      });
+      setPushNotice({ status: "success", title: "推送完成", step: "qB1 已接收下载任务", detail: item.title });
+      window.setTimeout(() => setPushNotice(null), 5200);
+    } catch (err) {
+      const detail = apiErrorDetail(err);
+      emitAppLog({
+        level: "error",
+        scope: "M-Team -> qB1",
+        message: "推送失败",
+        detail: `torrent_id=${item.id}\ntitle=${item.title}\n${detail}`,
+      });
+      setPushNotice({ status: "error", title: "推送失败", step: "未能完成 M-Team 到 qB1 的闭环", detail });
+    } finally {
+      timers.forEach((timer) => window.clearTimeout(timer));
+      setDownloading(false);
+    }
   }
 
   return (
@@ -1768,11 +2072,7 @@ function MTeamResourceCard({ item }: { item: any }) {
           {item.promotion_label && <span className="free-chip" title={promotionTitle(item)}>{item.promotion_label}</span>}
         </div>
         <div className="chip-row">
-          {(item.labels ?? []).map((label: string) => <span className="resource-chip" key={label}>{label}</span>)}
-          {item.resolution && item.resolution !== "-" && <span className="resource-chip">{item.resolution}</span>}
-          {item.codec && item.codec !== "-" && <span className="resource-chip">{item.codec}</span>}
-          {item.audio_codec && <span className="resource-chip">{item.audio_codec}</span>}
-          {item.hdr && <span className="resource-chip">{item.hdr}</span>}
+          {chips.map((label: string) => <span className="resource-chip" key={label}>{label}</span>)}
         </div>
         {item.subtitle && <p className="resource-subtitle">{item.subtitle}</p>}
         <div className="resource-meta-grid">
@@ -1790,9 +2090,29 @@ function MTeamResourceCard({ item }: { item: any }) {
           {item.imdb_rating && <span className="score-badge imdb">IMDb {item.imdb_rating}</span>}
         </div>
         {item.group && <span className="resource-group">{item.group}</span>}
-        <button onClick={download}>下载到 qB 1</button>
+        <button className="resource-download-button" onClick={download} disabled={downloading}>
+          <Download size={17} />
+          {downloading ? "推送中" : "下载"}
+        </button>
       </aside>
+      {pushNotice && <PushDownloadNotice notice={pushNotice} onClose={() => setPushNotice(null)} />}
     </article>
+  );
+}
+
+function PushDownloadNotice({ notice, onClose }: { notice: PushNoticeState; onClose: () => void }) {
+  return (
+    <div className={`push-download-notice ${notice.status}`} role="status" aria-live="polite">
+      <div className="push-ring">
+        {notice.status === "success" ? <Check size={20} /> : notice.status === "error" ? <Bell size={18} /> : <RefreshCw size={19} />}
+      </div>
+      <div>
+        <strong>{notice.title}</strong>
+        <span>{notice.step}</span>
+        {notice.detail && <small>{notice.detail}</small>}
+      </div>
+      {notice.status !== "running" && <button type="button" onClick={onClose}>关闭</button>}
+    </div>
   );
 }
 
@@ -2003,11 +2323,10 @@ function PersonDetailPage({
 
 function ResourceRow({ item }: { item: any }) {
   async function download() {
-    await api("/api/qb/qb1/torrents", { method: "POST", body: JSON.stringify({ payload: item }) });
-    alert("已提交到 qB 1。");
+    await api(`/api/mteam/torrents/${encodeURIComponent(item.id)}/download-to/qb1`, { method: "POST", body: JSON.stringify({ payload: item }) });
   }
 
-  return <div className="row"><strong>{item.title}</strong><span>{item.resolution} / {item.codec} / {item.size} / 做种 {item.seeders}</span><button onClick={download}>下载到 qB 1</button></div>;
+  return <div className="row"><strong>{item.title}</strong><span>{item.resolution} / {item.codec} / {item.size} / 做种 {item.seeders}</span><button className="resource-download-button" onClick={download}><Download size={16} />下载</button></div>;
 }
 
 function QbTorrentTableRow({
@@ -2019,33 +2338,33 @@ function QbTorrentTableRow({
   item: any;
   selected: boolean;
   onSelect: () => void;
-  onContextMenu: (event: MouseEvent<HTMLTableRowElement>) => void;
+  onContextMenu: (event: MouseEvent<HTMLElement>) => void;
 }) {
   const progress = Math.round((item.progress ?? 0) * 1000) / 10;
   return (
-    <tr className={selected ? "selected" : ""} onClick={onSelect} onContextMenu={onContextMenu}>
-      <td className="qb-name-cell">
+    <article className={selected ? "qb-task-grid qb-task-row selected" : "qb-task-grid qb-task-row"} onClick={onSelect} onContextMenu={onContextMenu}>
+      <div className="qb-name-cell">
         <strong title={item.name}>{item.name}</strong>
         <small>{item.tracker || item.content_path || item.hash}</small>
-      </td>
-      <td>{formatBytes(item.size ?? item.total_size ?? 0)}</td>
-      <td className="qb-progress-cell">
+      </div>
+      <span className="qb-num">{formatBytes(item.size ?? item.total_size ?? 0)}</span>
+      <div className="qb-progress-cell">
         <div className="qb-progress"><span style={{ width: `${Math.max(2, Math.min(100, progress))}%` }} /></div>
         <b>{progress.toFixed(1)}%</b>
-      </td>
-      <td>{stateLabel(item.state)}</td>
-      <td>{numberPair(item.num_seeds, item.num_complete)}</td>
-      <td>{numberPair(item.num_leechs, item.num_incomplete)}</td>
-      <td>{formatSpeed(item.download_speed ?? 0)}</td>
-      <td>{formatSpeed(item.upload_speed ?? 0)}</td>
-      <td>{formatEta(item.eta)}</td>
-      <td>{numberLabel(item.ratio ?? 0, 2)}</td>
-      <td>{numberLabel(item.availability ?? 0, 2)}</td>
-      <td>{item.category || "-"}</td>
-      <td className="qb-tags-cell">{(item.tags ?? []).length ? item.tags.join(", ") : "-"}</td>
-      <td>{formatDateLabel(item.added_at)}</td>
-      <td className="qb-path-cell" title={item.save_path}>{item.save_path || "-"}</td>
-    </tr>
+      </div>
+      <span className="qb-state-pill">{stateLabel(item.state)}</span>
+      <span className="qb-num">{numberPair(item.num_seeds, item.num_complete)}</span>
+      <span className="qb-num">{numberPair(item.num_leechs, item.num_incomplete)}</span>
+      <span className="qb-num">{formatSpeed(item.download_speed ?? 0)}</span>
+      <span className="qb-num">{formatSpeed(item.upload_speed ?? 0)}</span>
+      <span className="qb-num">{formatEta(item.eta)}</span>
+      <span className="qb-num">{numberLabel(item.ratio ?? 0, 2)}</span>
+      <span className="qb-num">{numberLabel(item.availability ?? 0, 2)}</span>
+      <span className="qb-ellipsis">{item.category || "-"}</span>
+      <span className="qb-tags-cell">{(item.tags ?? []).length ? item.tags.join(", ") : "-"}</span>
+      <span className="qb-num">{formatDateLabel(item.added_at)}</span>
+      <span className="qb-path-cell" title={item.save_path}>{item.save_path || "-"}</span>
+    </article>
   );
 }
 
@@ -2073,6 +2392,25 @@ function QbTorrentDetailPanel({
   const props = detail?.properties ?? {};
   const files = detail?.files ?? [];
   const trackers = detail?.trackers ?? [];
+  const detailCards = [
+    { label: "保存路径", value: props.save_path || item?.save_path || "-", wide: true },
+    { label: "总大小", value: formatBytes(props.total_size || item?.size || 0) },
+    { label: "已下载", value: formatBytes(props.total_downloaded || item?.downloaded || 0) },
+    { label: "已上传", value: formatBytes(props.total_uploaded || item?.uploaded || 0) },
+    { label: "本次下载", value: formatBytes(props.total_downloaded_session || item?.downloaded_session || 0) },
+    { label: "本次上传", value: formatBytes(props.total_uploaded_session || item?.uploaded_session || 0) },
+    { label: "平均下载", value: formatSpeed(props.download_speed_avg || 0) },
+    { label: "平均上传", value: formatSpeed(props.upload_speed_avg || 0) },
+    { label: "连接", value: `${props.connections ?? 0} / ${props.connections_limit ?? "-"}` },
+    { label: "种子/用户", value: `${props.seeds ?? item?.num_seeds ?? 0} / ${props.peers ?? item?.num_leechs ?? 0}` },
+    { label: "分享率", value: numberLabel(props.share_ratio ?? item?.ratio ?? 0, 2) },
+    { label: "活跃时间", value: formatDuration(props.time_elapsed || item?.time_active || 0) },
+    { label: "做种时间", value: formatDuration(props.seeding_time || item?.seeding_time || 0) },
+    { label: "创建工具", value: props.created_by || "-" },
+    { label: "完成时间", value: formatDateLabel(props.completion_date || item?.completed_at) },
+    { label: "最后活动", value: formatDateLabel(item?.last_activity_at || props.last_seen) },
+    ...(props.comment ? [{ label: "备注", value: props.comment, wide: true }] : []),
+  ];
   return (
     <section className="qb-detail-panel">
       <div className="qb-detail-title">
@@ -2083,65 +2421,43 @@ function QbTorrentDetailPanel({
         {error && <strong className="qb-detail-error">{error}</strong>}
       </div>
       <div className="qb-detail-grid">
-        <DetailItem label="保存路径" value={props.save_path || item?.save_path || "-"} wide />
-        <DetailItem label="总大小" value={formatBytes(props.total_size || item?.size || 0)} />
-        <DetailItem label="已下载" value={formatBytes(props.total_downloaded || item?.downloaded || 0)} />
-        <DetailItem label="已上传" value={formatBytes(props.total_uploaded || item?.uploaded || 0)} />
-        <DetailItem label="本次下载" value={formatBytes(props.total_downloaded_session || item?.downloaded_session || 0)} />
-        <DetailItem label="本次上传" value={formatBytes(props.total_uploaded_session || item?.uploaded_session || 0)} />
-        <DetailItem label="平均下载" value={formatSpeed(props.download_speed_avg || 0)} />
-        <DetailItem label="平均上传" value={formatSpeed(props.upload_speed_avg || 0)} />
-        <DetailItem label="连接" value={`${props.connections ?? 0} / ${props.connections_limit ?? "-"}`} />
-        <DetailItem label="种子/用户" value={`${props.seeds ?? item?.num_seeds ?? 0} / ${props.peers ?? item?.num_leechs ?? 0}`} />
-        <DetailItem label="分享率" value={numberLabel(props.share_ratio ?? item?.ratio ?? 0, 2)} />
-        <DetailItem label="活跃时间" value={formatDuration(props.time_elapsed || item?.time_active || 0)} />
-        <DetailItem label="做种时间" value={formatDuration(props.seeding_time || item?.seeding_time || 0)} />
-        <DetailItem label="创建工具" value={props.created_by || "-"} />
-        <DetailItem label="完成时间" value={formatDateLabel(props.completion_date || item?.completed_at)} />
-        <DetailItem label="最后活动" value={formatDateLabel(item?.last_activity_at || props.last_seen)} />
-        {props.comment && <DetailItem label="备注" value={props.comment} wide />}
+        {detailCards.map((card) => <DetailItem label={card.label} value={card.value} wide={card.wide} key={card.label} />)}
       </div>
       <div className="qb-detail-tabs">
         <span className="active">内容</span>
         <span>Tracker</span>
       </div>
       <div className="qb-detail-content">
-        <div className="qb-files-table-wrap">
-          <table className="qb-files-table">
-            <thead>
-              <tr>
-                <th>名称</th>
-                <th>总大小</th>
-                <th>进度</th>
-                <th>下载优先级</th>
-                <th>剩余</th>
-                <th>可用性</th>
-              </tr>
-            </thead>
-            <tbody>
-              {files.map((file: any) => (
-                <tr key={file.id}>
-                  <td className="qb-file-name" title={file.name}>{file.name}</td>
-                  <td>{formatBytes(file.size)}</td>
-                  <td className="qb-progress-cell">
-                    <div className="qb-progress"><span style={{ width: `${Math.max(2, Math.min(100, Math.round(file.progress * 1000) / 10))}%` }} /></div>
-                    <b>{(Math.round(file.progress * 1000) / 10).toFixed(1)}%</b>
-                  </td>
-                  <td>
-                    <select value={file.priority} onChange={(event) => onPriorityChange(file.id, Number(event.target.value))}>
-                      <option value={0}>不下载</option>
-                      <option value={1}>正常</option>
-                      <option value={6}>高</option>
-                      <option value={7}>最高</option>
-                    </select>
-                  </td>
-                  <td>{formatBytes(file.size * (1 - file.progress))}</td>
-                  <td>{numberLabel(file.availability ?? 0, 1)}%</td>
-                </tr>
-              ))}
-              {!files.length && <tr><td colSpan={6} className="qb-empty">单击任务后会加载文件内容</td></tr>}
-            </tbody>
-          </table>
+        <div className="qb-files-list">
+          <div className="qb-file-row qb-file-head">
+            <span>名称</span>
+            <span>总大小</span>
+            <span>进度</span>
+            <span>下载优先级</span>
+            <span>剩余</span>
+            <span>可用性</span>
+          </div>
+          {files.map((file: any) => (
+            <div className="qb-file-row" key={file.id}>
+              <span className="qb-file-name" title={file.name}>{file.name}</span>
+              <span>{formatBytes(file.size)}</span>
+              <span className="qb-progress-cell">
+                <div className="qb-progress"><span style={{ width: `${Math.max(2, Math.min(100, Math.round(file.progress * 1000) / 10))}%` }} /></div>
+                <b>{(Math.round(file.progress * 1000) / 10).toFixed(1)}%</b>
+              </span>
+              <span>
+                <select value={file.priority} onChange={(event) => onPriorityChange(file.id, Number(event.target.value))}>
+                  <option value={0}>不下载</option>
+                  <option value={1}>正常</option>
+                  <option value={6}>高</option>
+                  <option value={7}>最高</option>
+                </select>
+              </span>
+              <span>{formatBytes(file.size * (1 - file.progress))}</span>
+              <span>{numberLabel(file.availability ?? 0, 1)}%</span>
+            </div>
+          ))}
+          {!files.length && <div className="qb-empty">单击任务后会加载文件内容</div>}
         </div>
         <div className="qb-trackers">
           {trackers.slice(0, 6).map((tracker: any) => (
@@ -2169,6 +2485,49 @@ function DetailItem({ label, value, wide }: { label: string; value: ReactNode; w
 function numberLabel(value: number, digits = 0): string {
   if (typeof value !== "number" || Number.isNaN(value)) return "-";
   return value.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+
+function apiErrorDetail(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  try {
+    const parsed = JSON.parse(message);
+    if (typeof parsed.detail === "string") return parsed.detail;
+    if (parsed.detail && typeof parsed.detail === "object") {
+      return [
+        `stage=${parsed.detail.stage ?? "-"}`,
+        `provider=${parsed.detail.provider ?? "-"}`,
+        `torrent_id=${parsed.detail.torrent_id ?? "-"}`,
+        `message=${parsed.detail.message ?? JSON.stringify(parsed.detail)}`,
+      ].join("\n");
+    }
+    if (parsed.detail) return JSON.stringify(parsed.detail);
+  } catch {
+    return message;
+  }
+  return message;
+}
+
+function playDoneSound() {
+  try {
+    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+    const context = new AudioContextClass();
+    const gain = context.createGain();
+    gain.gain.setValueAtTime(0.0001, context.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.08, context.currentTime + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.22);
+    gain.connect(context.destination);
+    [660, 880].forEach((frequency, index) => {
+      const oscillator = context.createOscillator();
+      oscillator.type = "sine";
+      oscillator.frequency.setValueAtTime(frequency, context.currentTime + index * 0.08);
+      oscillator.connect(gain);
+      oscillator.start(context.currentTime + index * 0.08);
+      oscillator.stop(context.currentTime + 0.24 + index * 0.02);
+    });
+    window.setTimeout(() => context.close().catch(() => undefined), 420);
+  } catch {
+    // Completion sound is best-effort; browsers may block audio in some contexts.
+  }
 }
 
 function formatBytesFixed(value: number, digits: number): string {
@@ -2336,6 +2695,23 @@ function sortResources(items: any[], sortBy: string, direction: "asc" | "desc"):
     if (a === b) return String(left.title ?? "").localeCompare(String(right.title ?? ""));
     return (a - b) * multiplier;
   });
+}
+
+function resourceChips(item: any): string[] {
+  const values = [
+    ...(Array.isArray(item.labels) ? item.labels : []),
+    item.resolution,
+    item.codec,
+    item.audio_codec,
+    item.hdr,
+  ];
+  const result: string[] = [];
+  for (const value of values) {
+    const label = String(value ?? "").trim();
+    if (!label || label === "-" || /^\d+$/.test(label)) continue;
+    if (!result.some((item) => item.toLowerCase() === label.toLowerCase())) result.push(label);
+  }
+  return result.slice(0, 10);
 }
 
 function promotionTitle(item: any): string {

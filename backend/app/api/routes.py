@@ -465,7 +465,7 @@ def qb_placeholder_state(downloader_id: str, row: IntegrationConfig | None, mess
     name = (row.redacted_summary or {}).get("name") if row else None
     return {
         "id": downloader_id,
-        "name": name or f"qB {index}",
+        "name": name or f"qB{index}",
         "online": False,
         "configured": configured,
         "enabled": enabled,
@@ -483,14 +483,20 @@ def qb_placeholder_state(downloader_id: str, row: IntegrationConfig | None, mess
     }
 
 
+def downloader_label(downloader_id: str) -> str:
+    if downloader_id.lower().startswith("qb"):
+        return f"qB{downloader_id[2:]}"
+    return downloader_id
+
+
 def get_qb_adapter_or_error(db: Session, downloader_id: str) -> QbittorrentWebAdapter:
     if downloader_id not in {"qb1", "qb2", "qb3"}:
         raise HTTPException(status_code=404, detail="未知下载器")
     row = get_config(db, downloader_id)
     if not row or not row.encrypted_payload:
-        raise HTTPException(status_code=409, detail=f"{downloader_id.upper()} 尚未配置")
+        raise HTTPException(status_code=409, detail=f"{downloader_label(downloader_id)} 尚未配置")
     if not row.enabled:
-        raise HTTPException(status_code=409, detail=f"{downloader_id.upper()} 尚未启用，请先在设置中测试并启用")
+        raise HTTPException(status_code=409, detail=f"{downloader_label(downloader_id)} 尚未启用，请先在设置中测试并启用")
     try:
         return QbittorrentWebAdapter(get_decrypted_config(db, downloader_id) or {})
     except QbittorrentConfigError as exc:
@@ -528,10 +534,10 @@ def nas_free_space_from_qbs(qbs: list[dict[str, Any]]) -> dict[str, Any]:
             "nas_total_space": 0,
             "nas_used_space": 0,
             "nas_usage_percent": None,
-            "nas_free_space_label": "-",
+            "nas_free_space_label": bytes_label(free_space, 2),
             "nas_free_space_source": "",
-            "nas_space_label": "-",
-            "nas_space_helper": "需要配置 NAS/qB 存储信息",
+            "nas_space_label": bytes_label(free_space, 2),
+            "nas_space_helper": "qB1 返回的剩余磁盘空间",
         }
     used_space = max(0.0, total_space - free_space)
     usage_percent = round((used_space / total_space) * 100, 1)
@@ -720,9 +726,24 @@ def admin_verify(request: AdminVerifyRequest, authorization: str | None = Header
     session.qb2_grant_expires_at = expires
     db.commit()
     trace = TraceRecorder(db, "admin_verify", "ADMIN")
-    trace.add("qB 2 grant issued", {"actor": user.username, "admin": admin.username, "expires_at": expires.isoformat()})
+    trace.add("qB2 grant issued", {"actor": user.username, "admin": admin.username, "expires_at": expires.isoformat()})
     trace.finish()
     return {"qb2_granted": True, "expires_at": expires.isoformat()}
+
+
+@router.post("/auth/qb2-grant/revoke")
+def revoke_qb2_grant(authorization: str | None = Header(default=None), user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
+    payload = decode_token(authorization.split(" ", 1)[1])
+    session = db.query(UserSession).filter(UserSession.token_id == payload["jti"]).one_or_none()
+    if session:
+        session.qb2_grant_expires_at = None
+        db.commit()
+    trace = TraceRecorder(db, "qb2_grant_revoke", "ADMIN")
+    trace.add("qB2 grant revoked", {"actor": user.username})
+    trace.finish()
+    return {"qb2_granted": False}
 
 
 @router.get("/admin/integrations")
@@ -889,6 +910,7 @@ def build_download_payload(db: Session, downloader_id: str) -> dict[str, Any]:
     adapter = get_qb_adapter_or_error(db, downloader_id)
     summary = adapter.get_server_state(downloader_id)
     items = adapter.get_torrents(downloader_id)
+    summary.update(adapter.summarize_torrents(items))
     return {
         "downloader_id": downloader_id,
         "summary": summary,
@@ -955,7 +977,7 @@ def download_overview(
     if downloader_id not in {"qb1", "qb2", "qb3"}:
         raise HTTPException(status_code=404, detail="未知下载器")
     if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
-        raise HTTPException(status_code=403, detail="qB 2 需要管理员验证")
+        raise HTTPException(status_code=403, detail="qB2 需要管理员验证")
     cache_name = f"downloads.{downloader_id}"
     if cached and not refresh:
         cache = get_preload_cache(db, cache_name)
@@ -972,7 +994,7 @@ def download_overview(
 @router.get("/qb/{downloader_id}/summary")
 def qb_summary(downloader_id: str, authorization: str | None = Header(default=None), db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
     if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
-        raise HTTPException(status_code=403, detail="qB 2 需要管理员验证")
+        raise HTTPException(status_code=403, detail="qB2 需要管理员验证")
     try:
         return get_qb_adapter_or_error(db, downloader_id).get_server_state(downloader_id)
     except QbittorrentApiError as exc:
@@ -982,7 +1004,7 @@ def qb_summary(downloader_id: str, authorization: str | None = Header(default=No
 @router.get("/qb/{downloader_id}/torrents")
 def qb_torrents(downloader_id: str, authorization: str | None = Header(default=None), db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
     if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
-        raise HTTPException(status_code=403, detail="qB 2 需要管理员验证")
+        raise HTTPException(status_code=403, detail="qB2 需要管理员验证")
     try:
         return {"items": get_qb_adapter_or_error(db, downloader_id).get_torrents(downloader_id)}
     except QbittorrentApiError as exc:
@@ -992,7 +1014,7 @@ def qb_torrents(downloader_id: str, authorization: str | None = Header(default=N
 @router.get("/qb/{downloader_id}/torrents/{torrent_hash}/detail")
 def qb_torrent_detail(downloader_id: str, torrent_hash: str, authorization: str | None = Header(default=None), db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
     if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
-        raise HTTPException(status_code=403, detail="qB 2 需要管理员验证")
+        raise HTTPException(status_code=403, detail="qB2 需要管理员验证")
     try:
         return get_qb_adapter_or_error(db, downloader_id).get_torrent_detail(downloader_id, torrent_hash)
     except QbittorrentApiError as exc:
@@ -1002,7 +1024,7 @@ def qb_torrent_detail(downloader_id: str, torrent_hash: str, authorization: str 
 @router.post("/qb/{downloader_id}/torrents/{torrent_hash}/files/{file_id}/priority")
 def qb_file_priority(downloader_id: str, torrent_hash: str, file_id: int, request: QbActionPayload, authorization: str | None = Header(default=None), db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
     if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
-        raise HTTPException(status_code=403, detail="qB 2 需要管理员验证")
+        raise HTTPException(status_code=403, detail="qB2 需要管理员验证")
     try:
         priority = int(request.payload.get("priority"))
     except (TypeError, ValueError) as exc:
@@ -1016,7 +1038,7 @@ def qb_file_priority(downloader_id: str, torrent_hash: str, file_id: int, reques
 @router.post("/qb/{downloader_id}/torrents")
 def qb_add_torrent(downloader_id: str, request: QbActionPayload, authorization: str | None = Header(default=None), user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
-        raise HTTPException(status_code=403, detail="qB 2 需要管理员验证")
+        raise HTTPException(status_code=403, detail="qB2 需要管理员验证")
     try:
         result = get_qb_adapter_or_error(db, downloader_id).add_torrent(downloader_id, request.payload)
     except QbittorrentApiError as exc:
@@ -1026,12 +1048,48 @@ def qb_add_torrent(downloader_id: str, request: QbActionPayload, authorization: 
     return result
 
 
+@router.post("/mteam/torrents/{torrent_id}/download-to/{downloader_id}")
+def mteam_download_to_qb(
+    torrent_id: str,
+    downloader_id: str,
+    request: QbActionPayload,
+    authorization: str | None = Header(default=None),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if downloader_id not in {"qb1", "qb2", "qb3"}:
+        raise HTTPException(status_code=404, detail="未知下载器")
+    if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
+        raise HTTPException(status_code=403, detail="qB2 需要管理员验证")
+    stage = "mteam_config"
+    try:
+        mteam_adapter = get_mteam_adapter_or_error(db)
+        stage = "mteam_download_torrent"
+        torrent_file = mteam_adapter.download_torrent_file(torrent_id)
+        stage = "qb_config"
+        qb_adapter = get_qb_adapter_or_error(db, downloader_id)
+        stage = "qb_add_torrent_file"
+        result = qb_adapter.add_torrent_file(
+            downloader_id,
+            torrent_file["filename"],
+            torrent_file["content"],
+            request.payload,
+        )
+    except MTeamApiError as exc:
+        raise HTTPException(status_code=502, detail={"stage": stage, "provider": "mteam", "torrent_id": torrent_id, "message": str(exc)}) from exc
+    except QbittorrentApiError as exc:
+        raise HTTPException(status_code=502, detail={"stage": stage, "provider": downloader_id, "torrent_id": torrent_id, "message": str(exc)}) from exc
+    db.add(DownloadAction(trace_id=result["trace_id"], downloader_id=downloader_id, action="add_mteam", target_hash=torrent_id, actor_user_id=user.id, status="accepted"))
+    db.commit()
+    return {**result, "torrent_id": torrent_id, "filename": torrent_file["filename"]}
+
+
 @router.post("/qb/{downloader_id}/torrents/{torrent_hash}/{action}")
 def qb_mutate(downloader_id: str, torrent_hash: str, action: str, request: QbActionPayload, authorization: str | None = Header(default=None), user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     if action not in {"pause", "resume", "limits", "category", "tags"}:
         raise HTTPException(status_code=404, detail="不支持的操作")
     if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
-        raise HTTPException(status_code=403, detail="qB 2 需要管理员验证")
+        raise HTTPException(status_code=403, detail="qB2 需要管理员验证")
     try:
         result = get_qb_adapter_or_error(db, downloader_id).mutate_torrent(downloader_id, torrent_hash, action, request.payload)
     except QbittorrentApiError as exc:
@@ -1051,7 +1109,7 @@ def qb_delete(downloader_id: str, torrent_hash: str, confirm_token: str = Query(
     if not confirm_token.startswith("DEL-"):
         raise HTTPException(status_code=400, detail="需要服务端删除确认令牌")
     if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
-        raise HTTPException(status_code=403, detail="qB 2 需要管理员验证")
+        raise HTTPException(status_code=403, detail="qB2 需要管理员验证")
     action = "delete_files" if delete_files else "delete"
     try:
         result = get_qb_adapter_or_error(db, downloader_id).mutate_torrent(downloader_id, torrent_hash, action, {"delete_files": delete_files})

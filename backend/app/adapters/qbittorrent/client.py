@@ -44,13 +44,13 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
             state = {}
         torrents = data.get("torrents") if isinstance(data, dict) else {}
         torrent_values = list(torrents.values()) if isinstance(torrents, dict) else []
-        active_downloads = sum(1 for item in torrent_values if _float(item.get("dlspeed")) > 0 or str(item.get("state") or "").lower() in DOWNLOADING_STATES)
-        active_uploads = sum(1 for item in torrent_values if _float(item.get("upspeed")) > 0 or str(item.get("state") or "").lower() in UPLOADING_STATES)
+        active_downloads = sum(1 for item in torrent_values if _is_active_download(item))
+        active_uploads = sum(1 for item in torrent_values if _is_active_upload(item))
         paused = sum(1 for item in torrent_values if "paused" in str(item.get("state") or "").lower())
         errors = sum(1 for item in torrent_values if "error" in str(item.get("state") or "").lower())
         return {
             "id": downloader_id,
-            "name": self.name or f"qB {downloader_id.replace('qb', '')}",
+            "name": self.name or f"qB{downloader_id.replace('qb', '')}",
             "online": True,
             "download_speed": _float(state.get("dl_info_speed")),
             "upload_speed": _float(state.get("up_info_speed")),
@@ -73,6 +73,13 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
         if not isinstance(items, list):
             return []
         return [self._normalize_torrent(item) for item in items if isinstance(item, dict)]
+
+    def summarize_torrents(self, torrents: list[dict[str, Any]]) -> dict[str, int]:
+        return {
+            "torrent_count": len(torrents),
+            "active_downloads": sum(1 for item in torrents if _is_active_download(item)),
+            "active_uploads": sum(1 for item in torrents if _is_active_upload(item)),
+        }
 
     def get_torrent_detail(self, downloader_id: str, torrent_hash: str) -> dict[str, Any]:
         properties = self._json_request("GET", "/api/v2/torrents/properties", query={"hash": torrent_hash})
@@ -120,6 +127,27 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
             form["tags"] = tags
         self._text_request("POST", "/api/v2/torrents/add", form=form)
         return {"accepted": True, "trace_id": trace_id("DL"), "downloader_id": downloader_id, "task_hash": None}
+
+    def add_torrent_file(self, downloader_id: str, filename: str, content: bytes, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        if not content:
+            raise QbittorrentApiError("种子文件为空，无法提交到 qB")
+        payload = payload or {}
+        fields: dict[str, str] = {}
+        save_path = _first_text(payload, "save_path") or self.default_save_path
+        category = _first_text(payload, "category") or self.default_category
+        tags = _first_text(payload, "tags") or self.default_tags
+        if save_path:
+            fields["savepath"] = save_path
+        if category:
+            fields["category"] = category
+        if tags:
+            fields["tags"] = tags
+        self._multipart_request(
+            "/api/v2/torrents/add",
+            fields=fields,
+            files={"torrents": (filename or "mteam.torrent", content, "application/x-bittorrent")},
+        )
+        return {"accepted": True, "trace_id": trace_id("DL"), "downloader_id": downloader_id, "task_hash": None, "source": "torrent_file"}
 
     def mutate_torrent(self, downloader_id: str, torrent_hash: str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
         if action == "pause":
@@ -196,6 +224,8 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
             "time_active": _float(item.get("time_active")),
             "seeding_time": _float(item.get("seeding_time")),
             "state": item.get("state") or "",
+            "is_active_download": _is_active_download(item),
+            "is_active_upload": _is_active_upload(item),
             "source": "qB Web API 原始数据（Real）",
         }
 
@@ -314,9 +344,38 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
         except (URLError, TimeoutError) as exc:
             raise QbittorrentApiError(f"无法连接 qB WebUI：{exc}") from exc
 
+    def _multipart_request(self, path: str, fields: dict[str, str], files: dict[str, tuple[str, bytes, str]]) -> str:
+        self._ensure_login()
+        boundary = f"----PTMediaHub{trace_id('MP').replace('-', '')}"
+        body = _multipart_body(boundary, fields, files)
+        request = Request(
+            f"{self.base_url}{path}",
+            data=body,
+            headers={"User-Agent": "PT-Media-Hub", "Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        try:
+            with self.opener.open(request, timeout=self.timeout) as response:
+                return response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else str(exc)
+            raise QbittorrentApiError(f"qB Web API 返回 HTTP {exc.code}: {detail}", exc.code) from exc
+        except (URLError, TimeoutError) as exc:
+            raise QbittorrentApiError(f"无法连接 qB WebUI：{exc}") from exc
 
-DOWNLOADING_STATES = {"downloading", "stalleddl", "metadl", "forceddl", "queueddl", "allocating", "checkingdl"}
-UPLOADING_STATES = {"uploading", "stalledup", "forcedup", "queuedup", "checkingup"}
+
+DOWNLOADING_STATES = {"downloading", "stalleddl", "forceddl", "queueddl", "metadl", "allocating"}
+UPLOADING_STATES = {"uploading", "stalledup", "forcedup", "queuedup"}
+
+
+def _is_active_download(item: dict[str, Any]) -> bool:
+    state = str(item.get("state") or "").lower()
+    return _float(item.get("dlspeed") or item.get("download_speed")) > 0 or state in DOWNLOADING_STATES
+
+
+def _is_active_upload(item: dict[str, Any]) -> bool:
+    state = str(item.get("state") or "").lower()
+    return _float(item.get("upspeed") or item.get("upload_speed")) > 0 or state in UPLOADING_STATES
 
 
 def _float(value: Any) -> float:
@@ -341,3 +400,29 @@ def _first_text(payload: dict[str, Any], *keys: str) -> str:
         if value not in (None, ""):
             return str(value).strip()
     return ""
+
+
+def _multipart_body(boundary: str, fields: dict[str, str], files: dict[str, tuple[str, bytes, str]]) -> bytes:
+    chunks: list[bytes] = []
+    for name, value in fields.items():
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode("utf-8"),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"),
+                str(value).encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+    for name, (filename, content, content_type) in files.items():
+        safe_filename = filename.replace('"', "")
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode("utf-8"),
+                f'Content-Disposition: form-data; name="{name}"; filename="{safe_filename}"\r\n'.encode("utf-8"),
+                f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"),
+                content,
+                b"\r\n",
+            ]
+        )
+    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(chunks)
