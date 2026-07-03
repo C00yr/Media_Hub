@@ -9,6 +9,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from app.adapters.base import MetadataAdapter
+from app.config.settings import get_settings
 
 
 TMDB_API_BASE = "https://api.themoviedb.org/3"
@@ -24,15 +25,34 @@ class TmdbConfigError(ValueError):
     pass
 
 
+class TmdbGatewayError(RuntimeError):
+    def __init__(self, message: str, error_type: str = "gateway_error", http_status: int | None = None):
+        super().__init__(message)
+        self.error_type = error_type
+        self.http_status = http_status
+
+
 class TmdbAdapter(MetadataAdapter):
     def __init__(self, config: dict[str, Any]):
+        settings = get_settings()
         self.api_key = str(config.get("api_key") or "").strip()
         self.bearer_token = str(config.get("bearer_token") or config.get("token") or "").strip()
         self.language = str(config.get("language") or "zh-CN").strip()
         self.region = str(config.get("region") or "CN").strip()
+        self.mode = str(config.get("mode") or settings.tmdb_mode or "direct").strip().lower()
+        self.gateway_url = self._gateway_root(str(config.get("gateway_url") or settings.tmdb_gateway_url or "").strip())
+        self.gateway_key = str(config.get("gateway_key") or settings.tmdb_gateway_key or "").strip()
+        if self.mode not in {"direct", "gateway"}:
+            self.mode = "direct"
         self.base_url = str(config.get("endpoint") or TMDB_API_BASE).strip().rstrip("/")
+        if self.mode == "gateway":
+            if not self.gateway_url:
+                raise TmdbConfigError("TMDB Gateway URL is not configured")
+            if not self.gateway_key:
+                raise TmdbConfigError("TMDB Gateway Key is not configured")
+            self.base_url = self._gateway_api_base(self.gateway_url)
         self.timeout = int(config.get("timeout") or 12)
-        if not self.api_key and not self.bearer_token:
+        if self.mode == "direct" and not self.api_key and not self.bearer_token:
             raise TmdbConfigError("TMDB API Key 或 Bearer Token 未配置")
 
     def search_media(self, query: str) -> list[dict[str, Any]]:
@@ -111,15 +131,42 @@ class TmdbAdapter(MetadataAdapter):
 
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         query = {"language": self.language, "page": 1, **params}
-        if self.api_key:
+        if self.mode == "direct" and self.api_key:
             query["api_key"] = self.api_key
         url = f"{self.base_url}{path}?{urlencode(query)}"
         headers = {"Accept": "application/json"}
-        if self.bearer_token:
+        if self.mode == "gateway":
+            headers["X-Gateway-Key"] = self.gateway_key
+        elif self.bearer_token:
             headers["Authorization"] = f"Bearer {self.bearer_token}"
         request = Request(url, headers=headers)
         with _urlopen_with_ipv4_fallback(request, timeout=self.timeout) as response:
             return json.loads(response.read().decode("utf-8"))
+
+    def test_gateway_health(self) -> dict[str, Any]:
+        if self.mode != "gateway":
+            return {"ok": True, "mode": self.mode}
+        request = Request(f"{self.gateway_url}/health", headers={"Accept": "application/json"})
+        with _urlopen_with_ipv4_fallback(request, timeout=self.timeout) as response:
+            status = getattr(response, "status", response.getcode())
+            payload = json.loads(response.read().decode("utf-8"))
+            if status >= 400 or not payload.get("ok"):
+                raise TmdbGatewayError("Cloudflare Worker health check failed", "gateway_health_error", status)
+            return payload
+
+    @staticmethod
+    def _gateway_root(value: str) -> str:
+        base = value.rstrip("/")
+        if base.endswith("/3"):
+            return base[:-2].rstrip("/")
+        return base
+
+    @staticmethod
+    def _gateway_api_base(value: str) -> str:
+        base = value.rstrip("/")
+        if base.endswith("/3"):
+            return base
+        return f"{base}/3"
 
     def _normalize_item(self, item: dict[str, Any]) -> dict[str, Any]:
         media_type = item.get("media_type") or ("tv" if item.get("name") else "movie")

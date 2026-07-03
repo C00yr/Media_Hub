@@ -11,7 +11,7 @@ from app.adapters.mock import MockMetadataAdapter
 from app.adapters.mteam import MTeamAdapter, MTeamApiError, MTeamConfigError
 from app.adapters.qbittorrent import QbittorrentApiError, QbittorrentConfigError, QbittorrentWebAdapter
 from app.adapters.tmdb import TmdbAdapter
-from app.adapters.tmdb.client import TmdbConfigError
+from app.adapters.tmdb.client import TmdbConfigError, TmdbGatewayError
 from app.api.deps import get_current_user, has_qb2_grant, require_admin
 from app.auth.security import create_access_token, decode_token, hash_password, verify_password
 from app.config.settings import get_settings
@@ -237,6 +237,36 @@ def classify_tmdb_test_error(exc: Exception, trace: str) -> dict[str, Any]:
         reason = str(getattr(exc, "reason", exc))
         return tmdb_test_result(False, trace, "无法连接到 TMDB。", "应用没有连上 TMDB，常见原因是 DNS、代理、NAS/Docker 出网或防火墙问题。", f"请先确认这台机器能访问 api.themoviedb.org。系统底层提示：{reason}", "network_error")
     return tmdb_test_result(False, trace, "TMDB 测试失败。", "应用遇到了未能自动识别的问题。", "请检查填写内容后重试；如果仍然失败，可以把这条提示截图发给开发者排查。", "unknown_error")
+
+
+def classify_tmdb_gateway_test_error(exc: Exception, trace: str, phase: str = "api") -> dict[str, Any]:
+    if isinstance(exc, TmdbConfigError):
+        return tmdb_test_result(False, trace, "TMDB Worker 网关配置不完整。", "系统需要 Cloudflare Worker 地址和 Gateway Key 才能通过网关访问 TMDB。", "请在设置页填写 Worker 地址，并使用自动生成的 Gateway Key 设置 Cloudflare Worker Secret。", "gateway_config_missing")
+    if isinstance(exc, TmdbGatewayError):
+        return tmdb_test_result(False, trace, "Cloudflare Worker 健康检查失败。", "NAS 已连接到 Worker 域名，但 Worker 返回的健康检查内容不符合预期。", "请检查 Worker 是否部署了本项目提供的 TMDB Gateway 代码。", exc.error_type, exc.http_status)
+    if isinstance(exc, HTTPError):
+        status_code = int(exc.code)
+        try:
+            gateway_error = str(exc.headers.get("X-TMDB-Gateway-Error") or "")
+        except Exception:
+            gateway_error = ""
+        if status_code in (401, 403) and gateway_error in {"invalid_gateway_key", "missing_gateway_key"}:
+            return tmdb_test_result(False, trace, "Gateway Key 校验失败。", "NAS 后端已经访问到 Cloudflare Worker，但 X-Gateway-Key 与 Worker Secret 不一致，或 Worker 还没有设置 GATEWAY_KEY。", "请把设置页里的 Gateway Key 复制到 Cloudflare Worker Secret：GATEWAY_KEY，然后重新部署/测试。", "gateway_key_invalid", status_code)
+        if gateway_error == "missing_tmdb_token":
+            return tmdb_test_result(False, trace, "Worker 缺少 TMDB Bearer Token。", "NAS 已经访问到 Cloudflare Worker，但 Worker 还没有设置 TMDB_BEARER_TOKEN Secret。", "请把 TMDB Bearer Token 设置到 Cloudflare Worker Secret：TMDB_BEARER_TOKEN，然后重新部署/测试。", "gateway_tmdb_token_missing", status_code)
+        if gateway_error == "tmdb_auth_error":
+            return tmdb_test_result(False, trace, "Worker 中的 TMDB Token 无效。", "Cloudflare Worker 已收到请求，但转发到 TMDB 时被 TMDB 拒绝。", "请在 Cloudflare Worker Secret 中重新设置 TMDB_BEARER_TOKEN，不要把它填成 API Key。", "gateway_tmdb_token_invalid", status_code)
+        if gateway_error == "tmdb_network_error":
+            return tmdb_test_result(False, trace, "Worker 到 TMDB 的链路异常。", "NAS 可以访问 Cloudflare Worker，但 Worker 连接 TMDB 失败。", "请查看 Cloudflare Worker 日志，确认 Worker 出网和 TMDB 服务状态。", "gateway_upstream_network_error", status_code)
+        if status_code >= 500:
+            return tmdb_test_result(False, trace, "Worker 到 TMDB 的链路异常。", "NAS 可以访问 Cloudflare Worker，但 Worker 转发到 TMDB 时失败。", "请查看 Cloudflare Worker 日志，确认 TMDB_BEARER_TOKEN 和 Worker 出网状态。", "gateway_upstream_error", status_code)
+        return tmdb_test_result(False, trace, "TMDB Worker 网关返回异常。", f"Worker 返回 HTTP {status_code}，应用无法确认具体原因。", "请检查 Worker Secret、路由和 Cloudflare Worker 日志。", "gateway_http_error", status_code)
+    if isinstance(exc, (TimeoutError, SocketTimeout, URLError)):
+        reason = str(getattr(exc, "reason", exc))
+        if phase == "health":
+            return tmdb_test_result(False, trace, "NAS 无法访问 Cloudflare Worker。", "后端容器连不上 Worker 的 /health 地址，因此还没有进入 TMDB Token 校验阶段。", f"请先确认 NAS 容器能访问你的 Worker 域名。底层提示：{reason}", "gateway_network_error")
+        return tmdb_test_result(False, trace, "Worker 到 TMDB 的链路异常。", "NAS 已能访问 Worker，但 Worker API 请求没有成功完成。", f"请检查 Worker 日志和 TMDB Secret。底层提示：{reason}", "gateway_upstream_network_error")
+    return tmdb_test_result(False, trace, "TMDB Worker 网关测试失败。", "应用遇到了未能自动识别的网关问题。", "请检查 Worker URL、Gateway Key 和 Cloudflare Worker 日志。", "gateway_unknown_error")
 
 
 def mock_test_result(provider: str, trace: str, row: IntegrationConfig | None) -> dict[str, Any]:
@@ -773,12 +803,22 @@ def test_integration(provider: str, request: IntegrationPayload | None = None, u
     row = upsert_config(db, provider, request.payload, actor_user_id=user.id, action="save_and_test") if request and request.payload else get_config(db, provider)
     test_trace_id = trace_id("CFGTEST")
     if provider == "tmdb":
+        gateway_phase = "api"
         try:
             config = get_decrypted_config(db, provider) or {}
-            TmdbAdapter(config).get_discover_lists()
+            adapter = TmdbAdapter(config)
+            if adapter.mode == "gateway":
+                gateway_phase = "health"
+                adapter.test_gateway_health()
+                gateway_phase = "api"
+            adapter.get_discover_lists()
             result = tmdb_test_result(True, test_trace_id, "TMDB 连接成功。", "应用已经成功访问 TMDB，并拿到了发现页需要的片单数据。", "你现在可以点击“启用”，然后回到“发现”页查看真实 TMDB 数据。", None, 200)
         except Exception as exc:
-            result = classify_tmdb_test_error(exc, test_trace_id)
+            config = get_decrypted_config(db, provider) or {}
+            if str(config.get("mode") or settings.tmdb_mode or "direct").strip().lower() == "gateway":
+                result = classify_tmdb_gateway_test_error(exc, test_trace_id, gateway_phase)
+            else:
+                result = classify_tmdb_test_error(exc, test_trace_id)
         result["config_version"] = row.config_version if row else 0
     elif provider == "mteam":
         try:

@@ -51,9 +51,11 @@ def normalize_payload(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
             normalized.update(parse_raw_headers(raw_settings))
         if "bearer" in normalized and "bearer_token" not in normalized:
             normalized["bearer_token"] = normalized.pop("bearer")
-        for key in ["api_key", "bearer_token", "language", "region", "endpoint"]:
+        for key in ["api_key", "bearer_token", "language", "region", "endpoint", "mode", "gateway_url", "gateway_key"]:
             if key in normalized and isinstance(normalized[key], str):
                 normalized[key] = normalized[key].strip()
+        if normalized.get("mode") not in {"direct", "gateway"}:
+            normalized["mode"] = "direct"
         if not normalized.get("language"):
             normalized["language"] = "zh-CN"
         if not normalized.get("region"):
@@ -91,7 +93,7 @@ def upsert_config(
         row.config_version += 1
         if provider == "tmdb" and row.encrypted_payload:
             previous = json.loads(decrypt_text(row.encrypted_payload))
-            for key in ("api_key", "bearer_token"):
+            for key in ("api_key", "bearer_token", "gateway_key"):
                 if key not in normalized and previous.get(key):
                     normalized[key] = previous[key]
         if provider == "mteam" and row.encrypted_payload:

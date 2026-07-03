@@ -50,8 +50,11 @@ type IntegrationTestResult = {
 };
 
 type TmdbForm = {
+  mode: string;
   api_key: string;
   bearer_token: string;
+  gateway_url: string;
+  gateway_key: string;
   language: string;
   region: string;
   timeout: string;
@@ -1596,11 +1599,28 @@ function MTeamIntegrationEditor({ provider, onChanged }: { provider: any; onChan
   );
 }
 
+function generateGatewayKey(): string {
+  const bytes = new Uint8Array(32);
+  if (globalThis.crypto?.getRandomValues) {
+    globalThis.crypto.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) bytes[index] = Math.floor(Math.random() * 256);
+  }
+  let binary = "";
+  bytes.forEach((value) => {
+    binary += String.fromCharCode(value);
+  });
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
 function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
   const saved = provider.saved_payload ?? {};
   const [form, setForm] = useState<TmdbForm>({
+    mode: String(saved.mode ?? "gateway"),
     api_key: String(saved.api_key ?? ""),
     bearer_token: String(saved.bearer_token ?? ""),
+    gateway_url: String(saved.gateway_url ?? ""),
+    gateway_key: String(saved.gateway_key || generateGatewayKey()),
     language: String(saved.language ?? "zh-CN"),
     region: String(saved.region ?? "CN"),
     timeout: String(saved.timeout ?? "12"),
@@ -1619,8 +1639,11 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
 
   function payload() {
     return {
+      mode: form.mode,
       api_key: form.api_key.trim(),
       bearer_token: form.bearer_token.trim(),
+      gateway_url: form.gateway_url.trim(),
+      gateway_key: form.gateway_key.trim(),
       language: form.language.trim() || "zh-CN",
       region: form.region.trim() || "CN",
       timeout: Number(form.timeout) || 12,
@@ -1677,39 +1700,84 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
     }
   }
 
+  const isGatewayMode = form.mode !== "direct";
+
+  function regenerateGatewayKey() {
+    updateField("gateway_key", generateGatewayKey());
+  }
+
   return (
     <Panel title="TMDB 配置">
       <div className="integration tmdb-editor">
         <div className="notice info">
-          <strong>用来获取“发现”页的真实影视片单</strong>
-          <span>API Key 和 Bearer Token 填其中一个即可；两个都填时会优先使用 Bearer Token。密钥默认用星号遮住，可点眼睛查看。</span>
+          <strong>NAS 推荐使用 Cloudflare Worker 网关</strong>
+          <span>后端只访问你自己的 Worker，由 Worker 再访问 TMDB。qBittorrent、NAS 和 Docker 全局网络不会被代理或改动。</span>
         </div>
-        <div className="settings-grid">
-          <label>API Key
-            <SecretInput value={form.api_key} onChange={(value) => updateField("api_key", value)} placeholder="例如 32 位左右的 TMDB API Key" autoComplete="off" />
-          </label>
-          <label>Bearer Token
-            <SecretInput value={form.bearer_token} onChange={(value) => updateField("bearer_token", value)} placeholder="以 eyJ 开头的一长串访问令牌" autoComplete="off" />
-          </label>
-          <label>语言
-            <CopyableInput value={form.language} onChange={(value) => updateField("language", value)} placeholder="zh-CN" />
-          </label>
-          <label>地区
-            <CopyableInput value={form.region} onChange={(value) => updateField("region", value)} placeholder="CN" />
-          </label>
-          <label>超时时间（秒）
-            <CopyableInput value={form.timeout} onChange={(value) => updateField("timeout", value)} inputMode="numeric" placeholder="12" />
-          </label>
+        <div className="tmdb-mode-row">
+          <span>连接方式</span>
+          <div className="segmented compact">
+            <button type="button" className={isGatewayMode ? "active" : ""} onClick={() => updateField("mode", "gateway")}>
+              <ShieldCheck size={16} /> Cloudflare Worker 网关
+            </button>
+            <button type="button" className={!isGatewayMode ? "active" : ""} onClick={() => updateField("mode", "direct")}>
+              <Radar size={16} /> 直连 TMDB
+            </button>
+          </div>
         </div>
-        {form.api_key.trim() && form.bearer_token.trim() && <p className="muted">已同时填写 API Key 和 Bearer Token，测试和发现页会优先使用 Bearer Token。</p>}
-        <button className="inline-tool" type="button" onClick={() => setShowAdvanced((value) => !value)}>
-          <SlidersHorizontal size={16} /> {showAdvanced ? "隐藏高级设置" : "显示高级设置"}
-        </button>
-        {showAdvanced && (
-          <label>TMDB 接口地址
-            <CopyableInput value={form.endpoint} onChange={(value) => updateField("endpoint", value)} placeholder="默认 https://api.themoviedb.org/3，通常不用修改" />
-          </label>
+        {isGatewayMode ? (
+          <>
+            <div className="settings-grid">
+              <label>Cloudflare Worker 地址
+                <CopyableInput value={form.gateway_url} onChange={(value) => updateField("gateway_url", value)} placeholder="https://xxx.workers.dev" inputMode="url" />
+              </label>
+              <label>Gateway Key
+                <div className="input-with-actions">
+                  <SecretInput value={form.gateway_key} onChange={(value) => updateField("gateway_key", value)} placeholder="自动生成，用作 Worker Secret：GATEWAY_KEY" autoComplete="off" />
+                  <button type="button" className="inline-tool" onClick={regenerateGatewayKey}><RefreshCw size={16} /> 重新生成</button>
+                </div>
+              </label>
+              <label>TMDB Bearer Token
+                <SecretInput value={form.bearer_token} onChange={(value) => updateField("bearer_token", value)} placeholder="复制到 Worker Secret：TMDB_BEARER_TOKEN" autoComplete="off" />
+              </label>
+              <label>语言 / 地区
+                <div className="split-inputs">
+                  <CopyableInput value={form.language} onChange={(value) => updateField("language", value)} placeholder="zh-CN" />
+                  <CopyableInput value={form.region} onChange={(value) => updateField("region", value)} placeholder="CN" />
+                </div>
+              </label>
+            </div>
+            <p className="muted">把 Gateway Key 和 Bearer Token 分别设置到 Cloudflare Worker Secret：GATEWAY_KEY、TMDB_BEARER_TOKEN。保存时后端只把 Gateway Key 发给 Worker，不会把 TMDB Token 发送到前端日志。</p>
+          </>
+        ) : (
+          <>
+            <div className="settings-grid">
+              <label>API Key
+                <SecretInput value={form.api_key} onChange={(value) => updateField("api_key", value)} placeholder="例如 32 位左右的 TMDB API Key" autoComplete="off" />
+              </label>
+              <label>Bearer Token
+                <SecretInput value={form.bearer_token} onChange={(value) => updateField("bearer_token", value)} placeholder="以 eyJ 开头的一长串访问令牌" autoComplete="off" />
+              </label>
+              <label>语言
+                <CopyableInput value={form.language} onChange={(value) => updateField("language", value)} placeholder="zh-CN" />
+              </label>
+              <label>地区
+                <CopyableInput value={form.region} onChange={(value) => updateField("region", value)} placeholder="CN" />
+              </label>
+            </div>
+            {form.api_key.trim() && form.bearer_token.trim() && <p className="muted">已同时填写 API Key 和 Bearer Token，测试和发现页会优先使用 Bearer Token。</p>}
+            <button className="inline-tool" type="button" onClick={() => setShowAdvanced((value) => !value)}>
+              <SlidersHorizontal size={16} /> {showAdvanced ? "隐藏直连高级设置" : "显示直连高级设置"}
+            </button>
+            {showAdvanced && (
+              <label>TMDB 接口地址
+                <CopyableInput value={form.endpoint} onChange={(value) => updateField("endpoint", value)} placeholder="默认 https://api.themoviedb.org/3，通常不用修改" />
+              </label>
+            )}
+          </>
         )}
+        <label className="compact-field">超时时间（秒）
+          <CopyableInput value={form.timeout} onChange={(value) => updateField("timeout", value)} inputMode="numeric" placeholder="12" />
+        </label>
         <div className="actions">
           <button onClick={saveDraft} disabled={busy !== ""}>{busy === "draft" ? "正在保存..." : "保存草稿"}</button>
           <button className="primary" onClick={saveAndTest} disabled={busy !== ""}>{busy === "test" ? "正在测试..." : "保存并测试"}</button>

@@ -4,7 +4,7 @@ from urllib.error import HTTPError, URLError
 from fastapi.testclient import TestClient
 
 from app.adapters.tmdb.client import TmdbConfigError
-from app.api.routes import classify_tmdb_test_error
+from app.api.routes import classify_tmdb_gateway_test_error, classify_tmdb_test_error
 from app.main import app
 
 
@@ -41,6 +41,37 @@ def test_tmdb_network_feedback():
 
     network_result = classify_tmdb_test_error(URLError("dns failed"), "CFGTEST-6")
     assert network_result["error_type"] == "network_error"
+
+
+def test_tmdb_gateway_worker_unreachable_feedback():
+    result = classify_tmdb_gateway_test_error(URLError("worker unreachable"), "CFGTEST-GW1", "health")
+    assert result["success"] is False
+    assert result["error_type"] == "gateway_network_error"
+    assert "Cloudflare Worker" in result["message"]
+
+
+def test_tmdb_gateway_key_feedback():
+    error = HTTPError("https://example.workers.dev/3/movie/popular", 403, "Forbidden", {"X-TMDB-Gateway-Error": "invalid_gateway_key"}, None)
+    result = classify_tmdb_gateway_test_error(error, "CFGTEST-GW2")
+    assert result["success"] is False
+    assert result["error_type"] == "gateway_key_invalid"
+    assert result["http_status"] == 403
+
+
+def test_tmdb_gateway_tmdb_token_feedback():
+    error = HTTPError("https://example.workers.dev/3/movie/popular", 401, "Unauthorized", {"X-TMDB-Gateway-Error": "tmdb_auth_error"}, None)
+    result = classify_tmdb_gateway_test_error(error, "CFGTEST-GW3")
+    assert result["success"] is False
+    assert result["error_type"] == "gateway_tmdb_token_invalid"
+    assert result["http_status"] == 401
+
+
+def test_tmdb_gateway_missing_tmdb_token_feedback():
+    error = HTTPError("https://example.workers.dev/3/movie/popular", 500, "Server Error", {"X-TMDB-Gateway-Error": "missing_tmdb_token"}, None)
+    result = classify_tmdb_gateway_test_error(error, "CFGTEST-GW4")
+    assert result["success"] is False
+    assert result["error_type"] == "gateway_tmdb_token_missing"
+    assert result["http_status"] == 500
 
 
 def test_tmdb_enable_requires_real_success():

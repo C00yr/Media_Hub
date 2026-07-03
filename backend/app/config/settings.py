@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     debug_trace_retention_days: int = 7
     snapshot_interval_minutes: int = 10
     static_dir: str = "static"
+    tmdb_mode: str = "direct"
+    tmdb_gateway_url: str = ""
+    tmdb_gateway_key: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
@@ -27,4 +30,3 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-
