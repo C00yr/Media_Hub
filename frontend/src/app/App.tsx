@@ -54,6 +54,7 @@ type TmdbForm = {
   api_key: string;
   bearer_token: string;
   gateway_url: string;
+  worker_name: string;
   gateway_key: string;
   language: string;
   region: string;
@@ -1613,13 +1614,29 @@ function generateGatewayKey(): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
+function inferWorkerNameFromUrl(value: string): string {
+  const input = value.trim();
+  if (!input) return "";
+  try {
+    const url = new URL(input.includes("://") ? input : `https://${input}`);
+    const suffix = ".workers.dev";
+    const host = url.hostname.toLowerCase();
+    if (!host.endsWith(suffix)) return "";
+    const parts = host.slice(0, -suffix.length).split(".");
+    return parts.length >= 2 ? parts[0] : "";
+  } catch {
+    return "";
+  }
+}
+
 function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
   const saved = provider.saved_payload ?? {};
   const [form, setForm] = useState<TmdbForm>({
-    mode: String(saved.mode ?? "gateway"),
+    mode: String(saved.mode ?? "direct"),
     api_key: String(saved.api_key ?? ""),
     bearer_token: String(saved.bearer_token ?? ""),
     gateway_url: String(saved.gateway_url ?? ""),
+    worker_name: String(saved.worker_name ?? inferWorkerNameFromUrl(String(saved.gateway_url ?? ""))),
     gateway_key: String(saved.gateway_key || generateGatewayKey()),
     language: String(saved.language ?? "zh-CN"),
     region: String(saved.region ?? "CN"),
@@ -1637,18 +1654,43 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
     setForm((current) => ({ ...current, [key]: value }));
   }
 
+  function updateGatewayUrl(value: string) {
+    const inferred = inferWorkerNameFromUrl(value);
+    setForm((current) => ({
+      ...current,
+      gateway_url: value,
+      worker_name: current.worker_name.trim() ? current.worker_name : inferred,
+    }));
+  }
+
   function payload() {
     return {
       mode: form.mode,
       api_key: form.api_key.trim(),
       bearer_token: form.bearer_token.trim(),
       gateway_url: form.gateway_url.trim(),
+      worker_name: form.worker_name.trim() || inferWorkerNameFromUrl(form.gateway_url),
       gateway_key: form.gateway_key.trim(),
       language: form.language.trim() || "zh-CN",
       region: form.region.trim() || "CN",
       timeout: Number(form.timeout) || 12,
       endpoint: form.endpoint.trim()
     };
+  }
+
+  function tmdbTestLogDetail(result: IntegrationTestResult) {
+    return [
+      `mode=${form.mode}`,
+      `language=${form.language || "zh-CN"}`,
+      `region=${form.region || "CN"}`,
+      `timeout=${form.timeout || "12"}`,
+      form.endpoint.trim() ? `endpoint=${form.endpoint.trim()}` : "",
+      result.error_type ? `error_type=${result.error_type}` : "",
+      result.http_status ? `http_status=${result.http_status}` : "",
+      result.trace_id ? `trace_id=${result.trace_id}` : "",
+      result.explanation ? `explanation=${result.explanation}` : "",
+      result.next_step ? `next_step=${result.next_step}` : "",
+    ].filter(Boolean).join("\n");
   }
 
   async function saveDraft() {
@@ -1678,10 +1720,30 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
     setLocalError("");
     try {
       const updated = await api<any>(`/api/admin/integrations/tmdb/test`, { method: "POST", body: JSON.stringify({ payload: payload() }) });
-      setLocalResult(updated.last_test_result);
+      const testResult = updated.last_test_result as IntegrationTestResult;
+      setLocalResult(testResult);
+      emitAppLog({
+        level: testResult?.success ? "success" : "error",
+        scope: "TMDB 配置测试",
+        message: testResult?.message || (testResult?.success ? "测试成功" : "测试失败"),
+        detail: tmdbTestLogDetail(testResult || {}),
+      });
       onChanged();
     } catch (err) {
-      setLocalError((err as Error).message);
+      const message = (err as Error).message;
+      setLocalError(message);
+      emitAppLog({
+        level: "error",
+        scope: "TMDB 配置测试",
+        message: "请求测试接口失败",
+        detail: [
+          `mode=${form.mode}`,
+          `language=${form.language || "zh-CN"}`,
+          `region=${form.region || "CN"}`,
+          `timeout=${form.timeout || "12"}`,
+          `error=${message}`,
+        ].join("\n"),
+      });
     } finally {
       setBusy("");
     }
@@ -1710,17 +1772,17 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
     <Panel title="TMDB 配置">
       <div className="integration tmdb-editor">
         <div className="notice info">
-          <strong>NAS 推荐使用 Cloudflare Worker 网关</strong>
-          <span>后端只访问你自己的 Worker，由 Worker 再访问 TMDB。qBittorrent、NAS 和 Docker 全局网络不会被代理或改动。</span>
+          <strong>NAS 推荐使用直连 TMDB + DoH</strong>
+          <span>只需要填写 TMDB v4 Bearer Token。后端会用 doh.pub 解析 TMDB，并优先使用 IPv4，绕开 NAS/Docker 的异常 DNS 和不可用 IPv6。</span>
         </div>
         <div className="tmdb-mode-row">
           <span>连接方式</span>
           <div className="segmented compact">
-            <button type="button" className={isGatewayMode ? "active" : ""} onClick={() => updateField("mode", "gateway")}>
-              <ShieldCheck size={16} /> Cloudflare Worker 网关
-            </button>
             <button type="button" className={!isGatewayMode ? "active" : ""} onClick={() => updateField("mode", "direct")}>
-              <Radar size={16} /> 直连 TMDB
+              <Radar size={16} /> 直连 TMDB + DoH
+            </button>
+            <button type="button" className={isGatewayMode ? "active" : ""} onClick={() => updateField("mode", "gateway")}>
+              <ShieldCheck size={16} /> Cloudflare Worker 备用
             </button>
           </div>
         </div>
@@ -1728,16 +1790,19 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
           <>
             <div className="settings-grid">
               <label>Cloudflare Worker 地址
-                <CopyableInput value={form.gateway_url} onChange={(value) => updateField("gateway_url", value)} placeholder="https://xxx.workers.dev" inputMode="url" />
+                <CopyableInput value={form.gateway_url} onChange={updateGatewayUrl} placeholder="https://your-worker.your-subdomain.workers.dev" inputMode="url" />
+                <small className="field-note">高级备用：适合已经有自有域名绑定 Worker，或 NAS 能稳定访问 Worker 域名的用户。</small>
               </label>
               <label>Gateway Key
                 <div className="input-with-actions">
                   <SecretInput value={form.gateway_key} onChange={(value) => updateField("gateway_key", value)} placeholder="自动生成，用作 Worker Secret：GATEWAY_KEY" autoComplete="off" />
                   <button type="button" className="inline-tool" onClick={regenerateGatewayKey}><RefreshCw size={16} /> 重新生成</button>
                 </div>
+                <small className="field-note">APP 和 Worker 共用这串密码，防止别人随便调用你的 Worker。</small>
               </label>
               <label>TMDB Bearer Token
-                <SecretInput value={form.bearer_token} onChange={(value) => updateField("bearer_token", value)} placeholder="复制到 Worker Secret：TMDB_BEARER_TOKEN" autoComplete="off" />
+                <SecretInput value={form.bearer_token} onChange={(value) => updateField("bearer_token", value)} placeholder="从 TMDB 账号后台复制，通常以 eyJ 开头" autoComplete="off" />
+                <small className="field-note">需要手动填到 Cloudflare Worker Secret：TMDB_BEARER_TOKEN。</small>
               </label>
               <label>语言 / 地区
                 <div className="split-inputs">
@@ -1746,16 +1811,17 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
                 </div>
               </label>
             </div>
-            <p className="muted">把 Gateway Key 和 Bearer Token 分别设置到 Cloudflare Worker Secret：GATEWAY_KEY、TMDB_BEARER_TOKEN。保存时后端只把 Gateway Key 发给 Worker，不会把 TMDB Token 发送到前端日志。</p>
+            <div className="field-help compact-help">
+              <strong>Cloudflare 手动设置</strong>
+              <span>在 Worker 的 Variables and Secrets 中添加 Secret：GATEWAY_KEY 填上方 Gateway Key，TMDB_BEARER_TOKEN 填 TMDB v4 Bearer Token。保存后回到这里“保存并测试”。</span>
+            </div>
           </>
         ) : (
           <>
             <div className="settings-grid">
-              <label>API Key
-                <SecretInput value={form.api_key} onChange={(value) => updateField("api_key", value)} placeholder="例如 32 位左右的 TMDB API Key" autoComplete="off" />
-              </label>
-              <label>Bearer Token
+              <label>TMDB v4 Bearer Token
                 <SecretInput value={form.bearer_token} onChange={(value) => updateField("bearer_token", value)} placeholder="以 eyJ 开头的一长串访问令牌" autoComplete="off" />
+                <small className="field-note">推荐只填这个。APP 会通过 doh.pub 解析 TMDB，并使用 IPv4 访问。</small>
               </label>
               <label>语言
                 <CopyableInput value={form.language} onChange={(value) => updateField("language", value)} placeholder="zh-CN" />
@@ -1769,9 +1835,14 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
               <SlidersHorizontal size={16} /> {showAdvanced ? "隐藏直连高级设置" : "显示直连高级设置"}
             </button>
             {showAdvanced && (
-              <label>TMDB 接口地址
-                <CopyableInput value={form.endpoint} onChange={(value) => updateField("endpoint", value)} placeholder="默认 https://api.themoviedb.org/3，通常不用修改" />
-              </label>
+              <div className="settings-grid">
+                <label>API Key
+                  <SecretInput value={form.api_key} onChange={(value) => updateField("api_key", value)} placeholder="可选，通常不需要；Bearer Token 优先" autoComplete="off" />
+                </label>
+                <label>TMDB 接口地址
+                  <CopyableInput value={form.endpoint} onChange={(value) => updateField("endpoint", value)} placeholder="默认 https://api.themoviedb.org/3，通常不用修改" />
+                </label>
+              </div>
             )}
           </>
         )}

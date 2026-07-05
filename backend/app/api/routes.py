@@ -1,7 +1,12 @@
+import shutil
+import subprocess
 from datetime import datetime, timedelta
+from pathlib import Path
+from re import fullmatch
 from socket import timeout as SocketTimeout
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -11,7 +16,7 @@ from app.adapters.mock import MockMetadataAdapter
 from app.adapters.mteam import MTeamAdapter, MTeamApiError, MTeamConfigError
 from app.adapters.qbittorrent import QbittorrentApiError, QbittorrentConfigError, QbittorrentWebAdapter
 from app.adapters.tmdb import TmdbAdapter
-from app.adapters.tmdb.client import TmdbConfigError, TmdbGatewayError
+from app.adapters.tmdb.client import TmdbConfigError, TmdbDohError, TmdbGatewayError
 from app.api.deps import get_current_user, has_qb2_grant, require_admin
 from app.auth.security import create_access_token, decode_token, hash_password, verify_password
 from app.config.settings import get_settings
@@ -70,6 +75,82 @@ class IntegrationPayload(BaseModel):
 class QbActionPayload(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     confirm_token: str | None = None
+
+
+def _wrangler_cwd() -> Path:
+    repo_root = Path(__file__).resolve().parents[3]
+    candidates = [
+        repo_root / "tmdb-gateway",
+        repo_root / "cloudflare" / "tmdb-gateway",
+    ]
+    for candidate in candidates:
+        if (candidate / "package.json").exists() or (candidate / "wrangler.jsonc").exists() or (candidate / "wrangler.toml").exists():
+            return candidate
+    return repo_root
+
+
+def _worker_name_from_gateway_url(value: str) -> str:
+    if not value:
+        return ""
+    parsed = urlparse(value if "://" in value else f"https://{value}")
+    host = parsed.netloc.split(":", 1)[0].strip().lower()
+    suffix = ".workers.dev"
+    if not host.endswith(suffix):
+        return ""
+    parts = host[: -len(suffix)].split(".")
+    return parts[0] if len(parts) >= 2 else ""
+
+
+def _normalize_worker_name(payload: dict[str, Any]) -> str:
+    worker_name = str(payload.get("worker_name") or "").strip()
+    if not worker_name:
+        worker_name = _worker_name_from_gateway_url(str(payload.get("gateway_url") or "").strip())
+    if not worker_name:
+        raise HTTPException(status_code=400, detail="请填写 Worker 名称，或先填写完整的 workers.dev 地址。")
+    if not fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", worker_name):
+        raise HTTPException(status_code=400, detail="Worker 名称只能包含小写字母、数字和连字符，且不能以连字符开头或结尾。")
+    return worker_name
+
+
+def _wrangler_command() -> str | None:
+    return shutil.which("npx.cmd") or shutil.which("npx")
+
+
+def _sanitize_wrangler_output(value: str) -> str:
+    lines = []
+    for line in value.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if "https://dash.cloudflare.com/oauth2/auth" in stripped:
+            lines.append("Wrangler 需要重新登录 Cloudflare。")
+            continue
+        lines.append(stripped)
+    return "\n".join(lines[-8:])
+
+
+def _put_worker_secret(cwd: Path, worker_name: str, secret_name: str, secret_value: str) -> tuple[bool, str]:
+    command = _wrangler_command()
+    if not command:
+        return False, "当前运行环境没有找到 npx，无法调用 Wrangler CLI。"
+    try:
+        result = subprocess.run(
+            [command, "wrangler", "secret", "put", secret_name, "--name", worker_name],
+            cwd=str(cwd),
+            input=f"{secret_value}\n",
+            text=True,
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"写入 {secret_name} 超时。请确认 Wrangler 已登录，网络可以访问 Cloudflare。"
+    except OSError as exc:
+        return False, f"无法启动 Wrangler CLI：{exc}"
+    if result.returncode == 0:
+        return True, ""
+    detail = _sanitize_wrangler_output(f"{result.stdout}\n{result.stderr}")
+    return False, detail or f"Wrangler 写入 {secret_name} 失败。"
 
 
 def bytes_label(value: float, digits: int = 1) -> str:
@@ -213,6 +294,24 @@ def classify_tmdb_test_error(exc: Exception, trace: str) -> dict[str, Any]:
             "系统需要 TMDB API Key 或 Bearer Token 才能访问真实片单数据。",
             "请到 TMDB 账号后台复制 API Key 或 Bearer Token，填入其中一个字段后再点击“保存并测试”。",
             "missing_credentials",
+        )
+    if isinstance(exc, TmdbDohError):
+        if exc.error_type == "doh_bad_answer":
+            return tmdb_test_result(
+                False,
+                trace,
+                "TMDB DoH 解析结果不可用。",
+                "系统已经访问到 DNS over HTTPS 服务，但没有拿到可用于 TMDB 的 IPv4 地址，可能是 DNS 返回被污染或格式异常。",
+                "请稍后重试；如果一直失败，可以切换 DoH 源或改用路由器级代理/VPN。",
+                "doh_bad_answer",
+            )
+        return tmdb_test_result(
+            False,
+            trace,
+            "DNS over HTTPS 不可用。",
+            "NAS 容器无法访问 doh.pub，因此还没有进入 TMDB Token 校验阶段。",
+            "请确认 NAS 容器可以访问 https://doh.pub；如果不可用，可以切换 DoH 源或改用路由器级代理/VPN。",
+            "doh_unavailable",
         )
     if isinstance(exc, HTTPError):
         status_code = int(exc.code)
@@ -811,8 +910,8 @@ def test_integration(provider: str, request: IntegrationPayload | None = None, u
                 gateway_phase = "health"
                 adapter.test_gateway_health()
                 gateway_phase = "api"
-            adapter.get_discover_lists()
-            result = tmdb_test_result(True, test_trace_id, "TMDB 连接成功。", "应用已经成功访问 TMDB，并拿到了发现页需要的片单数据。", "你现在可以点击“启用”，然后回到“发现”页查看真实 TMDB 数据。", None, 200)
+            adapter.test_connection()
+            result = tmdb_test_result(True, test_trace_id, "TMDB 连接成功。", "应用已经成功访问 TMDB，并验证了当前 Bearer Token 可以使用。", "你现在可以点击“启用”，然后回到“发现”页查看真实 TMDB 数据。", None, 200)
         except Exception as exc:
             config = get_decrypted_config(db, provider) or {}
             if str(config.get("mode") or settings.tmdb_mode or "direct").strip().lower() == "gateway":
@@ -856,6 +955,39 @@ def test_integration(provider: str, request: IntegrationPayload | None = None, u
     else:
         result = mock_test_result(provider, test_trace_id, row)
     return serialize_config(record_test_result(db, provider, result, actor_user_id=user.id))
+
+
+@router.post("/admin/integrations/tmdb/cloudflare-secrets")
+def set_tmdb_cloudflare_secrets(request: IntegrationPayload, _: User = Depends(require_admin)) -> dict[str, Any]:
+    payload = request.payload or {}
+    gateway_key = str(payload.get("gateway_key") or "").strip()
+    bearer_token = str(payload.get("bearer_token") or payload.get("token") or "").strip()
+    if not gateway_key:
+        raise HTTPException(status_code=400, detail="请先填写 Gateway Key。")
+    if not bearer_token:
+        raise HTTPException(status_code=400, detail="请先填写 TMDB v4 Bearer Token。")
+    worker_name = _normalize_worker_name(payload)
+    cwd = _wrangler_cwd()
+
+    written: list[str] = []
+    for secret_name, secret_value in (("GATEWAY_KEY", gateway_key), ("TMDB_BEARER_TOKEN", bearer_token)):
+        ok, detail = _put_worker_secret(cwd, worker_name, secret_name, secret_value)
+        if not ok:
+            partial = f"已写入：{', '.join(written)}。" if written else ""
+            raise HTTPException(status_code=502, detail=f"{partial}写入 {secret_name} 失败：{detail}")
+        written.append(secret_name)
+
+    return {
+        "success": True,
+        "provider": "tmdb",
+        "mode": "real",
+        "can_enable": False,
+        "message": "Cloudflare Worker Secrets 已写入。",
+        "explanation": f"GATEWAY_KEY 和 TMDB_BEARER_TOKEN 已通过本机 Wrangler CLI 写入 Worker：{worker_name}。",
+        "next_step": "现在点击“保存并测试”，确认 Worker 可以访问 TMDB；测试成功后再启用 TMDB。",
+        "written": written,
+        "worker_name": worker_name,
+    }
 
 
 @router.post("/admin/integrations/{provider}/enable")

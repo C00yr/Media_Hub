@@ -51,7 +51,7 @@ def normalize_payload(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
             normalized.update(parse_raw_headers(raw_settings))
         if "bearer" in normalized and "bearer_token" not in normalized:
             normalized["bearer_token"] = normalized.pop("bearer")
-        for key in ["api_key", "bearer_token", "language", "region", "endpoint", "mode", "gateway_url", "gateway_key"]:
+        for key in ["api_key", "bearer_token", "language", "region", "endpoint", "mode", "gateway_url", "gateway_key", "worker_name"]:
             if key in normalized and isinstance(normalized[key], str):
                 normalized[key] = normalized[key].strip()
         if normalized.get("mode") not in {"direct", "gateway"}:

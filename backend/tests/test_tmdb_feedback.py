@@ -3,7 +3,7 @@ from urllib.error import HTTPError, URLError
 
 from fastapi.testclient import TestClient
 
-from app.adapters.tmdb.client import TmdbConfigError
+from app.adapters.tmdb.client import TmdbConfigError, TmdbDohError
 from app.api.routes import classify_tmdb_gateway_test_error, classify_tmdb_test_error
 from app.main import app
 
@@ -41,6 +41,16 @@ def test_tmdb_network_feedback():
 
     network_result = classify_tmdb_test_error(URLError("dns failed"), "CFGTEST-6")
     assert network_result["error_type"] == "network_error"
+
+
+def test_tmdb_doh_feedback():
+    unavailable = classify_tmdb_test_error(TmdbDohError("doh refused", "doh_unavailable"), "CFGTEST-DOH1")
+    assert unavailable["success"] is False
+    assert unavailable["error_type"] == "doh_unavailable"
+
+    bad_answer = classify_tmdb_test_error(TmdbDohError("bad answer", "doh_bad_answer"), "CFGTEST-DOH2")
+    assert bad_answer["success"] is False
+    assert bad_answer["error_type"] == "doh_bad_answer"
 
 
 def test_tmdb_gateway_worker_unreachable_feedback():

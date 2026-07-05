@@ -1,11 +1,13 @@
 import errno
+import ipaddress
 import json
 import socket
 import threading
+import time
 from contextlib import contextmanager
 from typing import Any
-from urllib.error import URLError
-from urllib.parse import urlencode
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from app.adapters.base import MetadataAdapter
@@ -18,7 +20,25 @@ TMDB_BACKDROP_BASE = "https://image.tmdb.org/t/p/w780"
 TMDB_PROFILE_BASE = "https://image.tmdb.org/t/p/w185"
 PLACEHOLDER_POSTER = "https://placehold.co/342x513?text=No+Poster"
 PLACEHOLDER_PROFILE = "https://placehold.co/185x278?text=No+Photo"
+TMDB_DOH_URL = "https://doh.pub/resolve"
+TMDB_DOH_HOSTS = {"api.themoviedb.org"}
+TMDB_DOH_FALLBACK_IPV4S = {
+    "api.themoviedb.org": ["65.9.175.91", "65.9.175.66", "65.9.175.72", "65.9.175.84"],
+}
+SUSPECT_TMDB_IPV4_NETWORKS = tuple(
+    ipaddress.ip_network(value)
+    for value in (
+        "31.13.0.0/16",
+        "69.171.0.0/16",
+        "108.160.0.0/16",
+        "157.240.0.0/16",
+        "202.160.0.0/16",
+    )
+)
 _IPV4_DNS_LOCK = threading.Lock()
+_DOH_CACHE_LOCK = threading.Lock()
+_DOH_CACHE: dict[str, tuple[float, list[str]]] = {}
+_DOH_STALE_CACHE: dict[str, tuple[float, list[str]]] = {}
 
 
 class TmdbConfigError(ValueError):
@@ -30,6 +50,12 @@ class TmdbGatewayError(RuntimeError):
         super().__init__(message)
         self.error_type = error_type
         self.http_status = http_status
+
+
+class TmdbDohError(RuntimeError):
+    def __init__(self, message: str, error_type: str = "doh_error"):
+        super().__init__(message)
+        self.error_type = error_type
 
 
 class TmdbAdapter(MetadataAdapter):
@@ -115,6 +141,14 @@ class TmdbAdapter(MetadataAdapter):
             "top_rated_tv": self._list("/tv/top_rated", {}, media_type="tv"),
         }
 
+    def test_connection(self) -> dict[str, Any]:
+        payload = self._get("/configuration", {})
+        return {
+            "ok": True,
+            "images": isinstance(payload.get("images"), dict),
+            "change_keys": len(payload.get("change_keys") or []) if isinstance(payload.get("change_keys"), list) else 0,
+        }
+
     def _list(self, path: str, params: dict[str, Any], media_type: str | None) -> list[dict[str, Any]]:
         payload = self._get(path, params)
         items = payload.get("results", [])
@@ -140,7 +174,8 @@ class TmdbAdapter(MetadataAdapter):
         elif self.bearer_token:
             headers["Authorization"] = f"Bearer {self.bearer_token}"
         request = Request(url, headers=headers)
-        with _urlopen_with_ipv4_fallback(request, timeout=self.timeout) as response:
+        opener = _urlopen_with_doh_ipv4 if self.mode == "direct" else _urlopen_with_ipv4_fallback
+        with opener(request, timeout=self.timeout) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def test_gateway_health(self) -> dict[str, Any]:
@@ -250,6 +285,112 @@ def _urlopen_with_ipv4_fallback(request: Request, timeout: int):
             return urlopen(request, timeout=timeout)
 
 
+def _urlopen_with_doh_ipv4(request: Request, timeout: int):
+    host = (urlparse(request.full_url).hostname or "").lower()
+    if host not in TMDB_DOH_HOSTS:
+        return _urlopen_with_ipv4_fallback(request, timeout=timeout)
+    ips = _resolve_ipv4_with_doh(host, timeout)
+    last_error: Exception | None = None
+    per_ip_timeout = max(4, min(timeout, 8))
+    for index, ip in enumerate(ips):
+        try:
+            with _force_host_ipv4(host, [ip]):
+                response = urlopen(request, timeout=per_ip_timeout)
+            if index:
+                _prefer_doh_ip(host, ip)
+            return response
+        except HTTPError:
+            if index:
+                _prefer_doh_ip(host, ip)
+            raise
+        except (TimeoutError, OSError, URLError) as exc:
+            last_error = exc
+            continue
+    if last_error:
+        raise last_error
+    raise TmdbDohError("DNS over HTTPS returned no usable IPv4 records for TMDB", "doh_bad_answer")
+
+
+def _resolve_ipv4_with_doh(host: str, timeout: int) -> list[str]:
+    now = time.monotonic()
+    with _DOH_CACHE_LOCK:
+        expires_at, cached_ips = _DOH_CACHE.get(host, (0.0, []))
+        if expires_at > now and cached_ips:
+            return list(cached_ips)
+
+    request = Request(
+        f"{TMDB_DOH_URL}?{urlencode({'name': host, 'type': 'A'})}",
+        headers={"Accept": "application/dns-json"},
+    )
+    try:
+        with _force_ipv4_dns():
+            with urlopen(request, timeout=max(3, min(timeout, 20))) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        stale_ips = _stale_doh_ips(host, now)
+        if stale_ips:
+            return stale_ips
+        raise TmdbDohError(f"DNS over HTTPS unavailable: {exc}", "doh_unavailable") from exc
+
+    answers = payload.get("Answer") if isinstance(payload, dict) else None
+    ips: list[str] = []
+    ttls: list[int] = []
+    if isinstance(answers, list):
+        for item in answers:
+            if not isinstance(item, dict) or int(item.get("type") or 0) != 1:
+                continue
+            value = str(item.get("data") or "").strip()
+            if _is_usable_tmdb_ipv4(value):
+                ips.append(value)
+                try:
+                    ttls.append(int(item.get("TTL") or 60))
+                except (TypeError, ValueError):
+                    pass
+
+    if not ips:
+        stale_ips = _stale_doh_ips(host, now)
+        if stale_ips:
+            return stale_ips
+        raise TmdbDohError("DNS over HTTPS returned no usable IPv4 records for TMDB", "doh_bad_answer")
+
+    cache_ttl = max(30, min(ttls or [60], default=60))
+    with _DOH_CACHE_LOCK:
+        _DOH_CACHE[host] = (now + cache_ttl, ips)
+        _DOH_STALE_CACHE[host] = (now + 86400, ips)
+    return ips
+
+
+def _prefer_doh_ip(host: str, ip: str) -> None:
+    with _DOH_CACHE_LOCK:
+        expires_at, cached_ips = _DOH_CACHE.get(host, (0.0, []))
+        stale_expires_at, stale_ips = _DOH_STALE_CACHE.get(host, (time.monotonic() + 86400, []))
+        source_ips = cached_ips or stale_ips or TMDB_DOH_FALLBACK_IPV4S.get(host, [])
+        if not source_ips:
+            return
+        ordered = [ip, *[item for item in source_ips if item != ip]]
+        if cached_ips:
+            _DOH_CACHE[host] = (expires_at, ordered)
+        _DOH_STALE_CACHE[host] = (max(stale_expires_at, time.monotonic() + 86400), ordered)
+
+
+def _stale_doh_ips(host: str, now: float) -> list[str]:
+    with _DOH_CACHE_LOCK:
+        expires_at, cached_ips = _DOH_STALE_CACHE.get(host, (0.0, []))
+        if expires_at > now and cached_ips:
+            return list(cached_ips)
+    return [ip for ip in TMDB_DOH_FALLBACK_IPV4S.get(host, []) if _is_usable_tmdb_ipv4(ip)]
+
+
+def _is_usable_tmdb_ipv4(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    if address.version != 4 or not address.is_global:
+        return False
+    return not any(address in network for network in SUSPECT_TMDB_IPV4_NETWORKS)
+
+
 def _is_network_unreachable(exc: URLError) -> bool:
     reason = getattr(exc, "reason", exc)
     if isinstance(reason, OSError) and getattr(reason, "errno", None) == errno.ENETUNREACH:
@@ -268,6 +409,31 @@ def _force_ipv4_dns():
             return ipv4_results or results
 
         socket.getaddrinfo = ipv4_getaddrinfo
+        try:
+            yield
+        finally:
+            socket.getaddrinfo = original_getaddrinfo
+
+
+@contextmanager
+def _force_host_ipv4(hostname: str, ips: list[str]):
+    with _IPV4_DNS_LOCK:
+        original_getaddrinfo = socket.getaddrinfo
+        normalized = hostname.lower()
+
+        def doh_ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+            if str(host).lower() == normalized:
+                socktype = type or socket.SOCK_STREAM
+                protocol = proto or socket.IPPROTO_TCP
+                return [
+                    (socket.AF_INET, socktype, protocol, "", (ip, port))
+                    for ip in ips
+                ]
+            results = original_getaddrinfo(host, port, family, type, proto, flags)
+            ipv4_results = [item for item in results if item[0] == socket.AF_INET]
+            return ipv4_results or results
+
+        socket.getaddrinfo = doh_ipv4_getaddrinfo
         try:
             yield
         finally:

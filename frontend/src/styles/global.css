@@ -342,11 +342,15 @@ textarea { min-height: 96px; resize: vertical; }
 .input-with-actions .input-with-tools { min-width: 0; }
 .split-inputs { display: grid; grid-template-columns: 1fr 92px; gap: 8px; }
 .compact-field { max-width: 260px; }
+.field-note { color: #667085; font-size: 12px; font-weight: 500; line-height: 1.45; }
 .notice, .result-card { border: 1px solid #d8dee7; border-radius: 8px; padding: 12px; display: grid; gap: 6px; }
 .notice.info { background: #eef8f6; border-color: #b7ddd7; color: #134e4a; }
 .field-help { border: 1px solid #e5e9f0; border-radius: 8px; padding: 12px; background: #fbfcfe; color: #475467; display: grid; gap: 6px; line-height: 1.5; }
+.field-help.compact-help { padding: 10px 12px; gap: 3px; }
 .field-help strong { color: #344054; }
 .inline-tool { justify-self: start; display: inline-flex; align-items: center; gap: 8px; }
+.inline-tool.primary-soft { border-color: #b7ddd7; background: #e7f5f2; color: #0f766e; font-weight: 800; }
+.inline-tool.primary-soft:hover { border-color: #8bc8bf; background: #d9f0ec; }
 .result-card.neutral { background: #f8fafc; color: #475467; }
 .result-card.success { background: #ecfdf3; border-color: #abefc6; color: #067647; }
 .result-card.failed { background: #fff1f0; border-color: #ffdad6; color: #b42318; }
