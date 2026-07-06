@@ -359,6 +359,7 @@ class MTeamAdapter(TrackerAdapter):
             "completed": int(_float_from_any(_pick(item, "completed", "snatched", "finish", "finishCount") or _find_value(flat, "completed", "snatched", "finishCount")) or 0),
             "comments": int(_float_from_any(_pick(item, "comments", "commentCount") or _find_value(flat, "commentCount", "comments")) or 0),
             "published_at": _string_from_any(_pick(item, "createdDate", "createdAt", "publishDate", "releaseDate")) or "",
+            "detail_url": f"https://kp.m-team.cc/detail/{torrent_id}" if torrent_id else "",
             "download_url": f"{self.base_url}/api/torrent/download/{torrent_id}" if torrent_id else "",
             "raw_summary": _compact_raw_summary(item),
         }

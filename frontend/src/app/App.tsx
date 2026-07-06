@@ -29,12 +29,33 @@ import {
   Users,
   Wrench
 } from "lucide-react";
-import { FormEvent, MouseEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, MouseEvent, ReactNode, RefObject, useEffect, useMemo, useRef, useState } from "react";
 import { api, formatBytes, formatSpeed, getToken, setToken } from "../api/client";
 
 type User = { username: string; role: string };
 type NavKey = "discover" | "dashboard" | "downloads" | "notifications" | "settings" | "diagnostics";
 type TrafficDimension = "year" | "month" | "week" | "day" | "hour";
+type DiscoverMode = "home" | "dual" | "mteam";
+type DiscoverBrowseMode = "casual" | "filter";
+type DiscoverFilters = {
+  media_type: "movie" | "tv";
+  sort_by: string;
+  genre: string;
+  region: string;
+  language: string;
+  year: string;
+  min_rating: string;
+};
+
+const DEFAULT_DISCOVER_FILTERS: DiscoverFilters = {
+  media_type: "movie",
+  sort_by: "popularity.desc",
+  genre: "",
+  region: "",
+  language: "",
+  year: "",
+  min_rating: "0",
+};
 
 type IntegrationTestResult = {
   success?: boolean;
@@ -99,6 +120,7 @@ type QbForm = {
   tags: string;
   path_from: string;
   path_to: string;
+  nas_mount_paths: string;
 };
 
 const navItems: { key: NavKey; label: string; icon: typeof Film; admin?: boolean }[] = [
@@ -210,11 +232,23 @@ function writeSearchHistory(keyword: string): string[] {
   return next;
 }
 
+function removeSearchHistory(keyword: string): string[] {
+  const next = readSearchHistory().filter((item) => item !== keyword);
+  localStorage.setItem(SEARCH_HISTORY_STORAGE_KEY, JSON.stringify(next));
+  return next;
+}
+
+function clearSearchHistory(): string[] {
+  localStorage.removeItem(SEARCH_HISTORY_STORAGE_KEY);
+  return [];
+}
+
 export function App() {
   const [initialized, setInitialized] = useState<boolean | null>(null);
   const [user, setUser] = useState<User | null>(null);
   const [active, setActive] = useState<NavKey>("dashboard");
   const [storageSummary, setStorageSummary] = useState<any | null>(null);
+  const [discoverResetToken, setDiscoverResetToken] = useState(0);
 
   useEffect(() => {
     api<{ initialized: boolean }>("/api/setup/status").then((data) => setInitialized(data.initialized));
@@ -253,6 +287,13 @@ export function App() {
   const visibleNav = navItems.filter((item) => !item.admin || user.role === "admin");
   const ActivePage = pages[active];
 
+  function openNav(key: NavKey) {
+    if (key === "discover" && active === "discover") {
+      setDiscoverResetToken((value) => value + 1);
+    }
+    setActive(key);
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -261,7 +302,7 @@ export function App() {
           {visibleNav.map((item) => {
             const Icon = item.icon;
             return (
-              <button className={active === item.key ? "nav-item active" : "nav-item"} onClick={() => setActive(item.key)} key={item.key}>
+              <button className={active === item.key ? "nav-item active" : "nav-item"} onClick={() => openNav(item.key)} key={item.key}>
                 <Icon size={18} />
                 <span>{item.label}</span>
               </button>
@@ -287,13 +328,13 @@ export function App() {
             {user.username} / {user.role === "admin" ? "管理员" : "用户"}
           </div>
         </header>
-        <ActivePage user={user} />
+        <ActivePage user={user} resetToken={active === "discover" ? discoverResetToken : 0} />
       </main>
       <nav className="bottom-nav">
         {visibleNav.filter((item) => ["discover", "dashboard", "downloads", "settings"].includes(item.key)).map((item) => {
           const Icon = item.icon;
           return (
-            <button className={active === item.key ? "active" : ""} onClick={() => setActive(item.key)} key={item.key} aria-label={item.label}>
+            <button className={active === item.key ? "active" : ""} onClick={() => openNav(item.key)} key={item.key} aria-label={item.label}>
               <Icon size={20} />
               <span>{item.key === "settings" ? "我的" : item.label}</span>
             </button>
@@ -361,13 +402,13 @@ function storageDisplay(source: any) {
   if (free > 0) {
     return {
       percent: 0,
-      helper: "qB1 返回的剩余空间",
+      helper: "请在设置中配置 NAS/本机挂载路径以显示总空间",
       value: formatBytesFixed(free, 2),
     };
   }
   return {
     percent: 0,
-    helper: "等待 qB1 磁盘数据",
+    helper: "请在设置中配置 NAS/本机挂载路径",
     value: "-",
   };
 }
@@ -606,7 +647,7 @@ function MTeamSnapshotPanel({
   updatedAt?: string;
 }) {
   const [trafficDimension, setTrafficDimension] = useState<TrafficDimension>("hour");
-  const history = mteam.traffic_series?.[trafficDimension] ?? mteam.traffic_history ?? [];
+  const history = limitTrafficHistory(mteam.traffic_series?.[trafficDimension] ?? mteam.traffic_history ?? [], trafficDimension);
   const connected = statusOverride ? statusOverride.success : Boolean(connection?.enabled && connection?.last_test_success);
   const statusLabel = testingConnection ? "正在测试" : refreshing ? "正在刷新" : connected ? "连接正常" : "连接异常";
   const statusTitle = statusOverride?.message ?? connection?.message ?? statusLabel;
@@ -615,7 +656,7 @@ function MTeamSnapshotPanel({
   return (
     <section className="panel">
       <div className="mteam-panel-header">
-        <h2>站点用户数据 - 馒头</h2>
+        <h2>站点用户数据 - M-Team</h2>
         <div className="mteam-status-tools" title={statusTitle}>
           <button className="status-dot-button" onClick={onTestConnection} disabled={testingConnection} title="测试 M-Team 连通性" aria-label="测试 M-Team 连通性">
             <span className={connected ? "status-dot online" : "status-dot offline"} />
@@ -711,6 +752,12 @@ function TrafficLineChart({ history, dimension }: { history: any[]; dimension: T
         <polygon className="traffic-area download" points={areaFor("download")} />
         <polyline className="traffic-line upload" points={lineFor("upload")} />
         <polyline className="traffic-line download" points={lineFor("download")} />
+        {points.map((point, index) => (
+          <g key={`point-${point.date}-${index}`}>
+            <circle className="traffic-point upload" cx={xFor(index)} cy={yFor(point.upload)} r={4} />
+            <circle className="traffic-point download" cx={xFor(index)} cy={yFor(point.download)} r={4} />
+          </g>
+        ))}
         {points.map((point, index) => {
           const x = xFor(index);
           const uploadY = yFor(point.upload);
@@ -721,8 +768,6 @@ function TrafficLineChart({ history, dimension }: { history: any[]; dimension: T
             <g className="traffic-hover-group" key={`${point.date}-${index}`}>
               <line className="traffic-crosshair" x1={x} y1={padding.top} x2={x} y2={padding.top + plotHeight} />
               <rect className="traffic-hit" x={x - 14} y={padding.top} width="28" height={plotHeight} />
-              <circle className="traffic-point upload" cx={x} cy={uploadY} r={4} />
-              <circle className="traffic-point download" cx={x} cy={downloadY} r={4} />
               <g className="traffic-tooltip" transform={`translate(${tooltipX} ${tooltipY})`}>
                 <rect width="210" height="64" rx="8" />
                 <text x="12" y="20">{point.date}</text>
@@ -743,6 +788,18 @@ function TrafficLineChart({ history, dimension }: { history: any[]; dimension: T
       </svg>
     </div>
   );
+}
+
+function limitTrafficHistory(history: any[], dimension: TrafficDimension): any[] {
+  const limits: Partial<Record<TrafficDimension, number>> = {
+    hour: 24,
+    day: 14,
+    week: 12,
+    month: 12,
+  };
+  const limit = limits[dimension];
+  if (!limit) return history ?? [];
+  return (history ?? []).slice(-limit);
 }
 
 function trafficPointLabel(point: any): string {
@@ -823,14 +880,15 @@ function InfoTile({ icon: Icon, label, value, delta, negative, className }: { ic
   );
 }
 
-function DiscoverPage() {
+function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
   const { data, error, loading, setData } = useLoad<any>(() => api("/api/discover/lists?cached=true"), []);
   const [query, setQuery] = useState("");
   const [media, setMedia] = useState<any[]>([]);
   const [torrents, setTorrents] = useState<any[]>([]);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState("");
-  const [hasSearched, setHasSearched] = useState(false);
+  const [discoverMode, setDiscoverMode] = useState<DiscoverMode>("home");
+  const [browseMode, setBrowseMode] = useState<DiscoverBrowseMode>("casual");
   const [searchHistory, setSearchHistory] = useState<string[]>(() => readSearchHistory());
   const [expandedDiscoverTitle, setExpandedDiscoverTitle] = useState<string | null>(null);
   const [selectedMedia, setSelectedMedia] = useState<any | null>(null);
@@ -839,6 +897,17 @@ function DiscoverPage() {
   const [detailError, setDetailError] = useState("");
   const [resourceSort, setResourceSort] = useState("seeders");
   const [resourceSortDirection, setResourceSortDirection] = useState<"asc" | "desc">("desc");
+  const [discoverFilters, setDiscoverFilters] = useState<DiscoverFilters>(DEFAULT_DISCOVER_FILTERS);
+  const [filterPayload, setFilterPayload] = useState<any | null>(null);
+  const [filterItems, setFilterItems] = useState<any[]>([]);
+  const [filterLoading, setFilterLoading] = useState(false);
+  const [filterLoadingMore, setFilterLoadingMore] = useState(false);
+  const [filterError, setFilterError] = useState("");
+  const [filterNextPage, setFilterNextPage] = useState<number | null>(null);
+  const [filterHasMore, setFilterHasMore] = useState(false);
+  const filterRequestId = useRef(0);
+  const filterKeyRef = useRef("");
+  const filterSentinelRef = useRef<HTMLDivElement | null>(null);
   const lists = data ? [
     { title: "流行趋势", items: data.trending },
     { title: "热门电影", items: data.popular_movies },
@@ -853,6 +922,73 @@ function DiscoverPage() {
     api<any>("/api/discover/lists?refresh=true").then(setData).catch(() => undefined);
   }, []);
 
+  useEffect(() => {
+    resetDiscoverHome();
+  }, [resetToken]);
+
+  useEffect(() => {
+    if (discoverMode !== "home" || browseMode !== "filter") return;
+    const filterKey = discoverFilterKey(discoverFilters);
+    filterKeyRef.current = filterKey;
+    const timer = window.setTimeout(() => {
+      loadDiscoverFilter(discoverFilters, { page: 1, pages: 4, cached: true }).then((result) => {
+        if (filterKeyRef.current === filterKey && result?._preload?.preloaded) {
+          loadDiscoverFilter(discoverFilters, { page: 1, pages: 4, refresh: true, silent: true }).catch(() => undefined);
+        }
+      });
+    }, 220);
+    return () => window.clearTimeout(timer);
+  }, [discoverMode, browseMode, discoverFilters]);
+
+  useEffect(() => {
+    if (discoverMode !== "home" || browseMode !== "filter") return;
+    const node = filterSentinelRef.current;
+    if (!node || !filterHasMore || filterLoading || filterLoadingMore || !filterNextPage) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        loadDiscoverFilter(discoverFilters, { append: true, page: filterNextPage, pages: 1 }).catch(() => undefined);
+      }
+    }, { rootMargin: "640px 0px" });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [discoverMode, browseMode, discoverFilters, filterHasMore, filterLoading, filterLoadingMore, filterNextPage]);
+
+  function resetDiscoverHome() {
+    setQuery("");
+    setMedia([]);
+    setTorrents([]);
+    setSearching(false);
+    setSearchError("");
+    setDiscoverMode("home");
+    setBrowseMode("casual");
+    setExpandedDiscoverTitle(null);
+    setSelectedMedia(null);
+    setSelectedPerson(null);
+    setDetailError("");
+    setFilterError("");
+  }
+
+  function switchBrowseMode(nextMode: DiscoverBrowseMode) {
+    setBrowseMode(nextMode);
+    setDiscoverMode("home");
+    setMedia([]);
+    setTorrents([]);
+    setSearchError("");
+    setExpandedDiscoverTitle(null);
+    setSelectedMedia(null);
+    setSelectedPerson(null);
+    setDetailError("");
+  }
+
+  function enterSearchMode() {
+    if (discoverMode !== "dual") {
+      setDiscoverMode("dual");
+      setSelectedMedia(null);
+      setSelectedPerson(null);
+      setExpandedDiscoverTitle(null);
+    }
+  }
+
   async function runSearch(event: FormEvent) {
     event.preventDefault();
     await runSearchKeyword(query);
@@ -864,7 +1000,7 @@ function DiscoverPage() {
     setQuery(keyword);
     setSearching(true);
     setSearchError("");
-    setHasSearched(true);
+    setDiscoverMode("dual");
     setExpandedDiscoverTitle(null);
     setSelectedMedia(null);
     setSelectedPerson(null);
@@ -933,7 +1069,8 @@ function DiscoverPage() {
     setExpandedDiscoverTitle(null);
     setMedia([]);
     setTorrents([]);
-    setHasSearched(true);
+    setBrowseMode("casual");
+    setDiscoverMode("mteam");
     setSearching(true);
     setSearchError("");
     try {
@@ -947,21 +1084,84 @@ function DiscoverPage() {
     }
   }
 
+  async function loadDiscoverFilter(filters: DiscoverFilters, options: { append?: boolean; page?: number; pages?: number; cached?: boolean; refresh?: boolean; silent?: boolean } = {}) {
+    const append = Boolean(options.append);
+    const requestId = append ? filterRequestId.current : filterRequestId.current + 1;
+    if (!append) filterRequestId.current = requestId;
+    if (append) setFilterLoadingMore(true);
+    else if (!options.silent) {
+      setFilterLoading(true);
+      setFilterItems([]);
+      setFilterNextPage(null);
+      setFilterHasMore(false);
+    }
+    if (!append) setFilterError("");
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([key, value]) => {
+      if (key === "min_rating" && Number(value || 0) <= 0) return;
+      if (value) params.set(key, value);
+    });
+    params.set("page", String(options.page ?? 1));
+    params.set("pages", String(options.pages ?? (append ? 1 : 4)));
+    if (options.cached) params.set("cached", "true");
+    if (options.refresh) params.set("refresh", "true");
+    try {
+      const result = await api<any>(`/api/discover/filter?${params.toString()}`);
+      if (filterRequestId.current === requestId) {
+        setFilterPayload(result);
+        setFilterNextPage(result?.next_page ?? null);
+        setFilterHasMore(Boolean(result?.next_page));
+        setFilterItems((current) => append ? mergeMediaItems(current, result?.items ?? []) : (result?.items ?? []));
+      }
+      return result;
+    } catch (err) {
+      if (filterRequestId.current === requestId) {
+        if (!append) {
+          setFilterPayload(null);
+          setFilterItems([]);
+          setFilterNextPage(null);
+          setFilterHasMore(false);
+        }
+        setFilterError((err as Error).message);
+      }
+    } finally {
+      if (append) setFilterLoadingMore(false);
+      else if (filterRequestId.current === requestId) setFilterLoading(false);
+    }
+  }
+
+  function updateDiscoverFilters(patch: Partial<DiscoverFilters>) {
+    setDiscoverFilters((current) => {
+      const next = { ...current, ...patch };
+      if (patch.media_type && patch.media_type !== current.media_type) next.genre = "";
+      return next;
+    });
+  }
+
   return (
     <div className="grid-page">
       <form className="searchbar" onSubmit={runSearch}>
-        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索电影、剧集、年份、制作组或关键词" />
+        <input value={query} onFocus={enterSearchMode} onChange={(event) => setQuery(event.target.value)} placeholder="搜索电影、剧集、年份、制作组或关键词" />
         <button className="primary" disabled={searching}><Search size={18} /> {searching ? "搜索中..." : "搜索"}</button>
       </form>
       {searchHistory.length > 0 && (
         <div className="search-history-strip" aria-label="历史搜索">
           <span>最近搜索</span>
           {searchHistory.map((keyword) => (
-            <button type="button" key={keyword} onClick={() => runSearchKeyword(keyword)} disabled={searching}>
-              {keyword}
-            </button>
+            <span className="search-history-chip" key={keyword}>
+              <button type="button" className="search-history-keyword" onClick={() => runSearchKeyword(keyword)} disabled={searching}>
+                {keyword}
+              </button>
+              <button type="button" className="search-history-remove" onClick={() => setSearchHistory(removeSearchHistory(keyword))} aria-label={`删除最近搜索 ${keyword}`}>
+                ×
+              </button>
+            </span>
           ))}
+          <button type="button" className="search-history-clear" onClick={() => setSearchHistory(clearSearchHistory())}>清空记录</button>
         </div>
+      )}
+      {!selectedPerson && !selectedMedia && !expandedDiscoverList && discoverMode !== "mteam" && (
+        <DiscoverModeTabs mode={browseMode} onChange={switchBrowseMode} />
       )}
       {searchError && <p className="error">{searchError}</p>}
       {selectedPerson ? (
@@ -972,9 +1172,9 @@ function DiscoverPage() {
         <DiscoverCollectionPage title={expandedDiscoverList.title} items={expandedDiscoverList.items} onBack={() => setExpandedDiscoverTitle(null)} onSelect={openMediaDetail} />
       ) : (
         <>
-          {hasSearched && (
+          {discoverMode === "dual" || discoverMode === "mteam" ? (
             <div className="discover-search-results">
-              <MediaSearchResults items={media} onSelect={openMediaDetail} loading={searching} />
+              {discoverMode === "dual" && <MediaSearchResults items={media} onSelect={openMediaDetail} loading={searching} />}
               <MTeamResourceResults
                 items={sortedTorrents}
                 loading={searching}
@@ -982,17 +1182,210 @@ function DiscoverPage() {
                 sortDirection={resourceSortDirection}
                 onSortBy={setResourceSort}
                 onSortDirection={setResourceSortDirection}
+                onBack={resetDiscoverHome}
               />
             </div>
+          ) : null}
+          {discoverMode === "home" && browseMode === "casual" && (
+            <>
+              {loading && <Panel title="发现"><p>正在从 TMDB 加载片单...</p></Panel>}
+              {error && <Panel title="TMDB 获取失败"><p className="error">{error}</p></Panel>}
+              {data && !data.configured && <Panel title="需要配置 TMDB"><p>{data.message}</p><p className="muted">进入“设置”，在 TMDB 配置里填写 API Key 或 Bearer Token，保存并启用后再回到发现页。</p></Panel>}
+              {lists.map((list) => <PosterRail title={list.title} items={list.items} onMore={() => setExpandedDiscoverTitle(list.title)} onSelect={openMediaDetail} key={list.title} />)}
+            </>
           )}
-          {loading && <Panel title="发现"><p>正在从 TMDB 加载片单...</p></Panel>}
-          {error && <Panel title="TMDB 获取失败"><p className="error">{error}</p></Panel>}
-          {data && !data.configured && <Panel title="需要配置 TMDB"><p>{data.message}</p><p className="muted">进入“设置”，在 TMDB 配置里填写 API Key 或 Bearer Token，保存并启用后再回到发现页。</p></Panel>}
-          {lists.map((list) => <PosterRail title={list.title} items={list.items} onMore={() => setExpandedDiscoverTitle(list.title)} onSelect={openMediaDetail} key={list.title} />)}
+          {discoverMode === "home" && browseMode === "filter" && (
+            <DiscoverFilterPage
+              filters={discoverFilters}
+              payload={filterPayload}
+              items={filterItems}
+              loading={filterLoading}
+              loadingMore={filterLoadingMore}
+              error={filterError}
+              hasMore={filterHasMore}
+              sentinelRef={filterSentinelRef}
+              onChange={updateDiscoverFilters}
+              onSelect={openMediaDetail}
+            />
+          )}
         </>
       )}
     </div>
   );
+}
+
+function DiscoverModeTabs({ mode, onChange }: { mode: DiscoverBrowseMode; onChange: (mode: DiscoverBrowseMode) => void }) {
+  return (
+    <div className="discover-mode-tabs" role="tablist" aria-label="发现模式">
+      <button className={mode === "casual" ? "active" : ""} type="button" role="tab" aria-selected={mode === "casual"} onClick={() => onChange("casual")}>
+        <Film size={16} /> 随便看看
+      </button>
+      <button className={mode === "filter" ? "active" : ""} type="button" role="tab" aria-selected={mode === "filter"} onClick={() => onChange("filter")}>
+        <SlidersHorizontal size={16} /> 条件筛选
+      </button>
+    </div>
+  );
+}
+
+function DiscoverFilterPage({
+  filters,
+  payload,
+  items,
+  loading,
+  loadingMore,
+  error,
+  hasMore,
+  sentinelRef,
+  onChange,
+  onSelect
+}: {
+  filters: DiscoverFilters;
+  payload: any;
+  items: any[];
+  loading: boolean;
+  loadingMore: boolean;
+  error: string;
+  hasMore: boolean;
+  sentinelRef: RefObject<HTMLDivElement | null>;
+  onChange: (patch: Partial<DiscoverFilters>) => void;
+  onSelect: (item: any) => void;
+}) {
+  const options = payload?.options ?? {};
+  const genreOptions = options?.genres?.[filters.media_type] ?? [];
+  const sortOptions = options?.sorts ?? [
+    { value: "popularity.desc", label: "综合排序" },
+    { value: "release_date.desc", label: "首播时间" },
+    { value: "vote_average.desc", label: "高分优先" },
+    { value: "vote_count.desc", label: "讨论热度" },
+  ];
+  const regionOptions = options?.regions ?? [
+    { value: "", label: "不限地区" },
+    { value: "CN", label: "中国大陆" },
+    { value: "HK", label: "中国香港" },
+    { value: "TW", label: "中国台湾" },
+    { value: "US", label: "美国" },
+    { value: "JP", label: "日本" },
+    { value: "KR", label: "韩国" },
+  ];
+  const languageOptions = options?.languages ?? [
+    { value: "", label: "不限语言" },
+    { value: "zh", label: "中文" },
+    { value: "en", label: "英语" },
+    { value: "ja", label: "日语" },
+    { value: "ko", label: "韩语" },
+  ];
+  const yearOptions = discoverYearOptions();
+  const loadedCount = items.length;
+  const minRating = Number(filters.min_rating || 0);
+
+  return (
+    <section className="discover-filter-page">
+      <div className="discover-filter-panel">
+        <div className="discover-filter-topline">
+          <div className="segmented compact">
+            <button className={filters.media_type === "movie" ? "active" : ""} type="button" onClick={() => onChange({ media_type: "movie" })}>电影</button>
+            <button className={filters.media_type === "tv" ? "active" : ""} type="button" onClick={() => onChange({ media_type: "tv" })}>电视剧</button>
+          </div>
+          <button type="button" onClick={() => onChange({ ...DEFAULT_DISCOVER_FILTERS })}>重置条件</button>
+        </div>
+        <FilterChipGroup label="排序" value={filters.sort_by} options={sortOptions} onChange={(value) => onChange({ sort_by: value })} />
+        <FilterChipGroup label="题材" value={filters.genre} options={[{ value: "", label: "不限题材" }, ...genreOptions.map((genre: any) => ({ value: String(genre.id), label: genre.name }))]} onChange={(value) => onChange({ genre: value })} />
+        <FilterChipGroup label="地区" value={filters.region} options={regionOptions} onChange={(value) => onChange({ region: value })} />
+        <FilterChipGroup label="年代" value={filters.year} options={yearOptions} onChange={(value) => onChange({ year: value })} />
+        <FilterChipGroup label="语言" value={filters.language} options={languageOptions} onChange={(value) => onChange({ language: value })} />
+        <RatingSlider value={filters.min_rating} onChange={(value) => onChange({ min_rating: value })} />
+      </div>
+
+      {error && <p className="error">{error}</p>}
+      {payload?.message && <p className="muted">{payload.message}</p>}
+
+      <div className="discover-filter-results-head">
+        <div>
+          <h2>筛选结果</h2>
+          <span>{loading ? "正在刷新" : `已加载 ${loadedCount} 部${payload?.total_results ? ` / 约 ${payload.total_results} 个匹配条目` : ""}${minRating > 0 ? ` · ${minRating.toFixed(1)} 分以上` : ""}`}</span>
+        </div>
+      </div>
+      <div className="poster-grid discover-filter-grid">
+        {loading && <SearchLoadingState title="正在筛选 TMDB" detail="正在按类型、题材、地区和评分刷新海报墙" />}
+        {items.map((item: any) => <DiscoverPosterCard item={item} onSelect={onSelect} key={item.id} />)}
+        {!loading && !items.length && <p className="muted">没有符合条件的条目，可以放宽题材、地区或评分。</p>}
+      </div>
+      <div className="discover-load-sentinel" ref={sentinelRef}>
+        {loadingMore ? <SearchLoadingState title="正在加载更多" detail="继续补充下一批 TMDB 条目" /> : hasMore ? <span>继续下拉加载更多</span> : loadedCount > 0 ? <span>已经到底了</span> : null}
+      </div>
+    </section>
+  );
+}
+
+function RatingSlider({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  const rating = Number(value || 0);
+  return (
+    <div className="filter-chip-group rating-filter">
+      <span>评分</span>
+      <div className="rating-slider-wrap">
+        <input type="range" min="0" max="10" step="0.1" value={rating} onChange={(event) => onChange(event.target.value)} aria-label="最低评分" />
+        <strong>{rating <= 0 ? "不限评分" : `${rating.toFixed(1)} 分以上`}</strong>
+      </div>
+    </div>
+  );
+}
+
+function FilterChipGroup({ label, value, options, onChange }: { label: string; value: string; options: { value: string; label: string }[]; onChange: (value: string) => void }) {
+  return (
+    <div className="filter-chip-group">
+      <span>{label}</span>
+      <div>
+        {options.map((option) => (
+          <button className={value === option.value ? "active" : ""} type="button" onClick={() => onChange(option.value)} key={`${label}-${option.value || "all"}`}>
+            {option.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function discoverYearOptions() {
+  const currentYear = new Date().getFullYear();
+  const years = Array.from({ length: 6 }, (_, index) => {
+    const year = currentYear - index;
+    return { value: String(year), label: String(year) };
+  });
+  return [
+    { value: "", label: "不限年代" },
+    ...years,
+    { value: "2020s", label: "2020年代" },
+    { value: "2010s", label: "2010年代" },
+    { value: "2000s", label: "2000年代" },
+    { value: "1990s", label: "90年代" },
+    { value: "1980s", label: "80年代" },
+    { value: "1970s", label: "70年代" },
+  ];
+}
+
+function mergeMediaItems(current: any[], incoming: any[]) {
+  const seen = new Set(current.map((item) => String(item.id ?? item.tmdb_id)));
+  const merged = [...current];
+  incoming.forEach((item) => {
+    const key = String(item.id ?? item.tmdb_id);
+    if (!seen.has(key)) {
+      seen.add(key);
+      merged.push(item);
+    }
+  });
+  return merged;
+}
+
+function discoverFilterKey(filters: DiscoverFilters) {
+  return [
+    filters.media_type,
+    filters.sort_by,
+    filters.genre,
+    filters.region,
+    filters.language,
+    filters.year,
+    filters.min_rating,
+  ].join("|");
 }
 
 function DownloadsPage() {
@@ -1334,7 +1727,8 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
     category: String(saved.category ?? ""),
     tags: Array.isArray(saved.tags) ? saved.tags.join(",") : String(saved.tags ?? ""),
     path_from: String(savedMapping.from ?? ""),
-    path_to: String(savedMapping.to ?? "")
+    path_to: String(savedMapping.to ?? ""),
+    nas_mount_paths: Array.isArray(saved.nas_mount_paths) ? saved.nas_mount_paths.join("\n") : String(saved.nas_mount_paths ?? saved.storage_paths ?? "")
   });
   const [busy, setBusy] = useState("");
   const [localError, setLocalError] = useState("");
@@ -1359,6 +1753,7 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
       default_save_path: form.default_save_path.trim(),
       category: form.category.trim(),
       tags: form.tags.split(",").map((item) => item.trim()).filter(Boolean),
+      nas_mount_paths: form.nas_mount_paths.split(/\r?\n|,|;/).map((item) => item.trim()).filter(Boolean),
       path_mappings: mapping
     };
   }
@@ -1416,7 +1811,7 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
       <div className="integration tmdb-editor">
         <div className="notice info">
           <strong>用于实时读取 qBittorrent WebUI 中的下载器状态和任务列表</strong>
-          <span>必填：WebUI 地址、用户名、密码。保存路径、分类、标签和路径映射是添加任务与后续整理媒体文件时使用的可选项。</span>
+          <span>必填：WebUI 地址、用户名、密码。NAS/本机挂载路径用于仪表盘统计总空间、已用空间和使用率。</span>
         </div>
         <div className="settings-grid">
           <label>显示名称
@@ -1449,10 +1844,13 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
           <label>本机/NAS 路径前缀（可选）
             <CopyableInput value={form.path_to} onChange={(value) => updateField("path_to", value)} placeholder="例如 Z:\\downloads 或 /volume1/downloads" />
           </label>
+          <label>NAS/本机挂载路径（用于空间统计）
+            <CopyableTextarea value={form.nas_mount_paths} onChange={(value) => updateField("nas_mount_paths", value)} placeholder={"例如 /volume1/downloads\n或 Z:\\downloads\n多个路径可换行填写，会按磁盘去重"} />
+          </label>
         </div>
         <div className="field-help">
           <strong>实际需要你提供：</strong>
-          <span>局域网地址就是 qB WebUI 地址；账号密码用于登录 Web API；储存地址用于添加新任务时指定保存位置；映射路径用于以后把 qB 返回的路径对应到 NAS/本机媒体库路径。</span>
+          <span>局域网地址就是 qB WebUI 地址；账号密码用于登录 Web API；储存地址用于添加新任务时指定保存位置；挂载路径必须是本后端容器/主机能访问到的 NAS 路径，仪表盘会用它统计总空间并自动去重。</span>
         </div>
         <div className="actions">
           <button onClick={saveDraft} disabled={busy !== ""}>{busy === "draft" ? "正在保存..." : "保存草稿"}</button>
@@ -1556,7 +1954,7 @@ function MTeamIntegrationEditor({ provider, onChanged }: { provider: any; onChan
     <Panel title="M-Team 配置">
       <div className="integration tmdb-editor">
         <div className="notice info">
-          <strong>用来读取馒头站点的用户数据与资源查询</strong>
+          <strong>用来读取 M-Team 站点的用户数据与资源查询</strong>
           <span>真实 API 需要 M-Team API Key；Cookie 和 Passkey 只作为兼容字段保存。敏感字段默认用星号遮住，可点眼睛查看。</span>
         </div>
         <div className="settings-grid">
@@ -2022,20 +2420,43 @@ function downloaderShortLabel(value: string): string {
 
 function DownloaderCard({ qb }: { qb: any }) {
   const displayName = downloaderDisplayName(qb);
-  const statusText = qb.online ? "连接正常 · 实时速度" : qb.message || "等待连接";
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ success: boolean; message?: string; updated_at?: string } | null>(null);
+  const online = testResult ? testResult.success : Boolean(qb.online);
+  const statusTitle = testing ? "正在测试连接" : testResult?.message || qb.message || (online ? "连接正常" : "等待连接");
+  const updatedAt = testResult?.updated_at || qb.updated_at;
+
+  async function testConnection() {
+    if (testing) return;
+    setTesting(true);
+    try {
+      const result = await api<{ success: boolean; message?: string; updated_at?: string }>(`/api/qb/${qb.id}/test`, { method: "POST" });
+      setTestResult(result);
+    } catch (err) {
+      setTestResult({ success: false, message: (err as Error).message, updated_at: new Date().toISOString() });
+    } finally {
+      setTesting(false);
+    }
+  }
+
   return (
     <div className="downloader-node">
-      <div className="downloader-node-head">
-        <div className="downloader-node-title">
+      <div className="downloader-node-top">
+        <div className="downloader-node-title" title={statusTitle}>
+          <button className="status-dot-button downloader-status-button" type="button" onClick={testConnection} disabled={testing} title={statusTitle} aria-label={`${displayName} 测试连接`}>
+            <span className={online ? "status-dot online" : "status-dot offline"} />
+          </button>
           <h3>{displayName}</h3>
         </div>
+        <small className="downloader-updated-at">数据更新于：{formatDateLabel(updatedAt)}</small>
+      </div>
+      <div className="downloader-count-row">
         <ActiveTransferCounts upload={qb.active_uploads ?? 0} download={qb.active_downloads ?? 0} />
       </div>
-      <div className="downloader-speed-row">
-        <span><Download size={13} />{formatSpeed(qb.download_speed)}</span>
-        <span><Upload size={13} />{formatSpeed(qb.upload_speed)}</span>
+      <div className="downloader-speed-list">
+        <span className="download"><b>↓</b><em>下载</em><strong>{formatSpeed(qb.download_speed)}</strong></span>
+        <span className="upload"><b>↑</b><em>上传</em><strong>{formatSpeed(qb.upload_speed)}</strong></span>
       </div>
-      <small className="downloader-node-helper">{statusText}</small>
     </div>
   );
 }
@@ -2103,7 +2524,8 @@ function MTeamResourceResults({
   sortBy,
   sortDirection,
   onSortBy,
-  onSortDirection
+  onSortDirection,
+  onBack
 }: {
   items: any[];
   loading?: boolean;
@@ -2111,11 +2533,15 @@ function MTeamResourceResults({
   sortDirection: "asc" | "desc";
   onSortBy: (value: string) => void;
   onSortDirection: (value: "asc" | "desc") => void;
+  onBack: () => void;
 }) {
   return (
     <section className="panel">
       <div className="resource-panel-header">
-        <h2>M-Team 资源结果</h2>
+        <div className="resource-panel-title">
+          <button type="button" onClick={onBack}>返回发现</button>
+          <h2>M-Team 资源结果</h2>
+        </div>
         <div className="resource-sort-tools">
           <label>
             <span>排序</span>
@@ -2156,6 +2582,7 @@ function MTeamResourceCard({ item }: { item: any }) {
   const [downloading, setDownloading] = useState(false);
   const [pushNotice, setPushNotice] = useState<PushNoticeState | null>(null);
   const chips = resourceChips(item);
+  const detailUrl = mteamResourceDetailUrl(item);
 
   async function download() {
     if (downloading) return;
@@ -2207,7 +2634,11 @@ function MTeamResourceCard({ item }: { item: any }) {
     <article className="mteam-resource-card">
       <div className="resource-main">
         <div className="resource-title-line">
-          <strong>{item.title}</strong>
+          {detailUrl ? (
+            <a className="resource-title-link" href={detailUrl} target="_blank" rel="noreferrer">{item.title}</a>
+          ) : (
+            <strong>{item.title}</strong>
+          )}
           {item.promotion_label && <span className="free-chip" title={promotionTitle(item)}>{item.promotion_label}</span>}
         </div>
         <div className="chip-row">
@@ -2357,7 +2788,7 @@ function MediaDetailPage({
         <button className="tmdb-back" type="button" onClick={onBack}>返回发现</button>
         <button className="tmdb-mteam-search" type="button" onClick={() => onMTeamSearch(item)} disabled={mteamSearching} title="用影片名称在 M-Team 搜索资源">
           <Radar size={17} />
-          {mteamSearching ? "搜索中" : "馒头搜索"}
+          {mteamSearching ? "搜索中" : "M-Team 搜索"}
         </button>
         {loading && <span className="tmdb-loading">正在读取 TMDB 详情...</span>}
         {error && <p className="error">{error}</p>}
@@ -2436,7 +2867,9 @@ function PersonDetailPage({
     <section className="tmdb-detail tmdb-person-detail">
       <div className="tmdb-detail-haze" />
       <div className="tmdb-detail-glass">
-        <button className="tmdb-back" type="button" onClick={onBack}>返回影片</button>
+        <div className="tmdb-person-actions">
+          <button className="tmdb-back tmdb-back-inline" type="button" onClick={onBack}>返回影片</button>
+        </div>
         {loading && <span className="tmdb-loading">正在读取演员作品...</span>}
         {error && <p className="error">{error}</p>}
         <div className="tmdb-person-hero">
@@ -2860,7 +3293,11 @@ function promotionTitle(item: any): string {
   return parts.join(" / ") || "促销";
 }
 
-const pages: Record<NavKey, (props: { user: User }) => ReactNode> = {
+function mteamResourceDetailUrl(item: any): string {
+  return String(item?.detail_url || item?.detailUrl || item?.page_url || item?.pageUrl || "").trim();
+}
+
+const pages: Record<NavKey, (props: { user: User; resetToken?: number }) => ReactNode> = {
   discover: DiscoverPage,
   dashboard: DashboardPage,
   downloads: DownloadsPage,

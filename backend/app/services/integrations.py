@@ -37,6 +37,12 @@ def normalize_payload(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
         tags = normalized.get("tags")
         if isinstance(tags, str):
             normalized["tags"] = [item.strip() for item in tags.split(",") if item.strip()]
+        storage_paths = normalized.get("nas_mount_paths") or normalized.get("storage_paths") or []
+        if isinstance(storage_paths, str):
+            storage_paths = storage_paths.replace(";", "\n").replace(",", "\n").splitlines()
+        if isinstance(storage_paths, list):
+            normalized["nas_mount_paths"] = [str(item).strip() for item in storage_paths if str(item).strip()]
+            normalized.pop("storage_paths", None)
         path_mappings = normalized.get("path_mappings") or []
         if isinstance(path_mappings, list):
             normalized["path_mappings"] = [

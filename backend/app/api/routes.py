@@ -1,5 +1,8 @@
 import shutil
 import subprocess
+import os
+import hashlib
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from re import fullmatch
@@ -253,6 +256,16 @@ def refresh_discover_preload_task() -> None:
     db = SessionLocal()
     try:
         refresh_discover_preload(db)
+    except Exception:
+        pass
+    finally:
+        db.close()
+
+
+def refresh_discover_filter_preload_task(filters: dict[str, Any]) -> None:
+    db = SessionLocal()
+    try:
+        refresh_discover_filter_preload(db, filters)
     except Exception:
         pass
     finally:
@@ -642,9 +655,29 @@ def get_qb_state_for_dashboard(db: Session, downloader_id: str) -> dict[str, Any
         return qb_placeholder_state(downloader_id, row, f"qB 真实数据读取失败：{exc}")
 
 
-def nas_free_space_from_qbs(qbs: list[dict[str, Any]]) -> dict[str, Any]:
-    qb1 = next((item for item in qbs if item.get("id") == "qb1" and item.get("online") and float(item.get("free_space") or 0) > 0), None)
-    if not qb1:
+def _unique_storage_paths_from_configs(db: Session) -> list[str]:
+    paths: list[str] = []
+    for provider in ("qb1", "qb2", "qb3"):
+        config = get_decrypted_config(db, provider) or {}
+        for value in config.get("nas_mount_paths") or []:
+            if str(value).strip():
+                paths.append(str(value).strip())
+        for mapping in config.get("path_mappings") or []:
+            if isinstance(mapping, dict) and str(mapping.get("to") or "").strip():
+                paths.append(str(mapping.get("to")).strip())
+    unique: list[str] = []
+    seen = set()
+    for path in paths:
+        key = os.path.normcase(os.path.normpath(path))
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
+
+
+def nas_storage_from_configs(db: Session) -> dict[str, Any]:
+    configured_paths = _unique_storage_paths_from_configs(db)
+    if not configured_paths:
         return {
             "nas_free_space": 0,
             "nas_total_space": 0,
@@ -653,21 +686,56 @@ def nas_free_space_from_qbs(qbs: list[dict[str, Any]]) -> dict[str, Any]:
             "nas_free_space_label": "-",
             "nas_free_space_source": "",
             "nas_space_label": "-",
-            "nas_space_helper": "需要配置 NAS/qB 存储信息",
+            "nas_space_helper": "请在设置的下载器配置中填写 NAS/本机挂载路径",
+            "nas_storage_configured": False,
+            "nas_storage_readable": False,
+            "nas_storage_paths": [],
+            "nas_storage_errors": [],
         }
-    free_space = float(qb1.get("free_space") or 0)
-    total_space = float(qb1.get("total_space") or 0)
-    if total_space <= 0 or free_space > total_space:
+
+    disks_seen: set[Any] = set()
+    total_space = 0.0
+    free_space = 0.0
+    readable_paths: list[str] = []
+    errors: list[dict[str, str]] = []
+    for raw_path in configured_paths:
+        path = Path(raw_path).expanduser()
+        try:
+            if not path.exists():
+                errors.append({"path": raw_path, "message": "路径不存在或后端容器无法访问"})
+                continue
+            disk_key: Any
+            try:
+                disk_key = path.stat().st_dev
+            except OSError:
+                disk_key = os.path.normcase(path.anchor or str(path))
+            if disk_key in disks_seen:
+                readable_paths.append(raw_path)
+                continue
+            usage = shutil.disk_usage(path)
+            disks_seen.add(disk_key)
+            readable_paths.append(raw_path)
+            total_space += float(usage.total)
+            free_space += float(usage.free)
+        except Exception as exc:
+            errors.append({"path": raw_path, "message": str(exc)})
+
+    if total_space <= 0:
         return {
-            "nas_free_space": free_space,
+            "nas_free_space": 0,
             "nas_total_space": 0,
             "nas_used_space": 0,
             "nas_usage_percent": None,
-            "nas_free_space_label": bytes_label(free_space, 2),
+            "nas_free_space_label": "-",
             "nas_free_space_source": "",
-            "nas_space_label": bytes_label(free_space, 2),
-            "nas_space_helper": "qB1 返回的剩余磁盘空间",
+            "nas_space_label": "-",
+            "nas_space_helper": "已配置挂载路径，但后端无法访问，请检查路径或容器挂载",
+            "nas_storage_configured": True,
+            "nas_storage_readable": False,
+            "nas_storage_paths": readable_paths,
+            "nas_storage_errors": errors,
         }
+
     used_space = max(0.0, total_space - free_space)
     usage_percent = round((used_space / total_space) * 100, 1)
     return {
@@ -676,9 +744,13 @@ def nas_free_space_from_qbs(qbs: list[dict[str, Any]]) -> dict[str, Any]:
         "nas_used_space": used_space,
         "nas_usage_percent": usage_percent,
         "nas_free_space_label": bytes_label(free_space, 2),
-        "nas_free_space_source": "",
+        "nas_free_space_source": "NAS/本机挂载路径",
         "nas_space_label": f"{bytes_label(used_space, 2)}/{bytes_label(total_space, 2)}",
-        "nas_space_helper": f"已使用 {usage_percent}%",
+        "nas_space_helper": f"已使用 {usage_percent}% · {len(disks_seen)} 个磁盘",
+        "nas_storage_configured": True,
+        "nas_storage_readable": True,
+        "nas_storage_paths": readable_paths,
+        "nas_storage_errors": errors,
     }
 
 
@@ -929,7 +1001,7 @@ def test_integration(provider: str, request: IntegrationPayload | None = None, u
                 test_trace_id,
                 "M-Team 连接成功。",
                 f"应用已经成功读取 M-Team 个人资料，当前等级为 {stats.get('user_level') or 'User'}。",
-                "你现在可以点击“启用”，然后回到仪表盘查看真实馒头站点数据。",
+                "你现在可以点击“启用”，然后回到仪表盘查看真实 M-Team 站点数据。",
                 None,
                 200,
             )
@@ -1039,7 +1111,7 @@ def build_dashboard_payload(db: Session) -> dict[str, Any]:
             connection["message"] = f"M-Team 真实数据读取失败：{exc}"
             mteam = empty_mteam_stats("M-Team 真实数据读取失败，请回到设置页重新测试。")
     qbs = [get_qb_state_for_dashboard(db, downloader_id) for downloader_id in ["qb1", "qb2", "qb3"]]
-    nas_space = nas_free_space_from_qbs(qbs)
+    nas_space = nas_storage_from_configs(db)
     persist_dashboard_snapshots(db, mteam, qbs, mteam_ok)
     if mteam_ok:
         apply_mteam_five_hour_deltas(db, mteam)
@@ -1062,6 +1134,10 @@ def build_dashboard_payload(db: Session) -> dict[str, Any]:
             "nas_free_space_source": nas_space["nas_free_space_source"],
             "nas_space_label": nas_space["nas_space_label"],
             "nas_space_helper": nas_space["nas_space_helper"],
+            "nas_storage_configured": nas_space["nas_storage_configured"],
+            "nas_storage_readable": nas_space["nas_storage_readable"],
+            "nas_storage_paths": nas_space["nas_storage_paths"],
+            "nas_storage_errors": nas_space["nas_storage_errors"],
             "download_tasks": sum(item.get("active_downloads", 0) for item in qbs),
             "upload_tasks": sum(item.get("active_uploads", 0) for item in qbs),
         },
@@ -1161,6 +1237,38 @@ def download_overview(
     except QbittorrentApiError as exc:
         raise HTTPException(status_code=502, detail=f"qB 下载页数据获取失败：{exc}") from exc
     return with_preload_meta(payload, get_preload_cache(db, cache_name), False)
+
+
+@router.post("/qb/{downloader_id}/test")
+def qb_test_connection(downloader_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    if downloader_id not in {"qb1", "qb2", "qb3"}:
+        raise HTTPException(status_code=404, detail="未知下载器")
+    row = get_config(db, downloader_id)
+    test_trace_id = trace_id("QBTEST")
+    try:
+        detail = QbittorrentWebAdapter(get_decrypted_config(db, downloader_id) or {}).test_connection()
+        result = qb_test_result(
+            True,
+            downloader_id,
+            test_trace_id,
+            "qB 连接成功。",
+            f"应用已经成功登录 qB WebUI，并读取到版本 {detail.get('version') or 'unknown'}。",
+            "下载器连接正常，可以继续读取仪表盘和任务数据。",
+            detail=detail,
+        )
+    except Exception as exc:
+        result = classify_qb_test_error(downloader_id, exc, test_trace_id)
+    result["config_version"] = row.config_version if row else 0
+    record_test_result(db, downloader_id, result, actor_user_id=user.id)
+    return {
+        "success": result["success"],
+        "provider": downloader_id,
+        "message": result["message"],
+        "explanation": result.get("explanation"),
+        "next_step": result.get("next_step"),
+        "trace_id": test_trace_id,
+        "updated_at": datetime.utcnow().isoformat(),
+    }
 
 
 @router.get("/qb/{downloader_id}/summary")
@@ -1302,9 +1410,53 @@ def build_discover_payload(db: Session) -> dict[str, Any]:
         raise HTTPException(status_code=502, detail=f"TMDB 数据获取失败：{exc}") from exc
 
 
+def default_discover_filter() -> dict[str, Any]:
+    return {
+        "media_type": "movie",
+        "sort_by": "popularity.desc",
+        "genre": "",
+        "region": "",
+        "language": "",
+        "year": "",
+        "min_rating": None,
+        "page": 1,
+        "pages": 4,
+    }
+
+
+def discover_filter_cache_name(filters: dict[str, Any]) -> str:
+    normalized = {
+        key: value
+        for key, value in filters.items()
+        if key in {"media_type", "sort_by", "genre", "region", "language", "year", "min_rating", "page", "pages"} and value not in (None, "")
+    }
+    digest = hashlib.sha1(json.dumps(normalized, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:18]
+    return f"discover.filter.{digest}"
+
+
+def build_discover_filter_payload(db: Session, filters: dict[str, Any]) -> dict[str, Any]:
+    config_row = get_config(db, "tmdb")
+    if config_row and config_row.enabled:
+        try:
+            return TmdbAdapter(get_decrypted_config(db, "tmdb") or {}).discover_media(filters)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"TMDB 条件筛选失败：{exc}") from exc
+    return MockMetadataAdapter().discover_media(filters)
+
+
+def refresh_discover_filter_preload(db: Session, filters: dict[str, Any]) -> dict[str, Any]:
+    payload = build_discover_filter_payload(db, filters)
+    set_preload_cache(db, discover_filter_cache_name(filters), payload)
+    return payload
+
+
 def refresh_discover_preload(db: Session) -> dict[str, Any]:
     payload = build_discover_payload(db)
     set_preload_cache(db, "discover", payload)
+    try:
+        refresh_discover_filter_preload(db, default_discover_filter())
+    except Exception:
+        pass
     return payload
 
 
@@ -1323,6 +1475,44 @@ def discover_lists(
             return with_preload_meta(cache["payload"], cache, True)
     payload = refresh_discover_preload(db)
     return with_preload_meta(payload, get_preload_cache(db, "discover"), False)
+
+
+@router.get("/discover/filter")
+def discover_filter(
+    background_tasks: BackgroundTasks,
+    media_type: str = Query(default="movie"),
+    sort_by: str = Query(default="popularity.desc"),
+    genre: str = Query(default=""),
+    region: str = Query(default=""),
+    language: str = Query(default=""),
+    year: str = Query(default=""),
+    min_rating: float | None = Query(default=None, ge=0, le=10),
+    page: int = Query(default=1, ge=1, le=500),
+    pages: int = Query(default=1, ge=1, le=4),
+    cached: bool = Query(default=False),
+    refresh: bool = Query(default=False),
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    filters = {
+        "media_type": media_type,
+        "sort_by": sort_by,
+        "genre": genre,
+        "region": region,
+        "language": language,
+        "year": year,
+        "min_rating": min_rating,
+        "page": page,
+        "pages": pages,
+    }
+    cache_name = discover_filter_cache_name(filters)
+    if cached and not refresh:
+        cache = get_preload_cache(db, cache_name)
+        if cache:
+            background_tasks.add_task(refresh_discover_filter_preload_task, filters)
+            return with_preload_meta(cache["payload"], cache, True)
+    payload = refresh_discover_filter_preload(db, filters)
+    return with_preload_meta(payload, get_preload_cache(db, cache_name), False)
 
 
 @router.get("/search/media")

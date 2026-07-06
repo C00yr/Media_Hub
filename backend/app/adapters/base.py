@@ -40,6 +40,12 @@ class MetadataAdapter(ABC):
     @abstractmethod
     def get_discover_lists(self) -> dict[str, Any]: ...
 
+    @abstractmethod
+    def discover_media(self, filters: dict[str, Any]) -> dict[str, Any]: ...
+
+    @abstractmethod
+    def get_discover_filter_options(self) -> dict[str, Any]: ...
+
 
 class AIAdapter(ABC):
     @abstractmethod

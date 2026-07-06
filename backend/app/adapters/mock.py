@@ -209,6 +209,71 @@ class MockMetadataAdapter(MetadataAdapter):
             "genres": ["动作", "剧情", "科幻", "纪录片"],
         }
 
+    def discover_media(self, filters: dict[str, Any]) -> dict[str, Any]:
+        media_type = str(filters.get("media_type") or "movie")
+        page = int(filters.get("page") or 1)
+        pages = int(filters.get("pages") or 1)
+        base_items = self.search_media("条件筛选")
+        items = [
+            {
+                **item,
+                "id": f"{item['id']}-p{page + offset}",
+                "tmdb_id": int(item["tmdb_id"]) + (page + offset) * 100,
+                "media_type": media_type,
+                "genres": [genre["name"] for genre in self.get_discover_filter_options()["genres"].get(media_type, [])[:2]],
+            }
+            for offset in range(pages)
+            for item in base_items
+        ]
+        total_pages = 6
+        return {
+            "source": "mock",
+            "configured": False,
+            "message": "请先在设置中启用 TMDB，当前展示示例筛选结果。",
+            "filters": filters,
+            "items": items,
+            "page": page,
+            "start_page": page,
+            "pages": pages,
+            "next_page": page + pages if page + pages <= total_pages else None,
+            "total_pages": total_pages,
+            "total_results": len(base_items) * total_pages,
+            "options": self.get_discover_filter_options(),
+        }
+
+    def get_discover_filter_options(self) -> dict[str, Any]:
+        genres = [
+            {"id": "28", "name": "动作"},
+            {"id": "18", "name": "剧情"},
+            {"id": "878", "name": "科幻"},
+            {"id": "16", "name": "动画"},
+            {"id": "9648", "name": "悬疑"},
+            {"id": "99", "name": "纪录片"},
+        ]
+        return {
+            "genres": {"movie": genres, "tv": genres},
+            "sorts": [
+                {"value": "popularity.desc", "label": "综合排序"},
+                {"value": "release_date.desc", "label": "首播时间"},
+                {"value": "vote_average.desc", "label": "高分优先"},
+                {"value": "vote_count.desc", "label": "讨论热度"},
+            ],
+            "regions": [
+                {"value": "", "label": "不限地区"},
+                {"value": "CN", "label": "中国大陆"},
+                {"value": "US", "label": "美国"},
+                {"value": "JP", "label": "日本"},
+                {"value": "KR", "label": "韩国"},
+            ],
+            "languages": [
+                {"value": "", "label": "不限语言"},
+                {"value": "zh", "label": "中文"},
+                {"value": "en", "label": "英语"},
+                {"value": "ja", "label": "日语"},
+                {"value": "ko", "label": "韩语"},
+            ],
+        }
+
 
 class MockAIAdapter(AIAdapter):
     def parse_search_intent(self, text: str) -> dict[str, Any]:

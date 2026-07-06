@@ -21,6 +21,36 @@ TMDB_PROFILE_BASE = "https://image.tmdb.org/t/p/w185"
 PLACEHOLDER_POSTER = "https://placehold.co/342x513?text=No+Poster"
 PLACEHOLDER_PROFILE = "https://placehold.co/185x278?text=No+Photo"
 TMDB_DOH_URL = "https://doh.pub/resolve"
+DISCOVER_SORT_OPTIONS = [
+    {"value": "popularity.desc", "label": "综合排序"},
+    {"value": "release_date.desc", "label": "首播时间"},
+    {"value": "vote_average.desc", "label": "高分优先"},
+    {"value": "vote_count.desc", "label": "讨论热度"},
+]
+DISCOVER_REGION_OPTIONS = [
+    {"value": "", "label": "不限地区"},
+    {"value": "CN", "label": "中国大陆"},
+    {"value": "HK", "label": "中国香港"},
+    {"value": "TW", "label": "中国台湾"},
+    {"value": "US", "label": "美国"},
+    {"value": "GB", "label": "英国"},
+    {"value": "JP", "label": "日本"},
+    {"value": "KR", "label": "韩国"},
+    {"value": "FR", "label": "法国"},
+    {"value": "DE", "label": "德国"},
+    {"value": "IN", "label": "印度"},
+    {"value": "TH", "label": "泰国"},
+]
+DISCOVER_LANGUAGE_OPTIONS = [
+    {"value": "", "label": "不限语言"},
+    {"value": "zh", "label": "中文"},
+    {"value": "en", "label": "英语"},
+    {"value": "ja", "label": "日语"},
+    {"value": "ko", "label": "韩语"},
+    {"value": "fr", "label": "法语"},
+    {"value": "de", "label": "德语"},
+    {"value": "es", "label": "西语"},
+]
 TMDB_DOH_HOSTS = {"api.themoviedb.org"}
 TMDB_DOH_FALLBACK_IPV4S = {
     "api.themoviedb.org": ["65.9.175.91", "65.9.175.66", "65.9.175.72", "65.9.175.84"],
@@ -141,6 +171,94 @@ class TmdbAdapter(MetadataAdapter):
             "top_rated_tv": self._list("/tv/top_rated", {}, media_type="tv"),
         }
 
+    def discover_media(self, filters: dict[str, Any]) -> dict[str, Any]:
+        media_type = str(filters.get("media_type") or "movie").strip().lower()
+        if media_type not in {"movie", "tv"}:
+            media_type = "movie"
+        requested_sort = str(filters.get("sort_by") or "popularity.desc").strip()
+        sort_by = requested_sort
+        if requested_sort == "release_date.desc":
+            sort_by = "primary_release_date.desc" if media_type == "movie" else "first_air_date.desc"
+        elif requested_sort == "first_air_date.desc" and media_type == "movie":
+            sort_by = "primary_release_date.desc"
+        params: dict[str, Any] = {
+            "include_adult": "false",
+            "include_video": "false",
+            "sort_by": sort_by,
+            "vote_count.gte": 20,
+        }
+        genre = str(filters.get("genre") or "").strip()
+        region = str(filters.get("region") or "").strip().upper()
+        language = str(filters.get("language") or "").strip().lower()
+        year = str(filters.get("year") or "").strip()
+        min_rating = str(filters.get("min_rating") or "").strip()
+        page = max(1, min(int(filters.get("page") or 1), 500))
+        pages = max(1, min(int(filters.get("pages") or 1), 4))
+        if genre:
+            params["with_genres"] = genre
+        if region:
+            params["with_origin_country"] = region
+            if media_type == "movie":
+                params["region"] = region
+        elif media_type == "movie":
+            params["region"] = self.region
+        if language:
+            params["with_original_language"] = language
+        if year.endswith("s") and year[:-1].isdigit():
+            start_year = int(year[:-1])
+            end_year = start_year + 9
+            date_field = "primary_release_date" if media_type == "movie" else "first_air_date"
+            params[f"{date_field}.gte"] = f"{start_year}-01-01"
+            params[f"{date_field}.lte"] = f"{end_year}-12-31"
+        elif year:
+            params["primary_release_year" if media_type == "movie" else "first_air_date_year"] = year
+        if min_rating:
+            params["vote_average.gte"] = min_rating
+        genre_map = self._genre_map(media_type)
+        normalized = []
+        total_pages = 1
+        total_results = 0
+        current_page = page
+        for offset in range(pages):
+            request_page = page + offset
+            if request_page > 500:
+                break
+            payload = self._get(f"/discover/{media_type}", {**params, "page": request_page})
+            current_page = payload.get("page") or request_page
+            total_pages = payload.get("total_pages") or total_pages
+            total_results = payload.get("total_results") or total_results
+            for item in payload.get("results", [])[:20]:
+                media = self._normalize_item({**item, "media_type": media_type})
+                if not media.get("genres"):
+                    media["genres"] = [genre_map[genre_id] for genre_id in item.get("genre_ids", []) if genre_id in genre_map]
+                normalized.append(media)
+            if request_page >= int(total_pages or 1):
+                break
+        return {
+            "source": "tmdb",
+            "configured": True,
+            "filters": {**filters, "media_type": media_type, "sort_by": requested_sort},
+            "items": normalized,
+            "page": current_page,
+            "start_page": page,
+            "pages": pages,
+            "next_page": page + pages if page + pages <= int(total_pages or 1) else None,
+            "total_pages": total_pages,
+            "total_results": total_results or len(normalized),
+            "options": self.get_discover_filter_options(),
+        }
+
+    def get_discover_filter_options(self) -> dict[str, Any]:
+        return {
+            "genres": {
+                "movie": self._genres("movie"),
+                "tv": self._genres("tv"),
+            },
+            "sorts": DISCOVER_SORT_OPTIONS,
+            "regions": DISCOVER_REGION_OPTIONS,
+            "languages": DISCOVER_LANGUAGE_OPTIONS,
+        }
+
     def test_connection(self) -> dict[str, Any]:
         payload = self._get("/configuration", {})
         return {
@@ -163,8 +281,17 @@ class TmdbAdapter(MetadataAdapter):
                 detailed.append(item)
         return detailed
 
+    def _genres(self, media_type: str) -> list[dict[str, Any]]:
+        payload = self._get(f"/genre/{media_type}/list", {})
+        genres = payload.get("genres") if isinstance(payload.get("genres"), list) else []
+        return [{"id": str(genre.get("id")), "name": genre.get("name")} for genre in genres if genre.get("id") and genre.get("name")]
+
+    def _genre_map(self, media_type: str) -> dict[int, str]:
+        genres = self._genres(media_type)
+        return {int(genre["id"]): str(genre["name"]) for genre in genres if str(genre.get("id", "")).isdigit()}
+
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
-        query = {"language": self.language, "page": 1, **params}
+        query = {"language": self.language, "page": 1, **{key: value for key, value in params.items() if value not in (None, "")}}
         if self.mode == "direct" and self.api_key:
             query["api_key"] = self.api_key
         url = f"{self.base_url}{path}?{urlencode(query)}"
