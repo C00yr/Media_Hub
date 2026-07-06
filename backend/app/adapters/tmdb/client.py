@@ -69,6 +69,9 @@ _IPV4_DNS_LOCK = threading.Lock()
 _DOH_CACHE_LOCK = threading.Lock()
 _DOH_CACHE: dict[str, tuple[float, list[str]]] = {}
 _DOH_STALE_CACHE: dict[str, tuple[float, list[str]]] = {}
+_DISCOVER_OPTIONS_LOCK = threading.Lock()
+_DISCOVER_GENRE_CACHE: dict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = {}
+_DISCOVER_OPTIONS_TTL_SECONDS = 6 * 60 * 60
 
 
 class TmdbConfigError(ValueError):
@@ -228,13 +231,10 @@ class TmdbAdapter(MetadataAdapter):
             total_pages = payload.get("total_pages") or total_pages
             total_results = payload.get("total_results") or total_results
             for item in payload.get("results", [])[:20]:
-                media = self._normalize_item({**item, "media_type": media_type})
-                if not media.get("genres"):
-                    media["genres"] = [genre_map[genre_id] for genre_id in item.get("genre_ids", []) if genre_id in genre_map]
-                normalized.append(media)
+                normalized.append(self._normalize_discover_item({**item, "media_type": media_type}, media_type, genre_map))
             if request_page >= int(total_pages or 1):
                 break
-        return {
+        result = {
             "source": "tmdb",
             "configured": True,
             "filters": {**filters, "media_type": media_type, "sort_by": requested_sort},
@@ -245,8 +245,10 @@ class TmdbAdapter(MetadataAdapter):
             "next_page": page + pages if page + pages <= int(total_pages or 1) else None,
             "total_pages": total_pages,
             "total_results": total_results or len(normalized),
-            "options": self.get_discover_filter_options(),
         }
+        if filters.get("include_options", True):
+            result["options"] = self.get_discover_filter_options()
+        return result
 
     def get_discover_filter_options(self) -> dict[str, Any]:
         return {
@@ -282,13 +284,45 @@ class TmdbAdapter(MetadataAdapter):
         return detailed
 
     def _genres(self, media_type: str) -> list[dict[str, Any]]:
+        cache_key = (self.language, media_type)
+        now = time.monotonic()
+        with _DISCOVER_OPTIONS_LOCK:
+            expires_at, cached = _DISCOVER_GENRE_CACHE.get(cache_key, (0.0, []))
+            if expires_at > now and cached:
+                return [dict(item) for item in cached]
         payload = self._get(f"/genre/{media_type}/list", {})
         genres = payload.get("genres") if isinstance(payload.get("genres"), list) else []
-        return [{"id": str(genre.get("id")), "name": genre.get("name")} for genre in genres if genre.get("id") and genre.get("name")]
+        result = [{"id": str(genre.get("id")), "name": genre.get("name")} for genre in genres if genre.get("id") and genre.get("name")]
+        with _DISCOVER_OPTIONS_LOCK:
+            _DISCOVER_GENRE_CACHE[cache_key] = (now + _DISCOVER_OPTIONS_TTL_SECONDS, [dict(item) for item in result])
+        return result
 
     def _genre_map(self, media_type: str) -> dict[int, str]:
         genres = self._genres(media_type)
         return {int(genre["id"]): str(genre["name"]) for genre in genres if str(genre.get("id", "")).isdigit()}
+
+    def _normalize_discover_item(self, item: dict[str, Any], media_type: str, genre_map: dict[int, str]) -> dict[str, Any]:
+        item_media_type = item.get("media_type") or media_type
+        date = item.get("release_date") if item_media_type == "movie" else item.get("first_air_date")
+        title = item.get("title") or item.get("name") or item.get("original_title") or item.get("original_name") or "Unknown"
+        poster_path = item.get("poster_path")
+        genre_ids = item.get("genre_ids") if isinstance(item.get("genre_ids"), list) else []
+        return {
+            "id": f"{item_media_type}-{item.get('id')}",
+            "tmdb_id": item.get("id"),
+            "media_type": item_media_type,
+            "title": title,
+            "original_title": item.get("original_title") or item.get("original_name") or title,
+            "year": date[:4] if date else "",
+            "release_date": date or "",
+            "rating": round(float(item.get("vote_average") or 0), 1),
+            "vote_count": int(item.get("vote_count") or 0),
+            "popularity": round(float(item.get("popularity") or 0), 1),
+            "poster": f"{TMDB_IMAGE_BASE}{poster_path}" if poster_path else PLACEHOLDER_POSTER,
+            "overview": item.get("overview") or "",
+            "genres": [genre_map[genre_id] for genre_id in genre_ids if genre_id in genre_map][:3],
+            "original_language": item.get("original_language") or "",
+        }
 
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         query = {"language": self.language, "page": 1, **{key: value for key, value in params.items() if value not in (None, "")}}
@@ -354,6 +388,10 @@ class TmdbAdapter(MetadataAdapter):
             runtime = runtimes[0] if runtimes else None
         external_ids = item.get("external_ids") if isinstance(item.get("external_ids"), dict) else {}
         countries = item.get("production_countries") if isinstance(item.get("production_countries"), list) else []
+        seasons = item.get("seasons") if isinstance(item.get("seasons"), list) else []
+        season_summaries = [self._normalize_tv_season(season) for season in seasons if isinstance(season, dict)]
+        regular_seasons = [season for season in season_summaries if int(season.get("season_number") or 0) > 0]
+        latest_season = max(regular_seasons, key=lambda season: int(season.get("season_number") or 0), default=None)
         recommendation_payload = item.get("recommendations") if isinstance(item.get("recommendations"), dict) else {}
         similar_payload = item.get("similar") if isinstance(item.get("similar"), dict) else {}
         recommendation_items = recommendation_payload.get("results") if isinstance(recommendation_payload.get("results"), list) else []
@@ -394,11 +432,40 @@ class TmdbAdapter(MetadataAdapter):
             "original_language": item.get("original_language") or "",
             "imdb_id": external_ids.get("imdb_id") or item.get("imdb_id") or "",
             "production_countries": [country.get("name") for country in countries if country.get("name")],
+            "number_of_seasons": item.get("number_of_seasons") if media_type == "tv" else None,
+            "number_of_episodes": item.get("number_of_episodes") if media_type == "tv" else None,
+            "seasons": season_summaries if media_type == "tv" else [],
+            "latest_season": latest_season if media_type == "tv" else None,
+            "last_episode_to_air": self._normalize_tv_episode(item.get("last_episode_to_air")) if media_type == "tv" else None,
+            "next_episode_to_air": self._normalize_tv_episode(item.get("next_episode_to_air")) if media_type == "tv" else None,
             "recommendations": [
                 self._normalize_item({**related, "media_type": related.get("media_type") or media_type})
                 for related in recommendation_items[:12]
                 if (related.get("media_type") or media_type) in {"movie", "tv"}
             ],
+        }
+
+    @staticmethod
+    def _normalize_tv_season(season: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "season_number": season.get("season_number"),
+            "episode_count": season.get("episode_count"),
+            "air_date": season.get("air_date") or "",
+            "name": season.get("name") or "",
+            "overview": season.get("overview") or "",
+            "poster": f"{TMDB_IMAGE_BASE}{season.get('poster_path')}" if season.get("poster_path") else "",
+        }
+
+    @staticmethod
+    def _normalize_tv_episode(episode: Any) -> dict[str, Any] | None:
+        if not isinstance(episode, dict):
+            return None
+        return {
+            "season_number": episode.get("season_number"),
+            "episode_number": episode.get("episode_number"),
+            "air_date": episode.get("air_date") or "",
+            "name": episode.get("name") or "",
+            "overview": episode.get("overview") or "",
         }
 
 

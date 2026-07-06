@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from re import fullmatch
 from socket import timeout as SocketTimeout
+from threading import Lock
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -53,6 +54,8 @@ from app.utils.redaction import redact_payload
 
 router = APIRouter()
 settings = get_settings()
+_PRELOAD_TASK_LOCK = Lock()
+_PRELOAD_TASKS_RUNNING: set[str] = set()
 PRELOAD_PREFIX = "preload."
 
 
@@ -240,6 +243,22 @@ def with_preload_meta(payload: dict[str, Any], cache: dict[str, Any] | None, pre
         "refreshing": preloaded,
     }
     return result
+
+
+def add_preload_task_once(background_tasks: BackgroundTasks, key: str, task, *args: Any) -> None:
+    with _PRELOAD_TASK_LOCK:
+        if key in _PRELOAD_TASKS_RUNNING:
+            return
+        _PRELOAD_TASKS_RUNNING.add(key)
+    background_tasks.add_task(run_preload_task_once, key, task, *args)
+
+
+def run_preload_task_once(key: str, task, *args: Any) -> None:
+    try:
+        task(*args)
+    finally:
+        with _PRELOAD_TASK_LOCK:
+            _PRELOAD_TASKS_RUNNING.discard(key)
 
 
 def refresh_dashboard_preload_task() -> None:
@@ -605,6 +624,11 @@ def qb_placeholder_state(downloader_id: str, row: IntegrationConfig | None, mess
     configured = bool(row and row.encrypted_payload)
     enabled = bool(row and row.enabled)
     name = (row.redacted_summary or {}).get("name") if row else None
+    return qb_placeholder_state_from_meta(downloader_id, configured, enabled, name, message)
+
+
+def qb_placeholder_state_from_meta(downloader_id: str, configured: bool, enabled: bool, name: str | None = None, message: str | None = None) -> dict[str, Any]:
+    index = downloader_id.replace("qb", "")
     return {
         "id": downloader_id,
         "name": name or f"qB{index}",
@@ -1154,6 +1178,48 @@ def refresh_dashboard_preload(db: Session) -> dict[str, Any]:
     return payload
 
 
+def build_dashboard_qbs_payload(db: Session) -> dict[str, Any]:
+    configs: list[tuple[str, dict[str, Any], str | None]] = []
+    states: list[dict[str, Any] | None] = []
+    for downloader_id in ["qb1", "qb2", "qb3"]:
+        row = get_config(db, downloader_id)
+        configured = bool(row and row.encrypted_payload)
+        enabled = bool(row and row.enabled)
+        name = (row.redacted_summary or {}).get("name") if row else None
+        if not configured or not enabled:
+            states.append(qb_placeholder_state_from_meta(downloader_id, configured, enabled, name))
+            continue
+        try:
+            configs.append((downloader_id, get_decrypted_config(db, downloader_id) or {}, name))
+            states.append(None)
+        except Exception as exc:
+            states.append(qb_placeholder_state_from_meta(downloader_id, configured, enabled, name, f"qB 配置读取失败：{exc}"))
+    db.close()
+
+    config_index = 0
+    for index, state in enumerate(states):
+        if state is not None:
+            continue
+        downloader_id, config, name = configs[config_index]
+        config_index += 1
+        try:
+            states[index] = QbittorrentWebAdapter(config).get_server_state(downloader_id)
+        except Exception as exc:
+            states[index] = qb_placeholder_state_from_meta(downloader_id, True, True, name, f"qB 真实数据读取失败：{exc}")
+
+    qbs = [item for item in states if item is not None]
+    return {
+        "qbs": qbs,
+        "overview": {
+            "total_download_speed": sum(item.get("download_speed", 0) for item in qbs),
+            "total_upload_speed": sum(item.get("upload_speed", 0) for item in qbs),
+            "download_tasks": sum(item.get("active_downloads", 0) for item in qbs),
+            "upload_tasks": sum(item.get("active_uploads", 0) for item in qbs),
+        },
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+
+
 def build_download_payload(db: Session, downloader_id: str) -> dict[str, Any]:
     adapter = get_qb_adapter_or_error(db, downloader_id)
     summary = adapter.get_server_state(downloader_id)
@@ -1185,10 +1251,15 @@ def dashboard(
     if cached and not refresh:
         cache = get_preload_cache(db, "dashboard")
         if cache:
-            background_tasks.add_task(refresh_dashboard_preload_task)
+            add_preload_task_once(background_tasks, "dashboard", refresh_dashboard_preload_task)
             return with_preload_meta(cache["payload"], cache, True)
     payload = refresh_dashboard_preload(db)
     return with_preload_meta(payload, get_preload_cache(db, "dashboard"), False)
+
+
+@router.get("/dashboard/qbs")
+def dashboard_qbs(db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
+    return build_dashboard_qbs_payload(db)
 
 
 @router.get("/mteam/stats")
@@ -1230,7 +1301,7 @@ def download_overview(
     if cached and not refresh:
         cache = get_preload_cache(db, cache_name)
         if cache:
-            background_tasks.add_task(refresh_download_preload_task, downloader_id)
+            add_preload_task_once(background_tasks, f"downloads.{downloader_id}", refresh_download_preload_task, downloader_id)
             return with_preload_meta(cache["payload"], cache, True)
     try:
         payload = refresh_download_preload(db, downloader_id)
@@ -1364,6 +1435,11 @@ def mteam_download_to_qb(
     return {**result, "torrent_id": torrent_id, "filename": torrent_file["filename"]}
 
 
+@router.post("/qb/{downloader_id}/torrents/{torrent_hash}/delete-confirm")
+def qb_delete_confirm(downloader_id: str, torrent_hash: str, user: User = Depends(get_current_user)) -> dict[str, Any]:
+    return {"confirm_token": trace_id("DEL"), "message": "用户确认风险后，请在 DELETE 请求中提交这个确认令牌。", "target": {"downloader_id": downloader_id, "hash": torrent_hash, "actor": user.username}}
+
+
 @router.post("/qb/{downloader_id}/torrents/{torrent_hash}/{action}")
 def qb_mutate(downloader_id: str, torrent_hash: str, action: str, request: QbActionPayload, authorization: str | None = Header(default=None), user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     if action not in {"pause", "resume", "limits", "category", "tags"}:
@@ -1377,11 +1453,6 @@ def qb_mutate(downloader_id: str, torrent_hash: str, action: str, request: QbAct
     db.add(DownloadAction(trace_id=result["trace_id"], downloader_id=downloader_id, action=action, target_hash=torrent_hash, actor_user_id=user.id))
     db.commit()
     return result
-
-
-@router.post("/qb/{downloader_id}/torrents/{torrent_hash}/delete-confirm")
-def qb_delete_confirm(downloader_id: str, torrent_hash: str, user: User = Depends(get_current_user)) -> dict[str, Any]:
-    return {"confirm_token": trace_id("DEL"), "message": "用户确认风险后，请在 DELETE 请求中提交这个确认令牌。", "target": {"downloader_id": downloader_id, "hash": torrent_hash, "actor": user.username}}
 
 
 @router.delete("/qb/{downloader_id}/torrents/{torrent_hash}")
@@ -1471,7 +1542,7 @@ def discover_lists(
     if cached and not refresh:
         cache = get_preload_cache(db, "discover")
         if cache:
-            background_tasks.add_task(refresh_discover_preload_task)
+            add_preload_task_once(background_tasks, "discover", refresh_discover_preload_task)
             return with_preload_meta(cache["payload"], cache, True)
     payload = refresh_discover_preload(db)
     return with_preload_meta(payload, get_preload_cache(db, "discover"), False)
@@ -1489,6 +1560,7 @@ def discover_filter(
     min_rating: float | None = Query(default=None, ge=0, le=10),
     page: int = Query(default=1, ge=1, le=500),
     pages: int = Query(default=1, ge=1, le=4),
+    include_options: bool = Query(default=True),
     cached: bool = Query(default=False),
     refresh: bool = Query(default=False),
     db: Session = Depends(get_db),
@@ -1504,12 +1576,13 @@ def discover_filter(
         "min_rating": min_rating,
         "page": page,
         "pages": pages,
+        "include_options": include_options,
     }
     cache_name = discover_filter_cache_name(filters)
     if cached and not refresh:
         cache = get_preload_cache(db, cache_name)
         if cache:
-            background_tasks.add_task(refresh_discover_filter_preload_task, filters)
+            add_preload_task_once(background_tasks, cache_name, refresh_discover_filter_preload_task, filters)
             return with_preload_meta(cache["payload"], cache, True)
     payload = refresh_discover_filter_preload(db, filters)
     return with_preload_meta(payload, get_preload_cache(db, cache_name), False)
@@ -1586,7 +1659,15 @@ def diagnostics_health(_: User = Depends(require_admin), db: Session = Depends(g
     for provider in PROVIDERS + ["nas_disk", "stats_engine"]:
         row = integrations.get(provider)
         result = row.last_test_result if row else None
-        modules.append({"module": provider, "status": "success" if (result or provider in ["nas_disk", "stats_engine"]) else "not_tested", "enabled": bool(row.enabled) if row else provider in ["nas_disk", "stats_engine"], "last_success_at": row.last_tested_at.isoformat() if row and row.last_tested_at else None, "duration_ms": result.get("duration_ms") if result else None, "last_error": None})
+        if provider in ["nas_disk", "stats_engine"]:
+            status = "success"
+        elif result and result.get("success") is True:
+            status = "success"
+        elif result and result.get("success") is False:
+            status = "failed"
+        else:
+            status = "not_tested"
+        modules.append({"module": provider, "status": status, "enabled": bool(row.enabled) if row else provider in ["nas_disk", "stats_engine"], "last_success_at": row.last_tested_at.isoformat() if row and row.last_tested_at else None, "duration_ms": result.get("duration_ms") if result else None, "last_error": result.get("message") if isinstance(result, dict) else None})
     return {"modules": modules}
 
 

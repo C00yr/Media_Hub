@@ -298,7 +298,7 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
                 return
             except QbittorrentApiError as exc:
                 last_error = exc
-                if exc.http_status != 404:
+                if exc.http_status not in {400, 404, 405, 409}:
                     raise
         if last_error:
             raise last_error

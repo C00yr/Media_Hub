@@ -1,5 +1,6 @@
 import {
   Activity,
+  ArrowUp,
   Bell,
   CalendarDays,
   Check,
@@ -29,7 +30,7 @@ import {
   Users,
   Wrench
 } from "lucide-react";
-import { FormEvent, MouseEvent, ReactNode, RefObject, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, MouseEvent, PointerEvent, ReactNode, RefObject, useEffect, useMemo, useRef, useState } from "react";
 import { api, formatBytes, formatSpeed, getToken, setToken } from "../api/client";
 
 type User = { username: string; role: string };
@@ -90,15 +91,6 @@ type PushNoticeState = {
   detail?: string;
 };
 
-type AppLogEntry = {
-  id: string;
-  at: string;
-  level: "info" | "success" | "error";
-  scope: string;
-  message: string;
-  detail?: string;
-};
-
 type MTeamForm = {
   base_url: string;
   api_key: string;
@@ -116,10 +108,6 @@ type QbForm = {
   password: string;
   timeout: string;
   default_save_path: string;
-  category: string;
-  tags: string;
-  path_from: string;
-  path_to: string;
   nas_mount_paths: string;
 };
 
@@ -138,7 +126,7 @@ const pageDescriptions: Record<NavKey, string> = {
   downloads: "查看和管理多个 qB 下载器中的任务。",
   notifications: "集中查看系统提醒和任务通知。",
   settings: "管理运行时凭据，敏感信息只在后端加密保存。",
-  diagnostics: "查看模块健康、调用轨迹并导出脱敏诊断信息。"
+  diagnostics: "查看核心模块是否正常运行，并导出脱敏诊断信息。"
 };
 
 function useLoad<T>(loader: () => Promise<T>, deps: unknown[]) {
@@ -181,38 +169,7 @@ function useLoad<T>(loader: () => Promise<T>, deps: unknown[]) {
   };
 }
 
-const APP_LOG_EVENT = "ptmh-app-log";
-const APP_LOG_STORAGE_KEY = "ptmh_temp_logs";
 const SEARCH_HISTORY_STORAGE_KEY = "ptmh_search_history";
-
-function readAppLogs(): AppLogEntry[] {
-  try {
-    const value = localStorage.getItem(APP_LOG_STORAGE_KEY);
-    return value ? JSON.parse(value) : [];
-  } catch {
-    return [];
-  }
-}
-
-function writeAppLogs(logs: AppLogEntry[]) {
-  localStorage.setItem(APP_LOG_STORAGE_KEY, JSON.stringify(logs.slice(0, 120)));
-  window.dispatchEvent(new CustomEvent(APP_LOG_EVENT, { detail: logs.slice(0, 120) }));
-}
-
-function emitAppLog(entry: Omit<AppLogEntry, "id" | "at">) {
-  const next: AppLogEntry = {
-    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    at: new Date().toLocaleString(),
-    ...entry,
-  };
-  writeAppLogs([next, ...readAppLogs()]);
-}
-
-function formatAppLogs(logs: AppLogEntry[]): string {
-  return logs
-    .map((item) => `[${item.at}] [${item.level}] [${item.scope}] ${item.message}${item.detail ? `\n${item.detail}` : ""}`)
-    .join("\n\n");
-}
 
 function readSearchHistory(): string[] {
   try {
@@ -247,8 +204,8 @@ export function App() {
   const [initialized, setInitialized] = useState<boolean | null>(null);
   const [user, setUser] = useState<User | null>(null);
   const [active, setActive] = useState<NavKey>("dashboard");
-  const [storageSummary, setStorageSummary] = useState<any | null>(null);
   const [discoverResetToken, setDiscoverResetToken] = useState(0);
+  const [selectedDownloader, setSelectedDownloader] = useState("qb1");
 
   useEffect(() => {
     api<{ initialized: boolean }>("/api/setup/status").then((data) => setInitialized(data.initialized));
@@ -256,29 +213,6 @@ export function App() {
       api<User>("/api/auth/me").then(setUser).catch(() => setToken(null));
     }
   }, []);
-
-  useEffect(() => {
-    if (!user) {
-      setStorageSummary(null);
-      return;
-    }
-    let alive = true;
-    async function loadStorage(refresh = false) {
-      try {
-        const result = await api<any>(`/api/downloads/qb1/overview?${refresh ? "refresh=true" : "cached=true"}`);
-        if (alive) setStorageSummary(result.summary);
-      } catch {
-        if (alive) setStorageSummary(null);
-      }
-    }
-    loadStorage(false);
-    loadStorage(true);
-    const timer = window.setInterval(() => loadStorage(true), 60000);
-    return () => {
-      alive = false;
-      window.clearInterval(timer);
-    };
-  }, [user]);
 
   if (initialized === null) return <Splash />;
   if (!initialized) return <SetupPage onDone={(nextUser) => { setInitialized(true); setUser(nextUser); }} />;
@@ -309,7 +243,6 @@ export function App() {
             );
           })}
         </nav>
-        <SidebarStorage summary={storageSummary} />
         <button className="nav-item logout" onClick={() => { setToken(null); setUser(null); }}>
           <LogOut size={18} />
           <span>退出登录</span>
@@ -328,7 +261,15 @@ export function App() {
             {user.username} / {user.role === "admin" ? "管理员" : "用户"}
           </div>
         </header>
-        <ActivePage user={user} resetToken={active === "discover" ? discoverResetToken : 0} />
+        <ActivePage
+          user={user}
+          resetToken={active === "discover" ? discoverResetToken : 0}
+          selectedDownloader={selectedDownloader}
+          onOpenDownloader={(downloaderId) => {
+            setSelectedDownloader(downloaderId);
+            setActive("downloads");
+          }}
+        />
       </main>
       <nav className="bottom-nav">
         {visibleNav.filter((item) => ["discover", "dashboard", "downloads", "settings"].includes(item.key)).map((item) => {
@@ -341,7 +282,6 @@ export function App() {
           );
         })}
       </nav>
-      <AppLogDock />
     </div>
   );
 }
@@ -366,23 +306,6 @@ function BrandLogo({ subtitle, large = false }: { subtitle: string; large?: bool
         <small>{subtitle}</small>
       </div>
     </div>
-  );
-}
-
-function SidebarStorage({ summary }: { summary: any | null }) {
-  const storage = storageDisplay(summary);
-  return (
-    <section className="sidebar-storage">
-      <div className="sidebar-storage-title">
-        <HardDrive size={15} />
-        <span>存储空间</span>
-      </div>
-      <div className="storage-line"><span style={{ width: `${storage.percent || 0}%` }} /></div>
-      <div className="sidebar-storage-row">
-        <small>{storage.helper}</small>
-        <strong>{storage.value}</strong>
-      </div>
-    </section>
   );
 }
 
@@ -411,67 +334,6 @@ function storageDisplay(source: any) {
     helper: "请在设置中配置 NAS/本机挂载路径",
     value: "-",
   };
-}
-
-function AppLogDock() {
-  const [open, setOpen] = useState(false);
-  const [logs, setLogs] = useState<AppLogEntry[]>(() => readAppLogs());
-  const [copied, setCopied] = useState(false);
-
-  useEffect(() => {
-    function sync(event: Event) {
-      const custom = event as CustomEvent<AppLogEntry[]>;
-      setLogs(custom.detail ?? readAppLogs());
-    }
-    window.addEventListener(APP_LOG_EVENT, sync);
-    window.addEventListener("storage", sync);
-    return () => {
-      window.removeEventListener(APP_LOG_EVENT, sync);
-      window.removeEventListener("storage", sync);
-    };
-  }, []);
-
-  async function copyLogs() {
-    await navigator.clipboard.writeText(formatAppLogs(logs) || "暂无日志");
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1400);
-  }
-
-  function clearLogs() {
-    writeAppLogs([]);
-    setLogs([]);
-  }
-
-  return (
-    <section className={open ? "app-log-dock open" : "app-log-dock"}>
-      <button className="app-log-toggle" type="button" onClick={() => setOpen(!open)}>
-        <MessageSquare size={16} />
-        临时日志
-        {!!logs.length && <span>{logs.length}</span>}
-      </button>
-      {open && (
-        <div className="app-log-panel">
-          <div className="app-log-header">
-            <strong>临时日志文档</strong>
-            <div>
-              <button type="button" onClick={copyLogs}><Copy size={14} />{copied ? "已复制" : "复制"}</button>
-              <button type="button" onClick={clearLogs}>清空</button>
-            </div>
-          </div>
-          <div className="app-log-list">
-            {logs.map((item) => (
-              <article className={`app-log-entry ${item.level}`} key={item.id}>
-                <span>{item.at} / {item.scope}</span>
-                <strong>{item.message}</strong>
-                {item.detail && <pre>{item.detail}</pre>}
-              </article>
-            ))}
-            {!logs.length && <p className="muted">暂无日志。下一次推送下载时会自动记录每一步。</p>}
-          </div>
-        </div>
-      )}
-    </section>
-  );
 }
 
 function SetupPage({ onDone }: { onDone: (user: User) => void }) {
@@ -544,7 +406,23 @@ function AuthForm(props: {
   );
 }
 
-function DashboardPage() {
+function mergeDashboardQbs(current: any, realtime: any) {
+  if (!current || !realtime) return current;
+  return {
+    ...current,
+    qbs: realtime.qbs ?? current.qbs,
+    overview: {
+      ...current.overview,
+      total_download_speed: realtime.overview?.total_download_speed ?? current.overview?.total_download_speed,
+      total_upload_speed: realtime.overview?.total_upload_speed ?? current.overview?.total_upload_speed,
+      download_tasks: realtime.overview?.download_tasks ?? current.overview?.download_tasks,
+      upload_tasks: realtime.overview?.upload_tasks ?? current.overview?.upload_tasks,
+    },
+    updated_at: realtime.updated_at ?? current.updated_at,
+  };
+}
+
+function DashboardPage({ onOpenDownloader }: { onOpenDownloader?: (downloaderId: string) => void }) {
   const { data, loading, setData } = useLoad<any>(() => api("/api/dashboard?cached=true"), []);
   const [refreshingMTeam, setRefreshingMTeam] = useState(false);
   const [testingMTeam, setTestingMTeam] = useState(false);
@@ -552,16 +430,54 @@ function DashboardPage() {
   const [dashboardError, setDashboardError] = useState("");
 
   useEffect(() => {
-    api<any>("/api/dashboard?refresh=true").then(setData).catch((err) => setDashboardError((err as Error).message));
-    const timer = window.setInterval(() => {
-      api<any>("/api/dashboard?refresh=true")
-        .then((value) => {
+    let alive = true;
+    let inFlight = false;
+    async function loadDashboard(url: string) {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const value = await api<any>(url);
+        if (alive) {
           setData(value);
           setDashboardError("");
-        })
-        .catch((err) => setDashboardError((err as Error).message));
-    }, 5000);
-    return () => window.clearInterval(timer);
+        }
+      } catch (err) {
+        if (alive) setDashboardError((err as Error).message);
+      } finally {
+        inFlight = false;
+      }
+    }
+    loadDashboard("/api/dashboard?refresh=true");
+    const timer = window.setInterval(() => {
+      loadDashboard("/api/dashboard?cached=true");
+    }, 60000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    let inFlight = false;
+    async function loadQbRealtime() {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const value = await api<any>("/api/dashboard/qbs");
+        if (alive) setData((current: any) => mergeDashboardQbs(current, value));
+      } catch {
+        // Keep the last successful qB snapshot visible; dashboard-level errors are handled by full refresh.
+      } finally {
+        inFlight = false;
+      }
+    }
+    loadQbRealtime();
+    const timer = window.setInterval(loadQbRealtime, 5000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
   }, []);
 
   async function refreshDashboard() {
@@ -604,10 +520,9 @@ function DashboardPage() {
           <Metric title="活跃上传/下载" value={<ActiveTransferCounts upload={data.overview.upload_tasks ?? 0} download={data.overview.download_tasks ?? 0} />} source={`共 ${(data.overview.upload_tasks ?? 0) + (data.overview.download_tasks ?? 0)} 个活跃任务`} />
           <StorageMetric overview={data.overview} />
         </section>
-        <section className="panel dashboard-downloaders">
-          <div className="dashboard-panel-title"><h2>下载器</h2></div>
-          <div className="cards-row">
-            {data.qbs.map((qb: any) => qb.locked ? <LockedCard key={qb.id} title={downloaderDisplayName(qb)} message={qb.message} /> : <DownloaderCard key={qb.id} qb={qb} />)}
+        <section className="dashboard-downloaders">
+          <div className="cards-row downloader-card-grid">
+            {data.qbs.map((qb: any) => qb.locked ? <LockedCard key={qb.id} title={downloaderDashboardTitle(qb)} message={qb.message} onOpen={() => onOpenDownloader?.(qb.id)} /> : <DownloaderCard key={qb.id} qb={qb} onOpen={onOpenDownloader} />)}
           </div>
         </section>
       </div>
@@ -656,7 +571,7 @@ function MTeamSnapshotPanel({
   return (
     <section className="panel">
       <div className="mteam-panel-header">
-        <h2>站点用户数据 - M-Team</h2>
+        <h2><a className="mteam-title-link" href="https://kp.m-team.cc/index" target="_blank" rel="noreferrer">站点用户数据 - M-Team</a></h2>
         <div className="mteam-status-tools" title={statusTitle}>
           <button className="status-dot-button" onClick={onTestConnection} disabled={testingConnection} title="测试 M-Team 连通性" aria-label="测试 M-Team 连通性">
             <span className={connected ? "status-dot online" : "status-dot offline"} />
@@ -908,6 +823,7 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
   const filterRequestId = useRef(0);
   const filterKeyRef = useRef("");
   const filterSentinelRef = useRef<HTMLDivElement | null>(null);
+  const filterLoadingPageRef = useRef<number | null>(null);
   const lists = data ? [
     { title: "流行趋势", items: data.trending },
     { title: "热门电影", items: data.popular_movies },
@@ -916,6 +832,7 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
     { title: "Top Rated 剧集", items: data.top_rated_tv }
   ] : [];
   const expandedDiscoverList = expandedDiscoverTitle ? lists.find((list) => list.title === expandedDiscoverTitle) : null;
+  const filterViewActive = discoverMode === "home" && browseMode === "filter" && !selectedPerson && !selectedMedia && !expandedDiscoverTitle;
   const sortedTorrents = useMemo(() => sortResources(torrents, resourceSort, resourceSortDirection), [torrents, resourceSort, resourceSortDirection]);
 
   useEffect(() => {
@@ -941,17 +858,33 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
   }, [discoverMode, browseMode, discoverFilters]);
 
   useEffect(() => {
-    if (discoverMode !== "home" || browseMode !== "filter") return;
+    if (!filterViewActive) return;
     const node = filterSentinelRef.current;
     if (!node || !filterHasMore || filterLoading || filterLoadingMore || !filterNextPage) return;
+    const nextPage = filterNextPage;
+    let cancelled = false;
+    function loadNextPage() {
+      if (cancelled || filterLoadingPageRef.current === nextPage) return;
+      loadDiscoverFilter(discoverFilters, { append: true, page: nextPage, pages: 2 }).catch(() => undefined);
+    }
+    const frame = window.requestAnimationFrame(() => {
+      const rect = node.getBoundingClientRect();
+      if (rect.top <= window.innerHeight + 1200 && rect.bottom >= -1200) {
+        loadNextPage();
+      }
+    });
     const observer = new IntersectionObserver((entries) => {
       if (entries.some((entry) => entry.isIntersecting)) {
-        loadDiscoverFilter(discoverFilters, { append: true, page: filterNextPage, pages: 1 }).catch(() => undefined);
+        loadNextPage();
       }
-    }, { rootMargin: "640px 0px" });
+    }, { rootMargin: "1200px 0px" });
     observer.observe(node);
-    return () => observer.disconnect();
-  }, [discoverMode, browseMode, discoverFilters, filterHasMore, filterLoading, filterLoadingMore, filterNextPage]);
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [filterViewActive, discoverFilters, filterHasMore, filterLoading, filterLoadingMore, filterNextPage]);
 
   function resetDiscoverHome() {
     setQuery("");
@@ -1086,6 +1019,14 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
 
   async function loadDiscoverFilter(filters: DiscoverFilters, options: { append?: boolean; page?: number; pages?: number; cached?: boolean; refresh?: boolean; silent?: boolean } = {}) {
     const append = Boolean(options.append);
+    const page = options.page ?? 1;
+    const pages = options.pages ?? (append ? 2 : 4);
+    if (append) {
+      if (filterLoadingPageRef.current === page) return;
+      filterLoadingPageRef.current = page;
+    } else {
+      filterLoadingPageRef.current = null;
+    }
     const requestId = append ? filterRequestId.current : filterRequestId.current + 1;
     if (!append) filterRequestId.current = requestId;
     if (append) setFilterLoadingMore(true);
@@ -1101,14 +1042,15 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
       if (key === "min_rating" && Number(value || 0) <= 0) return;
       if (value) params.set(key, value);
     });
-    params.set("page", String(options.page ?? 1));
-    params.set("pages", String(options.pages ?? (append ? 1 : 4)));
+    params.set("page", String(page));
+    params.set("pages", String(pages));
+    if (append) params.set("include_options", "false");
     if (options.cached) params.set("cached", "true");
     if (options.refresh) params.set("refresh", "true");
     try {
       const result = await api<any>(`/api/discover/filter?${params.toString()}`);
       if (filterRequestId.current === requestId) {
-        setFilterPayload(result);
+        setFilterPayload((current: any) => append ? { ...(current ?? {}), ...result, options: result?.options ?? current?.options } : result);
         setFilterNextPage(result?.next_page ?? null);
         setFilterHasMore(Boolean(result?.next_page));
         setFilterItems((current) => append ? mergeMediaItems(current, result?.items ?? []) : (result?.items ?? []));
@@ -1125,7 +1067,10 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
         setFilterError((err as Error).message);
       }
     } finally {
-      if (append) setFilterLoadingMore(false);
+      if (append) {
+        filterLoadingPageRef.current = null;
+        setFilterLoadingMore(false);
+      }
       else if (filterRequestId.current === requestId) setFilterLoading(false);
     }
   }
@@ -1140,6 +1085,9 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
 
   return (
     <div className="grid-page">
+      <button className="discover-scroll-top" type="button" onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })} aria-label="回到顶部" title="回到顶部">
+        <ArrowUp size={20} />
+      </button>
       <form className="searchbar" onSubmit={runSearch}>
         <input value={query} onFocus={enterSearchMode} onChange={(event) => setQuery(event.target.value)} placeholder="搜索电影、剧集、年份、制作组或关键词" />
         <button className="primary" disabled={searching}><Search size={18} /> {searching ? "搜索中..." : "搜索"}</button>
@@ -1311,7 +1259,7 @@ function DiscoverFilterPage({
         {!loading && !items.length && <p className="muted">没有符合条件的条目，可以放宽题材、地区或评分。</p>}
       </div>
       <div className="discover-load-sentinel" ref={sentinelRef}>
-        {loadingMore ? <SearchLoadingState title="正在加载更多" detail="继续补充下一批 TMDB 条目" /> : hasMore ? <span>继续下拉加载更多</span> : loadedCount > 0 ? <span>已经到底了</span> : null}
+        {loadingMore ? <SearchLoadingState title="正在加载中" detail="请稍候" /> : hasMore ? <span>向下滚动加载更多</span> : loadedCount > 0 ? <span>已经到底了</span> : null}
       </div>
     </section>
   );
@@ -1388,13 +1336,20 @@ function discoverFilterKey(filters: DiscoverFilters) {
   ].join("|");
 }
 
-function DownloadsPage() {
-  const [downloader, setDownloader] = useState("qb1");
+function DownloadsPage({ selectedDownloader = "qb1" }: { selectedDownloader?: string }) {
+  const [downloader, setDownloader] = useState(selectedDownloader);
   const [grantOpen, setGrantOpen] = useState(false);
   const { data, error, loading, setData } = useLoad<any>(() => api(`/api/downloads/${downloader}/overview?cached=true`), [downloader]);
   const downloadRequestId = useRef(0);
+  const downloadOverviewInFlight = useRef(false);
   const [qb2Authorized, setQb2Authorized] = useState(false);
   const [refreshingDownload, setRefreshingDownload] = useState(false);
+
+  useEffect(() => {
+    if (selectedDownloader && selectedDownloader !== downloader) {
+      setDownloader(selectedDownloader);
+    }
+  }, [selectedDownloader]);
 
   useEffect(() => {
     refreshDownloadOverview(downloader);
@@ -1404,16 +1359,21 @@ function DownloadsPage() {
     return () => window.clearInterval(timer);
   }, [downloader]);
 
-  function refreshDownloadOverview(target = downloader) {
+  function refreshDownloadOverview(target = downloader, refresh = true) {
+    if (downloadOverviewInFlight.current) return Promise.resolve(undefined);
+    downloadOverviewInFlight.current = true;
     const requestId = downloadRequestId.current + 1;
     downloadRequestId.current = requestId;
-    return api<any>(`/api/downloads/${target}/overview?refresh=true`)
+    return api<any>(`/api/downloads/${target}/overview?${refresh ? "refresh=true" : "cached=true"}`)
       .then((value) => {
         if (downloadRequestId.current === requestId && value?.downloader_id === target) setData(value);
         if (target === "qb2") setQb2Authorized(true);
         return value;
       })
-      .catch(() => undefined);
+      .catch(() => undefined)
+      .finally(() => {
+        downloadOverviewInFlight.current = false;
+      });
   }
 
   async function manualRefreshDownloadOverview() {
@@ -1579,11 +1539,25 @@ function QbTorrentTable({ items, downloader, onChanged }: { items: any[]; downlo
     await loadDetail(selectedHash);
   }
 
+  function openTaskMenu(item: any, x: number, y: number) {
+    const menuWidth = 136;
+    const menuHeight = 132;
+    setSelectedHash(item.hash);
+    setContextMenu({
+      x: Math.max(8, Math.min(x, window.innerWidth - menuWidth - 8)),
+      y: Math.max(8, Math.min(y, window.innerHeight - menuHeight - 8)),
+      item,
+    });
+  }
+
   return (
     <>
       <section className="qb-table-panel">
         <div className="qb-table-header">
-          <h2>{downloaderShortLabel(downloader)} 任务</h2>
+          <div>
+            <h2>{downloaderShortLabel(downloader)} 任务</h2>
+            <small>手机端长按任务可操作</small>
+          </div>
           <span>{items.length} 条任务</span>
         </div>
         <div className="qb-task-list-wrap">
@@ -1615,9 +1589,9 @@ function QbTorrentTable({ items, downloader, onChanged }: { items: any[]; downlo
                 }}
                 onContextMenu={(event) => {
                   event.preventDefault();
-                  setSelectedHash(item.hash);
-                  setContextMenu({ x: event.clientX, y: event.clientY, item });
+                  openTaskMenu(item, event.clientX, event.clientY);
                 }}
+                onLongPress={(point) => openTaskMenu(item, point.x, point.y)}
                 key={item.hash}
               />
             ))}
@@ -1671,7 +1645,9 @@ function SettingsPage() {
       <Panel title="运行时凭据中心">
         <p className="muted">凭据由后端加密保存；保存过的 API、账号、密码和路径会直接回填在输入框里，可显示或复制。</p>
       </Panel>
-      {data.providers.map((provider: any) => <IntegrationEditor provider={provider} onChanged={reload} key={provider.provider} />)}
+      {data.providers
+        .filter((provider: any) => ["mteam", "qb1", "qb2", "qb3", "tmdb"].includes(provider.provider))
+        .map((provider: any) => <IntegrationEditor provider={provider} onChanged={reload} key={provider.provider} />)}
     </div>
   );
 }
@@ -1681,10 +1657,7 @@ function IntegrationEditor({ provider, onChanged }: { provider: any; onChanged: 
   if (provider.provider === "tmdb") return <TmdbIntegrationEditor provider={provider} onChanged={onChanged} />;
   if (["qb1", "qb2", "qb3"].includes(provider.provider)) return <QbIntegrationEditor provider={provider} onChanged={onChanged} />;
 
-  const providerNames: Record<string, string> = {
-    ai: "AI",
-    wechat_claw: "微信爪爪"
-  };
+  const providerNames: Record<string, string> = { ai: "AI" };
   const [text, setText] = useState(String(provider.saved_payload?.endpoint ?? ""));
   const payload = useMemo(() => ({ endpoint: text || "mock://service", timeout: 10 }), [text]);
 
@@ -1716,7 +1689,6 @@ function IntegrationEditor({ provider, onChanged }: { provider: any; onChanged: 
 function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
   const label = downloaderShortLabel(provider.provider);
   const saved = provider.saved_payload ?? {};
-  const savedMapping = Array.isArray(saved.path_mappings) ? saved.path_mappings[0] ?? {} : {};
   const [form, setForm] = useState<QbForm>({
     name: String(saved.name ?? label),
     base_url: String(saved.base_url ?? ""),
@@ -1724,10 +1696,6 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
     password: String(saved.password ?? ""),
     timeout: String(saved.timeout ?? "10"),
     default_save_path: String(saved.default_save_path ?? ""),
-    category: String(saved.category ?? ""),
-    tags: Array.isArray(saved.tags) ? saved.tags.join(",") : String(saved.tags ?? ""),
-    path_from: String(savedMapping.from ?? ""),
-    path_to: String(savedMapping.to ?? ""),
     nas_mount_paths: Array.isArray(saved.nas_mount_paths) ? saved.nas_mount_paths.join("\n") : String(saved.nas_mount_paths ?? saved.storage_paths ?? "")
   });
   const [busy, setBusy] = useState("");
@@ -1741,9 +1709,6 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
   }
 
   function payload() {
-    const mapping = form.path_from.trim() && form.path_to.trim()
-      ? [{ from: form.path_from.trim(), to: form.path_to.trim() }]
-      : [];
     return {
       name: form.name.trim() || label,
       base_url: form.base_url.trim(),
@@ -1751,10 +1716,7 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
       password: form.password,
       timeout: Number(form.timeout) || 10,
       default_save_path: form.default_save_path.trim(),
-      category: form.category.trim(),
-      tags: form.tags.split(",").map((item) => item.trim()).filter(Boolean),
       nas_mount_paths: form.nas_mount_paths.split(/\r?\n|,|;/).map((item) => item.trim()).filter(Boolean),
-      path_mappings: mapping
     };
   }
 
@@ -1832,25 +1794,13 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
           <label>默认保存路径（可选）
             <CopyableInput value={form.default_save_path} onChange={(value) => updateField("default_save_path", value)} placeholder="例如 /downloads/media 或 D:\\Downloads" />
           </label>
-          <label>默认分类（可选）
-            <CopyableInput value={form.category} onChange={(value) => updateField("category", value)} placeholder="例如 movie / tv / anime" />
-          </label>
-          <label>默认标签（可选，逗号分隔）
-            <CopyableInput value={form.tags} onChange={(value) => updateField("tags", value)} placeholder="例如 pt-media-hub,mteam" />
-          </label>
-          <label>下载器路径前缀（可选）
-            <CopyableInput value={form.path_from} onChange={(value) => updateField("path_from", value)} placeholder="例如 /downloads" />
-          </label>
-          <label>本机/NAS 路径前缀（可选）
-            <CopyableInput value={form.path_to} onChange={(value) => updateField("path_to", value)} placeholder="例如 Z:\\downloads 或 /volume1/downloads" />
-          </label>
           <label>NAS/本机挂载路径（用于空间统计）
-            <CopyableTextarea value={form.nas_mount_paths} onChange={(value) => updateField("nas_mount_paths", value)} placeholder={"例如 /volume1/downloads\n或 Z:\\downloads\n多个路径可换行填写，会按磁盘去重"} />
+            <CopyableTextarea value={form.nas_mount_paths} onChange={(value) => updateField("nas_mount_paths", value)} placeholder={"/mnt/storage1\n/mnt/storage2\n多个路径可换行填写，会按磁盘去重"} />
           </label>
         </div>
         <div className="field-help">
           <strong>实际需要你提供：</strong>
-          <span>局域网地址就是 qB WebUI 地址；账号密码用于登录 Web API；储存地址用于添加新任务时指定保存位置；挂载路径必须是本后端容器/主机能访问到的 NAS 路径，仪表盘会用它统计总空间并自动去重。</span>
+          <span>局域网地址就是 qB WebUI 地址；账号密码用于登录 Web API；默认保存路径用于添加新任务时指定位置；挂载路径请填写 docker-compose 里映射到容器内的路径，例如 /mnt/storage1，仪表盘会用它统计总空间并自动去重。</span>
         </div>
         <div className="actions">
           <button onClick={saveDraft} disabled={busy !== ""}>{busy === "draft" ? "正在保存..." : "保存草稿"}</button>
@@ -2076,21 +2026,6 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
     };
   }
 
-  function tmdbTestLogDetail(result: IntegrationTestResult) {
-    return [
-      `mode=${form.mode}`,
-      `language=${form.language || "zh-CN"}`,
-      `region=${form.region || "CN"}`,
-      `timeout=${form.timeout || "12"}`,
-      form.endpoint.trim() ? `endpoint=${form.endpoint.trim()}` : "",
-      result.error_type ? `error_type=${result.error_type}` : "",
-      result.http_status ? `http_status=${result.http_status}` : "",
-      result.trace_id ? `trace_id=${result.trace_id}` : "",
-      result.explanation ? `explanation=${result.explanation}` : "",
-      result.next_step ? `next_step=${result.next_step}` : "",
-    ].filter(Boolean).join("\n");
-  }
-
   async function saveDraft() {
     setBusy("draft");
     setLocalError("");
@@ -2120,28 +2055,10 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
       const updated = await api<any>(`/api/admin/integrations/tmdb/test`, { method: "POST", body: JSON.stringify({ payload: payload() }) });
       const testResult = updated.last_test_result as IntegrationTestResult;
       setLocalResult(testResult);
-      emitAppLog({
-        level: testResult?.success ? "success" : "error",
-        scope: "TMDB 配置测试",
-        message: testResult?.message || (testResult?.success ? "测试成功" : "测试失败"),
-        detail: tmdbTestLogDetail(testResult || {}),
-      });
       onChanged();
     } catch (err) {
       const message = (err as Error).message;
       setLocalError(message);
-      emitAppLog({
-        level: "error",
-        scope: "TMDB 配置测试",
-        message: "请求测试接口失败",
-        detail: [
-          `mode=${form.mode}`,
-          `language=${form.language || "zh-CN"}`,
-          `region=${form.region || "CN"}`,
-          `timeout=${form.timeout || "12"}`,
-          `error=${message}`,
-        ].join("\n"),
-      });
     } finally {
       setBusy("");
     }
@@ -2369,15 +2286,62 @@ async function copyToClipboard(text: string): Promise<void> {
   document.body.removeChild(textarea);
 }
 
+function diagnosticModuleName(module: string): string {
+  const names: Record<string, string> = {
+    mteam: "M-Team",
+    qb1: "qB下载器1",
+    qb2: "qB下载器2",
+    qb3: "qB下载器3",
+    tmdb: "TMDB",
+    nas_disk: "NAS 存储",
+    stats_engine: "数据统计",
+  };
+  return names[module] ?? module;
+}
+
+function diagnosticStatusMeta(item: any): { label: string; detail: string; tone: "success" | "failed" | "neutral" } {
+  if (!item.enabled) {
+    return { label: "未启用", detail: "当前模块尚未启用", tone: "neutral" };
+  }
+  if (item.status === "success") {
+    return { label: "运行正常", detail: "最近一次检测通过", tone: "success" };
+  }
+  if (["failed", "failure", "error", "unhealthy"].includes(String(item.status || "").toLowerCase())) {
+    return { label: "需要处理", detail: item.last_error || "检测未通过，请检查配置或网络", tone: "failed" };
+  }
+  return { label: "待检测", detail: "保存并测试后会更新状态", tone: "neutral" };
+}
+
 function DiagnosticsPage() {
   const health = useLoad<any>(() => api("/api/diagnostics/health"), []);
-  const traces = useLoad<any>(() => api("/api/diagnostics/traces"), []);
   const [exportPayload, setExportPayload] = useState<any | null>(null);
+  const modules = health.data?.modules ?? [];
 
   return (
     <div className="grid-page">
-      <Panel title="健康概览"><div className="table-list">{(health.data?.modules ?? []).map((item: any) => <div className="row" key={item.module}><strong>{item.module}</strong><span>{item.status}</span><small>{item.enabled ? "已启用" : "已停用"}</small></div>)}</div></Panel>
-      <Panel title="调用轨迹"><div className="table-list">{(traces.data?.items ?? []).map((item: any) => <div className="row" key={item.trace_id}><strong>{item.trace_id}</strong><span>{item.event_type} / {item.status}</span><small>{item.duration_ms}ms</small></div>)}</div><button onClick={() => api<any>("/api/diagnostics/export", { method: "POST" }).then(setExportPayload)}>导出脱敏 JSON</button>{exportPayload && <pre>{JSON.stringify(exportPayload, null, 2)}</pre>}</Panel>
+      <Panel title="健康概览">
+        <div className="diagnostics-health-list">
+          {modules.map((item: any) => {
+            const meta = diagnosticStatusMeta(item);
+            return (
+              <article className={`diagnostic-card ${meta.tone}`} key={item.module}>
+                <div>
+                  <strong>{diagnosticModuleName(item.module)}</strong>
+                  <span className="diagnostic-status-pill">{meta.label}</span>
+                </div>
+                <small>{meta.detail}</small>
+                {item.last_success_at && <small>最近检测：{formatDateLabel(item.last_success_at)}</small>}
+              </article>
+            );
+          })}
+          {!modules.length && <p className="muted">暂无健康检测数据。</p>}
+        </div>
+      </Panel>
+      <Panel title="诊断导出">
+        <p className="muted">导出的内容会自动脱敏，便于排查配置、网络和模块状态。</p>
+        <button onClick={() => api<any>("/api/diagnostics/export", { method: "POST" }).then(setExportPayload)}>导出脱敏 JSON</button>
+        {exportPayload && <pre>{JSON.stringify(exportPayload, null, 2)}</pre>}
+      </Panel>
     </div>
   );
 }
@@ -2413,43 +2377,52 @@ function downloaderDisplayName(qb: any): string {
   return nameMatch ? `qB${nameMatch[1]}` : name || "qB";
 }
 
+function downloaderDashboardTitle(qb: any): string {
+  const id = String(qb?.id ?? "");
+  const match = id.match(/^qb(\d+)$/i);
+  return match ? `qB下载器${match[1]}` : `${downloaderDisplayName(qb)}下载器`;
+}
+
 function downloaderShortLabel(value: string): string {
   const match = String(value || "").match(/^qb(\d+)$/i);
   return match ? `qB${match[1]}` : String(value || "qB").replace(/^QB/i, "qB");
 }
 
-function DownloaderCard({ qb }: { qb: any }) {
-  const displayName = downloaderDisplayName(qb);
-  const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<{ success: boolean; message?: string; updated_at?: string } | null>(null);
-  const online = testResult ? testResult.success : Boolean(qb.online);
-  const statusTitle = testing ? "正在测试连接" : testResult?.message || qb.message || (online ? "连接正常" : "等待连接");
-  const updatedAt = testResult?.updated_at || qb.updated_at;
+function DownloaderCard({ qb, onOpen }: { qb: any; onOpen?: (downloaderId: string) => void }) {
+  const displayName = downloaderDashboardTitle(qb);
+  const online = Boolean(qb.online);
+  const configured = qb.configured !== false;
+  const enabled = qb.enabled !== false;
+  const inactive = configured && !enabled;
+  const connectionError = configured && enabled && !online;
+  const statusLabel = !configured ? "未配置" : connectionError ? "连接异常" : online ? "连接正常" : "未启用";
+  const statusTitle = qb.message || statusLabel;
+  const updatedAt = qb.updated_at;
 
-  async function testConnection() {
-    if (testing) return;
-    setTesting(true);
-    try {
-      const result = await api<{ success: boolean; message?: string; updated_at?: string }>(`/api/qb/${qb.id}/test`, { method: "POST" });
-      setTestResult(result);
-    } catch (err) {
-      setTestResult({ success: false, message: (err as Error).message, updated_at: new Date().toISOString() });
-    } finally {
-      setTesting(false);
-    }
+  function openDownloader() {
+    if (qb.id) onOpen?.(qb.id);
   }
 
   return (
-    <div className="downloader-node">
+    <button className={configured ? "downloader-node" : "downloader-node empty"} type="button" onClick={openDownloader}>
       <div className="downloader-node-top">
         <div className="downloader-node-title" title={statusTitle}>
-          <button className="status-dot-button downloader-status-button" type="button" onClick={testConnection} disabled={testing} title={statusTitle} aria-label={`${displayName} 测试连接`}>
-            <span className={online ? "status-dot online" : "status-dot offline"} />
-          </button>
           <h3>{displayName}</h3>
+          <span className={connectionError ? "downloader-status-label error" : "downloader-status-label"}>
+            <span className={online ? "status-dot online" : "status-dot offline"} />
+            {statusLabel}
+          </span>
         </div>
         <small className="downloader-updated-at">数据更新于：{formatDateLabel(updatedAt)}</small>
       </div>
+      {!configured ? (
+        <div className="downloader-empty-body">请去设置里配置这个下载器</div>
+      ) : inactive ? (
+        <div className="downloader-empty-body">{qb.message || "请在设置里测试并启用这个下载器"}</div>
+      ) : connectionError ? (
+        <div className="downloader-empty-body">连接异常</div>
+      ) : (
+        <>
       <div className="downloader-count-row">
         <ActiveTransferCounts upload={qb.active_uploads ?? 0} download={qb.active_downloads ?? 0} />
       </div>
@@ -2457,12 +2430,14 @@ function DownloaderCard({ qb }: { qb: any }) {
         <span className="download"><b>↓</b><em>下载</em><strong>{formatSpeed(qb.download_speed)}</strong></span>
         <span className="upload"><b>↑</b><em>上传</em><strong>{formatSpeed(qb.upload_speed)}</strong></span>
       </div>
-    </div>
+        </>
+      )}
+    </button>
   );
 }
 
-function LockedCard({ title, message }: { title: string; message: string }) {
-  return <div className="downloader-node locked"><div className="downloader-node-head"><div className="downloader-node-title"><h3>{title}</h3></div><Lock size={16} /></div><p>{message}</p><small className="downloader-node-helper">需要管理员验证</small></div>;
+function LockedCard({ title, message, onOpen }: { title: string; message: string; onOpen?: () => void }) {
+  return <button className="downloader-node locked" type="button" onClick={onOpen}><div className="downloader-node-head"><div className="downloader-node-title"><h3>{title}</h3></div><Lock size={16} /></div><p>{message}</p><small className="downloader-node-helper">需要管理员验证</small></button>;
 }
 
 function MediaSearchResults({ items = [], onSelect, loading }: { items: any[]; onSelect: (item: any) => void; loading?: boolean }) {
@@ -2479,10 +2454,14 @@ function MediaSearchResults({ items = [], onSelect, loading }: { items: any[]; o
 
 function MediaResultCard({ item, onSelect }: { item: any; onSelect: (item: any) => void }) {
   const genres = (item.genres ?? []).slice(0, 4);
+  const seasonEpisode = tvSeasonEpisodeLabel(item);
+  const latestSeason = tvLatestSeasonLabel(item);
+  const latestEpisode = tvEpisodeAirLabel(item.last_episode_to_air, "已播至");
   const meta = [
     item.media_type === "tv" ? "剧集" : "电影",
     item.year,
     item.runtime ? `${item.runtime} 分钟` : "",
+    seasonEpisode,
     mediaCountryLabel(item)
   ].filter(Boolean).join(" / ");
 
@@ -2509,6 +2488,8 @@ function MediaResultCard({ item, onSelect }: { item: any; onSelect: (item: any) 
         </div>
         <div className="media-meta-row">
           <InfoPill icon={Film} text={meta} />
+          {latestSeason ? <InfoPill icon={CalendarDays} text={latestSeason} /> : null}
+          {latestEpisode ? <InfoPill icon={Clock3} text={latestEpisode} /> : null}
           <InfoPill icon={Users} text={`${item.vote_count ?? 0} 票`} />
           {item.popularity ? <InfoPill icon={Activity} text={`热度 ${item.popularity}`} /> : null}
         </div>
@@ -2587,42 +2568,22 @@ function MTeamResourceCard({ item }: { item: any }) {
   async function download() {
     if (downloading) return;
     setDownloading(true);
-    emitAppLog({
-      level: "info",
-      scope: "M-Team -> qB1",
-      message: "开始推送下载",
-      detail: `torrent_id=${item.id}\ntitle=${item.title}\nendpoint=/api/mteam/torrents/${item.id}/download-to/qb1`,
-    });
     setPushNotice({ status: "running", title: "正在推送下载", step: "正在向 M-Team 请求种子", detail: item.title });
     const timers = [
       window.setTimeout(() => {
         setPushNotice({ status: "running", title: "正在推送下载", step: "正在下载种子文件", detail: item.title });
-        emitAppLog({ level: "info", scope: "M-Team -> qB1", message: "阶段：正在下载种子文件", detail: `torrent_id=${item.id}` });
       }, 700),
       window.setTimeout(() => {
         setPushNotice({ status: "running", title: "正在推送下载", step: "等待后端完成推送闭环", detail: item.title });
-        emitAppLog({ level: "info", scope: "M-Team -> qB1", message: "阶段：等待后端完成推送闭环", detail: `torrent_id=${item.id}` });
       }, 1700),
     ];
     try {
-      const result = await api<any>(`/api/mteam/torrents/${encodeURIComponent(item.id)}/download-to/qb1`, { method: "POST", body: JSON.stringify({ payload: item }) });
+      await api<any>(`/api/mteam/torrents/${encodeURIComponent(item.id)}/download-to/qb1`, { method: "POST", body: JSON.stringify({ payload: item }) });
       playDoneSound();
-      emitAppLog({
-        level: "success",
-        scope: "M-Team -> qB1",
-        message: "推送完成",
-        detail: `torrent_id=${item.id}\nfilename=${result.filename ?? "-"}\ntrace_id=${result.trace_id ?? "-"}`,
-      });
       setPushNotice({ status: "success", title: "推送完成", step: "qB1 已接收下载任务", detail: item.title });
       window.setTimeout(() => setPushNotice(null), 5200);
     } catch (err) {
       const detail = apiErrorDetail(err);
-      emitAppLog({
-        level: "error",
-        scope: "M-Team -> qB1",
-        message: "推送失败",
-        detail: `torrent_id=${item.id}\ntitle=${item.title}\n${detail}`,
-      });
       setPushNotice({ status: "error", title: "推送失败", step: "未能完成 M-Team 到 qB1 的闭环", detail });
     } finally {
       timers.forEach((timer) => window.clearTimeout(timer));
@@ -2726,6 +2687,8 @@ function DiscoverPosterCard({ item, onSelect }: { item: any; onSelect: (item: an
   const rating = Number(item.rating ?? 0);
   const details = [
     item.year && item.year !== "未知" ? String(item.year) : "",
+    tvSeasonEpisodeLabel(item),
+    tvLatestSeasonLabel(item, false),
     mediaCountryLabel(item),
     mediaGenreLabel(item),
     mediaCreditLabel(item),
@@ -2774,10 +2737,20 @@ function MediaDetailPage({
 }) {
   const castMembers = Array.isArray(item.cast_members) ? item.cast_members : [];
   const recommendations = Array.isArray(item.recommendations) ? item.recommendations : [];
+  const seasonEpisode = tvSeasonEpisodeLabel(item);
+  const latestSeason = tvLatestSeasonLabel(item, false);
+  const latestEpisode = tvEpisodeAirLabel(item.last_episode_to_air, "已播至");
+  const nextEpisode = tvEpisodeAirLabel(item.next_episode_to_air, "下一集");
   const facts = [
     ["TMDB ID", item.tmdb_id || mediaTmdbId(item) || "-"],
     ["原始标题", item.original_title || "-"],
-    ["上映日期", item.release_date || "-"],
+    [item.media_type === "tv" ? "首播日期" : "上映日期", item.release_date || "-"],
+    ...(item.media_type === "tv" ? [
+      ["季集信息", seasonEpisode || "-"],
+      ["最新季", latestSeason || "-"],
+      ["最近播出", latestEpisode || "-"],
+      ["下一集", nextEpisode || "-"],
+    ] : []),
     ["出品国家", mediaCountryLabel(item) || "-"],
   ];
   return (
@@ -2797,10 +2770,11 @@ function MediaDetailPage({
           <div className="tmdb-detail-copy">
             <span className="tmdb-type-pill">{item.media_type === "tv" ? "电视剧" : "电影"}</span>
             <h2>{item.title} <small>{item.year && item.year !== "未知" ? `(${item.year})` : ""}</small></h2>
-            <p className="tmdb-subtitle">{[item.runtime ? `${item.runtime} 分钟` : "", mediaGenreLabel(item), item.director ? `导演 ${item.director}` : ""].filter(Boolean).join(" / ")}</p>
+            <p className="tmdb-subtitle">{[item.runtime ? `${item.runtime} 分钟` : "", seasonEpisode, mediaGenreLabel(item), item.director ? `导演 ${item.director}` : ""].filter(Boolean).join(" / ")}</p>
             <div className="tmdb-score-line">
               <span className="tmdb-score"><Star size={16} /> {numberLabel(Number(item.rating ?? 0), 1)}</span>
               <span>{numberLabel(Number(item.vote_count ?? 0))} 票</span>
+              {latestEpisode ? <span>{latestEpisode}</span> : null}
               {item.popularity ? <span>热度 {numberLabel(Number(item.popularity), 1)}</span> : null}
             </div>
           </div>
@@ -2905,37 +2879,87 @@ function QbTorrentTableRow({
   item,
   selected,
   onSelect,
-  onContextMenu
+  onContextMenu,
+  onLongPress
 }: {
   item: any;
   selected: boolean;
   onSelect: () => void;
   onContextMenu: (event: MouseEvent<HTMLElement>) => void;
+  onLongPress: (point: { x: number; y: number }) => void;
 }) {
   const progress = Math.round((item.progress ?? 0) * 1000) / 10;
+  const longPressTimer = useRef<number | null>(null);
+  const longPressStart = useRef<{ x: number; y: number } | null>(null);
+  const longPressFired = useRef(false);
+
+  function clearLongPress() {
+    if (longPressTimer.current !== null) {
+      window.clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+    longPressStart.current = null;
+  }
+
+  function handlePointerDown(event: PointerEvent<HTMLElement>) {
+    if (event.pointerType === "mouse") return;
+    longPressFired.current = false;
+    const point = { x: event.clientX, y: event.clientY };
+    longPressStart.current = point;
+    longPressTimer.current = window.setTimeout(() => {
+      longPressFired.current = true;
+      onLongPress(point);
+    }, 520);
+  }
+
+  function handlePointerMove(event: PointerEvent<HTMLElement>) {
+    const point = longPressStart.current;
+    if (!point) return;
+    if (Math.abs(event.clientX - point.x) > 10 || Math.abs(event.clientY - point.y) > 10) {
+      clearLongPress();
+    }
+  }
+
+  function handleClick() {
+    if (longPressFired.current) {
+      longPressFired.current = false;
+      return;
+    }
+    onSelect();
+  }
+
   return (
-    <article className={selected ? "qb-task-grid qb-task-row selected" : "qb-task-grid qb-task-row"} onClick={onSelect} onContextMenu={onContextMenu}>
+    <article
+      className={selected ? "qb-task-grid qb-task-row selected" : "qb-task-grid qb-task-row"}
+      onClick={handleClick}
+      onContextMenu={onContextMenu}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={clearLongPress}
+      onPointerCancel={clearLongPress}
+      onPointerLeave={clearLongPress}
+    >
       <div className="qb-name-cell">
         <strong title={item.name}>{item.name}</strong>
         <small>{item.tracker || item.content_path || item.hash}</small>
       </div>
-      <span className="qb-num">{formatBytes(item.size ?? item.total_size ?? 0)}</span>
-      <div className="qb-progress-cell">
+      <span className="qb-num" data-label="大小">{formatBytes(item.size ?? item.total_size ?? 0)}</span>
+      <div className="qb-progress-cell" data-label="进度">
         <div className="qb-progress"><span style={{ width: `${Math.max(2, Math.min(100, progress))}%` }} /></div>
         <b>{progress.toFixed(1)}%</b>
       </div>
-      <span className="qb-state-pill">{stateLabel(item.state)}</span>
-      <span className="qb-num">{numberPair(item.num_seeds, item.num_complete)}</span>
-      <span className="qb-num">{numberPair(item.num_leechs, item.num_incomplete)}</span>
-      <span className="qb-num">{formatSpeed(item.download_speed ?? 0)}</span>
-      <span className="qb-num">{formatSpeed(item.upload_speed ?? 0)}</span>
-      <span className="qb-num">{formatEta(item.eta)}</span>
-      <span className="qb-num">{numberLabel(item.ratio ?? 0, 2)}</span>
-      <span className="qb-num">{numberLabel(item.availability ?? 0, 2)}</span>
-      <span className="qb-ellipsis">{item.category || "-"}</span>
-      <span className="qb-tags-cell">{(item.tags ?? []).length ? item.tags.join(", ") : "-"}</span>
-      <span className="qb-num">{formatDateLabel(item.added_at)}</span>
-      <span className="qb-path-cell" title={item.save_path}>{item.save_path || "-"}</span>
+      <span className="qb-state-pill" data-label="状态">{stateLabel(item.state)}</span>
+      <span className="qb-num" data-label="种子">{numberPair(item.num_seeds, item.num_complete)}</span>
+      <span className="qb-num" data-label="用户">{numberPair(item.num_leechs, item.num_incomplete)}</span>
+      <span className="qb-num" data-label="下载">{formatSpeed(item.download_speed ?? 0)}</span>
+      <span className="qb-num" data-label="上传">{formatSpeed(item.upload_speed ?? 0)}</span>
+      <span className="qb-num" data-label="剩余">{formatEta(item.eta)}</span>
+      <span className="qb-num" data-label="比率">{numberLabel(item.ratio ?? 0, 2)}</span>
+      <span className="qb-num" data-label="流行度">{numberLabel(item.availability ?? 0, 2)}</span>
+      <span className="qb-ellipsis" data-label="分类">{item.category || "-"}</span>
+      <span className="qb-tags-cell" data-label="标签">{(item.tags ?? []).length ? item.tags.join(", ") : "-"}</span>
+      <span className="qb-num" data-label="添加于">{formatDateLabel(item.added_at)}</span>
+      <span className="qb-path-cell" data-label="路径" title={item.save_path}>{item.save_path || "-"}</span>
     </article>
   );
 }
@@ -3207,6 +3231,41 @@ function mediaCreditLabel(item: any): string {
   return cast ? `主演 ${cast}` : "";
 }
 
+function tvSeasonEpisodeLabel(item: any): string {
+  if (item?.media_type !== "tv") return "";
+  const seasons = Number(item.number_of_seasons ?? 0);
+  const episodes = Number(item.number_of_episodes ?? 0);
+  if (seasons > 0 && episodes > 0) return `共 ${seasons} 季 ${episodes} 集`;
+  if (seasons > 0) return `共 ${seasons} 季`;
+  if (episodes > 0) return `共 ${episodes} 集`;
+  return "";
+}
+
+function tvLatestSeasonLabel(item: any, withPrefix = true): string {
+  if (item?.media_type !== "tv" || !item.latest_season) return "";
+  const seasonNumber = Number(item.latest_season.season_number ?? 0);
+  if (seasonNumber <= 0) return "";
+  const episodeCount = Number(item.latest_season.episode_count ?? 0);
+  const parts = [`第 ${seasonNumber} 季`];
+  if (episodeCount > 0) parts.push(`共 ${episodeCount} 集`);
+  if (item.latest_season.air_date) parts.push(`${String(item.latest_season.air_date)} 首播`);
+  const label = parts.join("，");
+  return withPrefix ? `最新季：${label}` : label;
+}
+
+function tvEpisodeAirLabel(episode: any, prefix: string): string {
+  if (!episode) return "";
+  const seasonNumber = Number(episode.season_number ?? 0);
+  const episodeNumber = Number(episode.episode_number ?? 0);
+  if (seasonNumber <= 0 || episodeNumber <= 0) return "";
+  const detail = [
+    `第 ${seasonNumber} 季第 ${episodeNumber} 集`,
+    episode.air_date ? String(episode.air_date) : "",
+    episode.name ? String(episode.name) : "",
+  ].filter(Boolean).join("，");
+  return prefix ? `${prefix}：${detail}` : detail;
+}
+
 function mediaTmdbId(item: any): string {
   if (item?.tmdb_id) return String(item.tmdb_id);
   const id = String(item?.id ?? "");
@@ -3297,7 +3356,7 @@ function mteamResourceDetailUrl(item: any): string {
   return String(item?.detail_url || item?.detailUrl || item?.page_url || item?.pageUrl || "").trim();
 }
 
-const pages: Record<NavKey, (props: { user: User; resetToken?: number }) => ReactNode> = {
+const pages: Record<NavKey, (props: { user: User; resetToken?: number; selectedDownloader?: string; onOpenDownloader?: (downloaderId: string) => void }) => ReactNode> = {
   discover: DiscoverPage,
   dashboard: DashboardPage,
   downloads: DownloadsPage,

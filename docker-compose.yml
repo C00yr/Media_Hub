@@ -29,6 +29,13 @@ services:
       - "8000:8000"
     volumes:
       - ./data:/data
+      # 将 NAS/下载目录挂载到容器内后，APP 才能探查总空间。
+      # 在 .env 中把左侧改成你的真实 NAS 路径，然后在下载器配置里填写右侧路径：
+      #   MEDIA_HUB_STORAGE_1=/volume1/downloads  ->  /mnt/storage1
+      #   MEDIA_HUB_STORAGE_2=/volume2/media      ->  /mnt/storage2
+      - ${MEDIA_HUB_STORAGE_1:-./data}:/mnt/storage1:ro
+      - ${MEDIA_HUB_STORAGE_2:-./data}:/mnt/storage2:ro
+      - ${MEDIA_HUB_STORAGE_3:-./data}:/mnt/storage3:ro
     depends_on:
       - mihomo
     healthcheck:

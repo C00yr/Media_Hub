@@ -10,7 +10,7 @@ from app.utils.ids import trace_id
 from app.utils.redaction import parse_raw_headers, redact_payload
 
 
-PROVIDERS = ["mteam", "qb1", "qb2", "qb3", "tmdb", "ai", "wechat_claw"]
+PROVIDERS = ["mteam", "qb1", "qb2", "qb3", "tmdb"]
 
 
 def normalize_payload(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -29,27 +29,19 @@ def normalize_payload(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
             normalized["timeout"] = 10
         normalized = {key: value for key, value in normalized.items() if value not in ("", None, {})}
     if provider in {"qb1", "qb2", "qb3"}:
-        for key in ["name", "base_url", "username", "password", "default_save_path", "category", "path_from", "path_to"]:
+        for key in ["name", "base_url", "username", "password", "default_save_path"]:
             if key in normalized and isinstance(normalized[key], str):
                 normalized[key] = normalized[key].strip()
+        for key in ["category", "tags", "path_from", "path_to", "path_mappings"]:
+            normalized.pop(key, None)
         if not normalized.get("timeout"):
             normalized["timeout"] = 10
-        tags = normalized.get("tags")
-        if isinstance(tags, str):
-            normalized["tags"] = [item.strip() for item in tags.split(",") if item.strip()]
         storage_paths = normalized.get("nas_mount_paths") or normalized.get("storage_paths") or []
         if isinstance(storage_paths, str):
             storage_paths = storage_paths.replace(";", "\n").replace(",", "\n").splitlines()
         if isinstance(storage_paths, list):
             normalized["nas_mount_paths"] = [str(item).strip() for item in storage_paths if str(item).strip()]
             normalized.pop("storage_paths", None)
-        path_mappings = normalized.get("path_mappings") or []
-        if isinstance(path_mappings, list):
-            normalized["path_mappings"] = [
-                {"from": str(item.get("from") or "").strip(), "to": str(item.get("to") or "").strip()}
-                for item in path_mappings
-                if isinstance(item, dict) and (item.get("from") or item.get("to"))
-            ]
         normalized = {key: value for key, value in normalized.items() if value not in ("", None, [], {})}
     if provider == "tmdb":
         raw_settings = normalized.pop("raw_settings", "")
