@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from app.adapters.base import TrackerAdapter
 
@@ -94,6 +94,7 @@ class MTeamAdapter(TrackerAdapter):
         self.api_key = self._pick_api_key(config)
         self.base_url = self._api_base(str(config.get("api_base_url") or config.get("base_url") or MTEAM_API_BASE))
         self.timeout = int(config.get("timeout") or 10)
+        self.opener = build_opener(ProxyHandler({}))
         if not self.api_key:
             raise MTeamConfigError("M-Team API Key 未配置")
 
@@ -383,7 +384,7 @@ class MTeamAdapter(TrackerAdapter):
         data = None if body is None else json.dumps(body).encode("utf-8")
         request = Request(f"{self.base_url}{path}", data=data, headers=self._request_headers(), method=method)
         try:
-            with urlopen(request, timeout=self.timeout) as response:
+            with self.opener.open(request, timeout=self.timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             text = exc.read().decode("utf-8", "replace")
@@ -405,7 +406,7 @@ class MTeamAdapter(TrackerAdapter):
         }
         request = Request(f"{self.base_url}{path}", data=data, headers=headers, method=method)
         try:
-            with urlopen(request, timeout=self.timeout) as response:
+            with self.opener.open(request, timeout=self.timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             text = exc.read().decode("utf-8", "replace")
@@ -423,7 +424,7 @@ class MTeamAdapter(TrackerAdapter):
         data = None if body is None else json.dumps(body).encode("utf-8")
         request = Request(url, data=data, headers={**self._request_headers(), "Accept": "application/x-bittorrent,*/*"}, method=method)
         try:
-            with urlopen(request, timeout=self.timeout) as response:
+            with self.opener.open(request, timeout=self.timeout) as response:
                 content_type = response.headers.get("Content-Type", "")
                 disposition = response.headers.get("Content-Disposition", "")
                 return response.read(), content_type, _filename_from_disposition(disposition)

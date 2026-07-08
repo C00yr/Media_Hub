@@ -17,8 +17,9 @@ class Settings(BaseSettings):
     snapshot_interval_minutes: int = 10
     static_dir: str = "static"
     tmdb_mode: str = "direct"
-    tmdb_gateway_url: str = ""
-    tmdb_gateway_key: str = ""
+    tmdb_proxy_url: str = "http://mihomo:7890"
+    tmdb_image_cache_dir: str = "/data/image-cache/tmdb"
+    tmdb_image_cache_max_mb: int = 512
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

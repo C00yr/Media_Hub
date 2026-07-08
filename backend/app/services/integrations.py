@@ -32,16 +32,10 @@ def normalize_payload(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
         for key in ["name", "base_url", "username", "password", "default_save_path"]:
             if key in normalized and isinstance(normalized[key], str):
                 normalized[key] = normalized[key].strip()
-        for key in ["category", "tags", "path_from", "path_to", "path_mappings"]:
+        for key in ["category", "tags", "path_from", "path_to", "path_mappings", "nas_mount_paths", "storage_paths"]:
             normalized.pop(key, None)
         if not normalized.get("timeout"):
             normalized["timeout"] = 10
-        storage_paths = normalized.get("nas_mount_paths") or normalized.get("storage_paths") or []
-        if isinstance(storage_paths, str):
-            storage_paths = storage_paths.replace(";", "\n").replace(",", "\n").splitlines()
-        if isinstance(storage_paths, list):
-            normalized["nas_mount_paths"] = [str(item).strip() for item in storage_paths if str(item).strip()]
-            normalized.pop("storage_paths", None)
         normalized = {key: value for key, value in normalized.items() if value not in ("", None, [], {})}
     if provider == "tmdb":
         raw_settings = normalized.pop("raw_settings", "")
@@ -49,11 +43,15 @@ def normalize_payload(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
             normalized.update(parse_raw_headers(raw_settings))
         if "bearer" in normalized and "bearer_token" not in normalized:
             normalized["bearer_token"] = normalized.pop("bearer")
-        for key in ["api_key", "bearer_token", "language", "region", "endpoint", "mode", "gateway_url", "gateway_key", "worker_name"]:
+        for key in ["api_key", "bearer_token", "language", "region", "endpoint", "mode", "proxy_url"]:
             if key in normalized and isinstance(normalized[key], str):
                 normalized[key] = normalized[key].strip()
-        if normalized.get("mode") not in {"direct", "gateway"}:
+        for key in ["gateway_url", "gateway_key", "worker_name"]:
+            normalized.pop(key, None)
+        if normalized.get("mode") not in {"direct", "proxy"}:
             normalized["mode"] = "direct"
+        if not normalized.get("proxy_url"):
+            normalized["proxy_url"] = "http://mihomo:7890"
         if not normalized.get("language"):
             normalized["language"] = "zh-CN"
         if not normalized.get("region"):
@@ -91,7 +89,7 @@ def upsert_config(
         row.config_version += 1
         if provider == "tmdb" and row.encrypted_payload:
             previous = json.loads(decrypt_text(row.encrypted_payload))
-            for key in ("api_key", "bearer_token", "gateway_key"):
+            for key in ("api_key", "bearer_token", "proxy_url"):
                 if key not in normalized and previous.get(key):
                     normalized[key] = previous[key]
         if provider == "mteam" and row.encrypted_payload:

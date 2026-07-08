@@ -8,19 +8,18 @@ from contextlib import contextmanager
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from app.adapters.base import MetadataAdapter
 from app.config.settings import get_settings
 
 
 TMDB_API_BASE = "https://api.themoviedb.org/3"
-TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w342"
-TMDB_BACKDROP_BASE = "https://image.tmdb.org/t/p/w780"
-TMDB_PROFILE_BASE = "https://image.tmdb.org/t/p/w185"
+TMDB_IMAGE_PROXY_BASE = "/api/tmdb/image"
 PLACEHOLDER_POSTER = "https://placehold.co/342x513?text=No+Poster"
 PLACEHOLDER_PROFILE = "https://placehold.co/185x278?text=No+Photo"
 TMDB_DOH_URL = "https://doh.pub/resolve"
+DEFAULT_TMDB_PROXY_URL = "http://mihomo:7890"
 DISCOVER_SORT_OPTIONS = [
     {"value": "popularity.desc", "label": "综合排序"},
     {"value": "release_date.desc", "label": "首播时间"},
@@ -51,7 +50,7 @@ DISCOVER_LANGUAGE_OPTIONS = [
     {"value": "de", "label": "德语"},
     {"value": "es", "label": "西语"},
 ]
-TMDB_DOH_HOSTS = {"api.themoviedb.org"}
+TMDB_DOH_HOSTS = {"api.themoviedb.org", "image.tmdb.org"}
 TMDB_DOH_FALLBACK_IPV4S = {
     "api.themoviedb.org": ["65.9.175.91", "65.9.175.66", "65.9.175.72", "65.9.175.84"],
 }
@@ -78,17 +77,16 @@ class TmdbConfigError(ValueError):
     pass
 
 
-class TmdbGatewayError(RuntimeError):
-    def __init__(self, message: str, error_type: str = "gateway_error", http_status: int | None = None):
-        super().__init__(message)
-        self.error_type = error_type
-        self.http_status = http_status
-
-
 class TmdbDohError(RuntimeError):
     def __init__(self, message: str, error_type: str = "doh_error"):
         super().__init__(message)
         self.error_type = error_type
+
+
+class TmdbImageError(RuntimeError):
+    def __init__(self, message: str, network_detail: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.network_detail = network_detail or {}
 
 
 class TmdbAdapter(MetadataAdapter):
@@ -99,20 +97,15 @@ class TmdbAdapter(MetadataAdapter):
         self.language = str(config.get("language") or "zh-CN").strip()
         self.region = str(config.get("region") or "CN").strip()
         self.mode = str(config.get("mode") or settings.tmdb_mode or "direct").strip().lower()
-        self.gateway_url = self._gateway_root(str(config.get("gateway_url") or settings.tmdb_gateway_url or "").strip())
-        self.gateway_key = str(config.get("gateway_key") or settings.tmdb_gateway_key or "").strip()
-        if self.mode not in {"direct", "gateway"}:
+        if self.mode not in {"direct", "proxy"}:
             self.mode = "direct"
+        self.proxy_url = str(config.get("proxy_url") or settings.tmdb_proxy_url or DEFAULT_TMDB_PROXY_URL).strip()
         self.base_url = str(config.get("endpoint") or TMDB_API_BASE).strip().rstrip("/")
-        if self.mode == "gateway":
-            if not self.gateway_url:
-                raise TmdbConfigError("TMDB Gateway URL is not configured")
-            if not self.gateway_key:
-                raise TmdbConfigError("TMDB Gateway Key is not configured")
-            self.base_url = self._gateway_api_base(self.gateway_url)
         self.timeout = int(config.get("timeout") or 12)
-        if self.mode == "direct" and not self.api_key and not self.bearer_token:
-            raise TmdbConfigError("TMDB API Key 或 Bearer Token 未配置")
+        if not self.api_key and not self.bearer_token:
+            raise TmdbConfigError("TMDB API Key or Bearer Token is not configured")
+        if self.mode == "proxy" and not self.proxy_url:
+            raise TmdbConfigError("TMDB proxy URL is not configured")
 
     def search_media(self, query: str) -> list[dict[str, Any]]:
         if not query.strip():
@@ -151,7 +144,7 @@ class TmdbAdapter(MetadataAdapter):
             "id": payload.get("id"),
             "person_id": payload.get("id"),
             "name": payload.get("name") or "未命名",
-            "profile": f"{TMDB_PROFILE_BASE}{profile_path}" if profile_path else PLACEHOLDER_PROFILE,
+            "profile": _tmdb_image_url("w185", profile_path, PLACEHOLDER_PROFILE),
             "biography": payload.get("biography") or "",
             "birthday": payload.get("birthday") or "",
             "deathday": payload.get("deathday") or "",
@@ -164,14 +157,17 @@ class TmdbAdapter(MetadataAdapter):
         }
 
     def get_discover_lists(self) -> dict[str, Any]:
+        movie_genres = self._genre_map("movie")
+        tv_genres = self._genre_map("tv")
+        genre_maps = {"movie": movie_genres, "tv": tv_genres}
         return {
             "source": "tmdb",
             "configured": True,
-            "trending": self._list("/trending/all/day", {"include_adult": "false"}, media_type=None),
-            "popular_movies": self._list("/movie/popular", {"region": self.region}, media_type="movie"),
-            "popular_tv": self._list("/tv/popular", {}, media_type="tv"),
-            "top_rated_movies": self._list("/movie/top_rated", {"region": self.region}, media_type="movie"),
-            "top_rated_tv": self._list("/tv/top_rated", {}, media_type="tv"),
+            "trending": self._list("/trending/all/day", {"include_adult": "false"}, media_type=None, genre_maps=genre_maps),
+            "popular_movies": self._list("/movie/popular", {"region": self.region}, media_type="movie", genre_maps=genre_maps),
+            "popular_tv": self._list("/tv/popular", {}, media_type="tv", genre_maps=genre_maps),
+            "top_rated_movies": self._list("/movie/top_rated", {"region": self.region}, media_type="movie", genre_maps=genre_maps),
+            "top_rated_tv": self._list("/tv/top_rated", {}, media_type="tv", genre_maps=genre_maps),
         }
 
     def discover_media(self, filters: dict[str, Any]) -> dict[str, Any]:
@@ -263,25 +259,66 @@ class TmdbAdapter(MetadataAdapter):
 
     def test_connection(self) -> dict[str, Any]:
         payload = self._get("/configuration", {})
+        image_probe = self._test_image_connection()
+        network = self.network_detail()
+        network["image_host"] = "image.tmdb.org"
+        network["image_probe"] = image_probe
         return {
             "ok": True,
             "images": isinstance(payload.get("images"), dict),
             "change_keys": len(payload.get("change_keys") or []) if isinstance(payload.get("change_keys"), list) else 0,
+            "network": network,
         }
 
-    def _list(self, path: str, params: dict[str, Any], media_type: str | None) -> list[dict[str, Any]]:
+    def network_detail(self) -> dict[str, Any]:
+        return {
+            "network_mode": self.mode,
+            "route_label": "TMDB：mihomo VPN 代理" if self.mode == "proxy" else "TMDB：直连 + DoH",
+            "proxy_enabled": self.mode == "proxy",
+            "proxy_url": _display_proxy_url(self.proxy_url) if self.mode == "proxy" else "",
+            "non_tmdb_policy": "direct_only",
+        }
+
+    def _test_image_connection(self) -> dict[str, Any]:
+        payload = self._get("/trending/all/day", {"include_adult": "false"})
+        results = payload.get("results") if isinstance(payload.get("results"), list) else []
+        image_path = ""
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            image_path = str(item.get("poster_path") or item.get("backdrop_path") or "").strip().lstrip("/")
+            if image_path:
+                break
+        if not image_path:
+            return {"checked": False, "ok": True, "reason": "no_image_path_from_probe"}
+        request = Request(
+            f"https://image.tmdb.org/t/p/w92/{image_path}",
+            headers={"Accept": "image/jpeg,image/png,image/webp,*/*", "User-Agent": "PT-Media-Hub"},
+        )
+        try:
+            with open_tmdb_network_request(request, self.mode, self.proxy_url, self.timeout) as response:
+                content = response.read(32)
+                if not _looks_like_image_bytes(content):
+                    content_type = response.headers.get_content_type() if response.headers else ""
+                    raise TmdbImageError(f"TMDB image host returned non-image content: {content_type or 'unknown content type'}")
+        except Exception as exc:
+            detail = self.network_detail()
+            detail["image_host"] = "image.tmdb.org"
+            detail["image_probe"] = {"checked": True, "ok": False, "error": str(exc)}
+            raise TmdbImageError(f"TMDB image host is unreachable: {exc}", detail) from exc
+        return {"checked": True, "ok": True, "size": "w92", "path": image_path}
+
+    def _list(self, path: str, params: dict[str, Any], media_type: str | None, genre_maps: dict[str, dict[int, str]] | None = None) -> list[dict[str, Any]]:
         payload = self._get(path, params)
         items = payload.get("results", [])
         if media_type is None:
             items = [item for item in items if item.get("media_type") in ("movie", "tv")]
-        normalized = [self._normalize_item({**item, "media_type": item.get("media_type") or media_type}) for item in items[:20]]
-        detailed: list[dict[str, Any]] = []
-        for item in normalized:
-            try:
-                detailed.append(self.get_media_details(str(item["tmdb_id"]), str(item["media_type"])))
-            except Exception:
-                detailed.append(item)
-        return detailed
+        normalized = []
+        for item in items[:20]:
+            item_media_type = item.get("media_type") or media_type or "movie"
+            genre_map = (genre_maps or {}).get(str(item_media_type), {})
+            normalized.append(self._normalize_discover_item({**item, "media_type": item_media_type}, item_media_type, genre_map))
+        return normalized
 
     def _genres(self, media_type: str) -> list[dict[str, Any]]:
         cache_key = (self.language, media_type)
@@ -318,7 +355,7 @@ class TmdbAdapter(MetadataAdapter):
             "rating": round(float(item.get("vote_average") or 0), 1),
             "vote_count": int(item.get("vote_count") or 0),
             "popularity": round(float(item.get("popularity") or 0), 1),
-            "poster": f"{TMDB_IMAGE_BASE}{poster_path}" if poster_path else PLACEHOLDER_POSTER,
+            "poster": _tmdb_image_url("w342", poster_path, PLACEHOLDER_POSTER),
             "overview": item.get("overview") or "",
             "genres": [genre_map[genre_id] for genre_id in genre_ids if genre_id in genre_map][:3],
             "original_language": item.get("original_language") or "",
@@ -326,43 +363,15 @@ class TmdbAdapter(MetadataAdapter):
 
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         query = {"language": self.language, "page": 1, **{key: value for key, value in params.items() if value not in (None, "")}}
-        if self.mode == "direct" and self.api_key:
+        if self.api_key and not self.bearer_token:
             query["api_key"] = self.api_key
         url = f"{self.base_url}{path}?{urlencode(query)}"
         headers = {"Accept": "application/json"}
-        if self.mode == "gateway":
-            headers["X-Gateway-Key"] = self.gateway_key
-        elif self.bearer_token:
+        if self.bearer_token:
             headers["Authorization"] = f"Bearer {self.bearer_token}"
         request = Request(url, headers=headers)
-        opener = _urlopen_with_doh_ipv4 if self.mode == "direct" else _urlopen_with_ipv4_fallback
-        with opener(request, timeout=self.timeout) as response:
+        with open_tmdb_network_request(request, self.mode, self.proxy_url, self.timeout) as response:
             return json.loads(response.read().decode("utf-8"))
-
-    def test_gateway_health(self) -> dict[str, Any]:
-        if self.mode != "gateway":
-            return {"ok": True, "mode": self.mode}
-        request = Request(f"{self.gateway_url}/health", headers={"Accept": "application/json"})
-        with _urlopen_with_ipv4_fallback(request, timeout=self.timeout) as response:
-            status = getattr(response, "status", response.getcode())
-            payload = json.loads(response.read().decode("utf-8"))
-            if status >= 400 or not payload.get("ok"):
-                raise TmdbGatewayError("Cloudflare Worker health check failed", "gateway_health_error", status)
-            return payload
-
-    @staticmethod
-    def _gateway_root(value: str) -> str:
-        base = value.rstrip("/")
-        if base.endswith("/3"):
-            return base[:-2].rstrip("/")
-        return base
-
-    @staticmethod
-    def _gateway_api_base(value: str) -> str:
-        base = value.rstrip("/")
-        if base.endswith("/3"):
-            return base
-        return f"{base}/3"
 
     def _normalize_item(self, item: dict[str, Any]) -> dict[str, Any]:
         media_type = item.get("media_type") or ("tv" if item.get("name") else "movie")
@@ -403,7 +412,7 @@ class TmdbAdapter(MetadataAdapter):
                 "person_id": person.get("id"),
                 "name": person.get("name"),
                 "character": person.get("character") or "",
-                "profile": f"{TMDB_PROFILE_BASE}{person.get('profile_path')}" if person.get("profile_path") else PLACEHOLDER_PROFILE,
+                "profile": _tmdb_image_url("w185", person.get("profile_path"), PLACEHOLDER_PROFILE),
                 "order": person.get("order"),
             }
             for person in cast[:14]
@@ -420,8 +429,8 @@ class TmdbAdapter(MetadataAdapter):
             "rating": round(float(item.get("vote_average") or 0), 1),
             "vote_count": int(item.get("vote_count") or 0),
             "popularity": round(float(item.get("popularity") or 0), 1),
-            "poster": f"{TMDB_IMAGE_BASE}{poster_path}" if poster_path else PLACEHOLDER_POSTER,
-            "backdrop": f"{TMDB_BACKDROP_BASE}{backdrop_path}" if backdrop_path else "",
+            "poster": _tmdb_image_url("w342", poster_path, PLACEHOLDER_POSTER),
+            "backdrop": _tmdb_image_url("w780", backdrop_path, ""),
             "overview": item.get("overview") or "",
             "genres": [genre.get("name") for genre in genres if genre.get("name")],
             "director": " / ".join(directors[:3]),
@@ -453,7 +462,7 @@ class TmdbAdapter(MetadataAdapter):
             "air_date": season.get("air_date") or "",
             "name": season.get("name") or "",
             "overview": season.get("overview") or "",
-            "poster": f"{TMDB_IMAGE_BASE}{season.get('poster_path')}" if season.get("poster_path") else "",
+            "poster": _tmdb_image_url("w342", season.get("poster_path"), ""),
         }
 
     @staticmethod
@@ -469,14 +478,58 @@ class TmdbAdapter(MetadataAdapter):
         }
 
 
+def _display_proxy_url(value: str) -> str:
+    parsed = urlparse(value if "://" in value else f"http://{value}")
+    if not parsed.netloc:
+        return value
+    return parsed.netloc
+
+
+def _tmdb_image_url(size: str, image_path: Any, fallback: str) -> str:
+    clean_path = str(image_path or "").strip().lstrip("/")
+    if not clean_path:
+        return fallback
+    return f"{TMDB_IMAGE_PROXY_BASE}/{size}/{clean_path}"
+
+
+def _looks_like_image_bytes(content: bytes) -> bool:
+    if len(content) < 12:
+        return False
+    if content.startswith(b"\xff\xd8\xff"):
+        return True
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+        return True
+    if content[4:8] == b"ftyp" and content[8:12] in {b"avif", b"avis"}:
+        return True
+    return False
+
+
+def open_tmdb_network_request(request: Request, mode: str, proxy_url: str, timeout: int):
+    request.tmdb_proxy_url = proxy_url or DEFAULT_TMDB_PROXY_URL
+    opener = _urlopen_with_proxy if mode == "proxy" else _urlopen_with_doh_ipv4
+    return opener(request, timeout=timeout)
+
+
+def _urlopen_no_proxy(request: Request, timeout: int):
+    return build_opener(ProxyHandler({})).open(request, timeout=timeout)
+
+
+def _urlopen_with_proxy(request: Request, timeout: int):
+    proxy_url = getattr(request, "tmdb_proxy_url", "") or DEFAULT_TMDB_PROXY_URL
+    opener = build_opener(ProxyHandler({"http": proxy_url, "https": proxy_url}))
+    return opener.open(request, timeout=timeout)
+
+
 def _urlopen_with_ipv4_fallback(request: Request, timeout: int):
     try:
-        return urlopen(request, timeout=timeout)
+        return _urlopen_no_proxy(request, timeout=timeout)
     except URLError as exc:
         if not _is_network_unreachable(exc):
             raise
         with _force_ipv4_dns():
-            return urlopen(request, timeout=timeout)
+            return _urlopen_no_proxy(request, timeout=timeout)
 
 
 def _urlopen_with_doh_ipv4(request: Request, timeout: int):
@@ -489,7 +542,7 @@ def _urlopen_with_doh_ipv4(request: Request, timeout: int):
     for index, ip in enumerate(ips):
         try:
             with _force_host_ipv4(host, [ip]):
-                response = urlopen(request, timeout=per_ip_timeout)
+                response = _urlopen_no_proxy(request, timeout=per_ip_timeout)
             if index:
                 _prefer_doh_ip(host, ip)
             return response
@@ -518,7 +571,7 @@ def _resolve_ipv4_with_doh(host: str, timeout: int) -> list[str]:
     )
     try:
         with _force_ipv4_dns():
-            with urlopen(request, timeout=max(3, min(timeout, 20))) as response:
+            with _urlopen_no_proxy(request, timeout=max(3, min(timeout, 20))) as response:
                 payload = json.loads(response.read().decode("utf-8"))
     except Exception as exc:
         stale_ips = _stale_doh_ips(host, now)

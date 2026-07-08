@@ -1,18 +1,21 @@
-import shutil
-import subprocess
 import os
 import hashlib
 import json
+import logging
+import mimetypes
+import re
+import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
-from re import fullmatch
 from socket import timeout as SocketTimeout
 from threading import Lock
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
+from urllib.request import Request
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, status
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -20,7 +23,7 @@ from app.adapters.mock import MockMetadataAdapter
 from app.adapters.mteam import MTeamAdapter, MTeamApiError, MTeamConfigError
 from app.adapters.qbittorrent import QbittorrentApiError, QbittorrentConfigError, QbittorrentWebAdapter
 from app.adapters.tmdb import TmdbAdapter
-from app.adapters.tmdb.client import TmdbConfigError, TmdbDohError, TmdbGatewayError
+from app.adapters.tmdb.client import DEFAULT_TMDB_PROXY_URL, TmdbConfigError, TmdbDohError, TmdbImageError, open_tmdb_network_request
 from app.api.deps import get_current_user, has_qb2_grant, require_admin
 from app.auth.security import create_access_token, decode_token, hash_password, verify_password
 from app.config.settings import get_settings
@@ -54,9 +57,17 @@ from app.utils.redaction import redact_payload
 
 router = APIRouter()
 settings = get_settings()
+logger = logging.getLogger(__name__)
 _PRELOAD_TASK_LOCK = Lock()
 _PRELOAD_TASKS_RUNNING: set[str] = set()
 PRELOAD_PREFIX = "preload."
+TMDB_IMAGE_SIZES = {"w92", "w154", "w185", "w342", "w500", "w780", "w1280", "original"}
+TMDB_IMAGE_PATH_RE = re.compile(r"^[A-Za-z0-9_./-]+\.(jpg|jpeg|png|webp)$", re.IGNORECASE)
+TMDB_DIRECT_IMAGE_RE = re.compile(
+    r"https://image\.tmdb\.org/t/p/(?P<size>w\d+|original)/(?P<path>[A-Za-z0-9_./-]+\.(?:jpg|jpeg|png|webp))",
+    re.IGNORECASE,
+)
+TMDB_IMAGE_MAX_BYTES = 20 * 1024 * 1024
 
 
 class SetupAdminRequest(BaseModel):
@@ -83,82 +94,6 @@ class QbActionPayload(BaseModel):
     confirm_token: str | None = None
 
 
-def _wrangler_cwd() -> Path:
-    repo_root = Path(__file__).resolve().parents[3]
-    candidates = [
-        repo_root / "tmdb-gateway",
-        repo_root / "cloudflare" / "tmdb-gateway",
-    ]
-    for candidate in candidates:
-        if (candidate / "package.json").exists() or (candidate / "wrangler.jsonc").exists() or (candidate / "wrangler.toml").exists():
-            return candidate
-    return repo_root
-
-
-def _worker_name_from_gateway_url(value: str) -> str:
-    if not value:
-        return ""
-    parsed = urlparse(value if "://" in value else f"https://{value}")
-    host = parsed.netloc.split(":", 1)[0].strip().lower()
-    suffix = ".workers.dev"
-    if not host.endswith(suffix):
-        return ""
-    parts = host[: -len(suffix)].split(".")
-    return parts[0] if len(parts) >= 2 else ""
-
-
-def _normalize_worker_name(payload: dict[str, Any]) -> str:
-    worker_name = str(payload.get("worker_name") or "").strip()
-    if not worker_name:
-        worker_name = _worker_name_from_gateway_url(str(payload.get("gateway_url") or "").strip())
-    if not worker_name:
-        raise HTTPException(status_code=400, detail="请填写 Worker 名称，或先填写完整的 workers.dev 地址。")
-    if not fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", worker_name):
-        raise HTTPException(status_code=400, detail="Worker 名称只能包含小写字母、数字和连字符，且不能以连字符开头或结尾。")
-    return worker_name
-
-
-def _wrangler_command() -> str | None:
-    return shutil.which("npx.cmd") or shutil.which("npx")
-
-
-def _sanitize_wrangler_output(value: str) -> str:
-    lines = []
-    for line in value.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if "https://dash.cloudflare.com/oauth2/auth" in stripped:
-            lines.append("Wrangler 需要重新登录 Cloudflare。")
-            continue
-        lines.append(stripped)
-    return "\n".join(lines[-8:])
-
-
-def _put_worker_secret(cwd: Path, worker_name: str, secret_name: str, secret_value: str) -> tuple[bool, str]:
-    command = _wrangler_command()
-    if not command:
-        return False, "当前运行环境没有找到 npx，无法调用 Wrangler CLI。"
-    try:
-        result = subprocess.run(
-            [command, "wrangler", "secret", "put", secret_name, "--name", worker_name],
-            cwd=str(cwd),
-            input=f"{secret_value}\n",
-            text=True,
-            capture_output=True,
-            timeout=120,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"写入 {secret_name} 超时。请确认 Wrangler 已登录，网络可以访问 Cloudflare。"
-    except OSError as exc:
-        return False, f"无法启动 Wrangler CLI：{exc}"
-    if result.returncode == 0:
-        return True, ""
-    detail = _sanitize_wrangler_output(f"{result.stdout}\n{result.stderr}")
-    return False, detail or f"Wrangler 写入 {secret_name} 失败。"
-
-
 def bytes_label(value: float, digits: int = 1) -> str:
     units = ["B", "KB", "MB", "GB", "TB", "PB"]
     current = float(value)
@@ -167,6 +102,9 @@ def bytes_label(value: float, digits: int = 1) -> str:
             return f"{current:.{digits}f} {unit}"
         current /= 1024
     return f"{current:.{digits}f} PB"
+
+
+DEFAULT_STORAGE_MOUNT_PATHS = ("/mnt/storage1", "/mnt/storage2", "/mnt/storage3")
 
 
 def signed_bytes_delta(value: float) -> str:
@@ -235,12 +173,33 @@ def set_preload_cache(db: Session, name: str, payload: dict[str, Any]) -> dict[s
     return value
 
 
+def _rewrite_tmdb_image_url(value: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        size = match.group("size")
+        image_path = match.group("path").lstrip("/")
+        if size not in TMDB_IMAGE_SIZES:
+            return match.group(0)
+        return f"/api/tmdb/image/{size}/{image_path}"
+
+    return TMDB_DIRECT_IMAGE_RE.sub(replace, value)
+
+
+def rewrite_tmdb_image_urls(payload: Any) -> Any:
+    if isinstance(payload, str):
+        return _rewrite_tmdb_image_url(payload)
+    if isinstance(payload, list):
+        return [rewrite_tmdb_image_urls(item) for item in payload]
+    if isinstance(payload, dict):
+        return {key: rewrite_tmdb_image_urls(value) for key, value in payload.items()}
+    return payload
+
+
 def with_preload_meta(payload: dict[str, Any], cache: dict[str, Any] | None, preloaded: bool) -> dict[str, Any]:
-    result = dict(payload)
+    result = dict(rewrite_tmdb_image_urls(payload))
     result["_preload"] = {
         "preloaded": preloaded,
         "cached_at": cache.get("cached_at") if cache else None,
-        "refreshing": preloaded,
+        "refreshing": False,
     }
     return result
 
@@ -259,6 +218,131 @@ def run_preload_task_once(key: str, task, *args: Any) -> None:
     finally:
         with _PRELOAD_TASK_LOCK:
             _PRELOAD_TASKS_RUNNING.discard(key)
+
+
+def _safe_tmdb_image_path(image_path: str) -> str:
+    clean_path = image_path.strip().lstrip("/")
+    if not clean_path or "\\" in clean_path or ".." in clean_path or clean_path.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Invalid TMDB image path")
+    if len(clean_path) > 240 or not TMDB_IMAGE_PATH_RE.fullmatch(clean_path):
+        raise HTTPException(status_code=400, detail="Invalid TMDB image path")
+    return clean_path
+
+
+def _tmdb_image_cache_file(size: str, image_path: str) -> Path:
+    digest = hashlib.sha1(f"{size}/{image_path}".encode("utf-8")).hexdigest()
+    suffix = Path(image_path).suffix.lower() or ".jpg"
+    return Path(settings.tmdb_image_cache_dir) / f"{digest}{suffix}"
+
+
+def _tmdb_image_headers(cache_file: Path) -> dict[str, str]:
+    stat = cache_file.stat()
+    return {
+        "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
+        "ETag": f'W/"{stat.st_mtime_ns:x}-{stat.st_size:x}"',
+    }
+
+
+def _valid_tmdb_image_bytes(content: bytes) -> bool:
+    if len(content) < 12:
+        return False
+    if content.startswith(b"\xff\xd8\xff"):
+        return True
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+        return True
+    if content[4:8] == b"ftyp" and content[8:12] in {b"avif", b"avis"}:
+        return True
+    return False
+
+
+def _tmdb_image_media_type_from_bytes(content: bytes, fallback: str = "image/jpeg") -> str:
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+        return "image/webp"
+    if len(content) >= 12 and content[4:8] == b"ftyp" and content[8:12] in {b"avif", b"avis"}:
+        return "image/avif"
+    return fallback
+
+
+def _valid_tmdb_image_file(cache_file: Path) -> bool:
+    try:
+        with cache_file.open("rb") as handle:
+            return _valid_tmdb_image_bytes(handle.read(32))
+    except OSError:
+        return False
+
+
+def _tmdb_cached_image_media_type(cache_file: Path, fallback: str) -> str:
+    try:
+        with cache_file.open("rb") as handle:
+            return _tmdb_image_media_type_from_bytes(handle.read(32), fallback)
+    except OSError:
+        return fallback
+
+
+def _tmdb_image_error_label(exc: Exception) -> str:
+    if isinstance(exc, HTTPError):
+        return f"http_{int(exc.code)}"
+    if isinstance(exc, TmdbDohError):
+        return exc.error_type
+    if isinstance(exc, URLError):
+        reason = str(getattr(exc, "reason", exc))
+        return f"url_error:{reason}"[:180]
+    return f"{exc.__class__.__name__}:{exc}"[:180]
+
+
+def _tmdb_image_placeholder_response(reason: str = "fetch_failed") -> Response:
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="342" height="513" viewBox="0 0 342 513">'
+        '<rect width="342" height="513" fill="#e5e9f0"/>'
+        '<path d="M96 208h150v97H96z" fill="#cbd5e1"/>'
+        '<circle cx="130" cy="238" r="17" fill="#94a3b8"/>'
+        '<path d="M107 288l44-45 31 31 21-22 34 36z" fill="#94a3b8"/>'
+        '<text x="171" y="350" text-anchor="middle" font-family="Arial,sans-serif" '
+        'font-size="24" font-weight="700" fill="#64748b">No Image</text>'
+        "</svg>"
+    )
+    return Response(
+        content=svg,
+        media_type="image/svg+xml",
+        headers={
+            "Cache-Control": "no-store",
+            "X-TMDB-Image-Status": "placeholder",
+            "X-TMDB-Image-Error": reason[:180],
+        },
+    )
+
+
+def _prune_tmdb_image_cache(cache_dir: Path) -> None:
+    max_bytes = max(1, int(settings.tmdb_image_cache_max_mb)) * 1024 * 1024
+    files = [path for path in cache_dir.iterdir() if path.is_file() and not path.name.endswith(".tmp")]
+    total = sum(path.stat().st_size for path in files)
+    if total <= max_bytes:
+        return
+    for path in sorted(files, key=lambda item: item.stat().st_mtime):
+        try:
+            total -= path.stat().st_size
+            path.unlink()
+        except OSError:
+            continue
+        if total <= max_bytes:
+            break
+
+
+def _tmdb_image_network_config(db: Session) -> tuple[str, str, int]:
+    row = get_config(db, "tmdb")
+    config = get_decrypted_config(db, "tmdb") if row and row.encrypted_payload else {}
+    mode = str((config or {}).get("mode") or settings.tmdb_mode or "direct").strip().lower()
+    if mode not in {"direct", "proxy"}:
+        mode = "direct"
+    proxy_url = str((config or {}).get("proxy_url") or settings.tmdb_proxy_url or DEFAULT_TMDB_PROXY_URL).strip()
+    timeout = int((config or {}).get("timeout") or 12)
+    return mode, proxy_url, timeout
 
 
 def refresh_dashboard_preload_task() -> None:
@@ -301,7 +385,23 @@ def refresh_download_preload_task(downloader_id: str) -> None:
         db.close()
 
 
-def tmdb_test_result(success: bool, trace: str, message: str, explanation: str, next_step: str, error_type: str | None = None, http_status: int | None = None) -> dict[str, Any]:
+def tmdb_network_detail_from_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    config = config or {}
+    mode = str(config.get("mode") or settings.tmdb_mode or "direct").strip().lower()
+    if mode not in {"direct", "proxy"}:
+        mode = "direct"
+    proxy_url = str(config.get("proxy_url") or settings.tmdb_proxy_url or DEFAULT_TMDB_PROXY_URL).strip()
+    proxy_host = urlparse(proxy_url if "://" in proxy_url else f"http://{proxy_url}").netloc if proxy_url else ""
+    return {
+        "network_mode": mode,
+        "route_label": "TMDB：mihomo VPN 代理" if mode == "proxy" else "TMDB：直连 + DoH",
+        "proxy_enabled": mode == "proxy",
+        "proxy_url": proxy_host if mode == "proxy" else "",
+        "non_tmdb_policy": "direct_only",
+    }
+
+
+def tmdb_test_result(success: bool, trace: str, message: str, explanation: str, next_step: str, error_type: str | None = None, http_status: int | None = None, detail: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "success": success,
         "provider": "tmdb",
@@ -314,6 +414,7 @@ def tmdb_test_result(success: bool, trace: str, message: str, explanation: str, 
         "error_type": error_type,
         "can_enable": success,
         "trace_id": trace,
+        "detail": detail or tmdb_network_detail_from_config(),
     }
 
 
@@ -345,6 +446,16 @@ def classify_tmdb_test_error(exc: Exception, trace: str) -> dict[str, Any]:
             "请确认 NAS 容器可以访问 https://doh.pub；如果不可用，可以切换 DoH 源或改用路由器级代理/VPN。",
             "doh_unavailable",
         )
+    if isinstance(exc, TmdbImageError):
+        return tmdb_test_result(
+            False,
+            trace,
+            "TMDB 图片域无法访问。",
+            "应用可以测试 TMDB API，但后端容器无法下载 image.tmdb.org 上的海报图片，所以发现页只能显示占位图。",
+            "请在设置页把 TMDB 切换为 mihomo VPN 代理并重新测试；如果已经是代理模式，请确认 mihomo 容器运行正常，且规则包含 image.tmdb.org 走代理。",
+            "tmdb_image_network_error",
+            detail=getattr(exc, "network_detail", None) or tmdb_network_detail_from_config(),
+        )
     if isinstance(exc, HTTPError):
         status_code = int(exc.code)
         if status_code in (401, 403):
@@ -371,33 +482,12 @@ def classify_tmdb_test_error(exc: Exception, trace: str) -> dict[str, Any]:
 
 
 def classify_tmdb_gateway_test_error(exc: Exception, trace: str, phase: str = "api") -> dict[str, Any]:
-    if isinstance(exc, TmdbConfigError):
-        return tmdb_test_result(False, trace, "TMDB Worker 网关配置不完整。", "系统需要 Cloudflare Worker 地址和 Gateway Key 才能通过网关访问 TMDB。", "请在设置页填写 Worker 地址，并使用自动生成的 Gateway Key 设置 Cloudflare Worker Secret。", "gateway_config_missing")
-    if isinstance(exc, TmdbGatewayError):
-        return tmdb_test_result(False, trace, "Cloudflare Worker 健康检查失败。", "NAS 已连接到 Worker 域名，但 Worker 返回的健康检查内容不符合预期。", "请检查 Worker 是否部署了本项目提供的 TMDB Gateway 代码。", exc.error_type, exc.http_status)
-    if isinstance(exc, HTTPError):
-        status_code = int(exc.code)
-        try:
-            gateway_error = str(exc.headers.get("X-TMDB-Gateway-Error") or "")
-        except Exception:
-            gateway_error = ""
-        if status_code in (401, 403) and gateway_error in {"invalid_gateway_key", "missing_gateway_key"}:
-            return tmdb_test_result(False, trace, "Gateway Key 校验失败。", "NAS 后端已经访问到 Cloudflare Worker，但 X-Gateway-Key 与 Worker Secret 不一致，或 Worker 还没有设置 GATEWAY_KEY。", "请把设置页里的 Gateway Key 复制到 Cloudflare Worker Secret：GATEWAY_KEY，然后重新部署/测试。", "gateway_key_invalid", status_code)
-        if gateway_error == "missing_tmdb_token":
-            return tmdb_test_result(False, trace, "Worker 缺少 TMDB Bearer Token。", "NAS 已经访问到 Cloudflare Worker，但 Worker 还没有设置 TMDB_BEARER_TOKEN Secret。", "请把 TMDB Bearer Token 设置到 Cloudflare Worker Secret：TMDB_BEARER_TOKEN，然后重新部署/测试。", "gateway_tmdb_token_missing", status_code)
-        if gateway_error == "tmdb_auth_error":
-            return tmdb_test_result(False, trace, "Worker 中的 TMDB Token 无效。", "Cloudflare Worker 已收到请求，但转发到 TMDB 时被 TMDB 拒绝。", "请在 Cloudflare Worker Secret 中重新设置 TMDB_BEARER_TOKEN，不要把它填成 API Key。", "gateway_tmdb_token_invalid", status_code)
-        if gateway_error == "tmdb_network_error":
-            return tmdb_test_result(False, trace, "Worker 到 TMDB 的链路异常。", "NAS 可以访问 Cloudflare Worker，但 Worker 连接 TMDB 失败。", "请查看 Cloudflare Worker 日志，确认 Worker 出网和 TMDB 服务状态。", "gateway_upstream_network_error", status_code)
-        if status_code >= 500:
-            return tmdb_test_result(False, trace, "Worker 到 TMDB 的链路异常。", "NAS 可以访问 Cloudflare Worker，但 Worker 转发到 TMDB 时失败。", "请查看 Cloudflare Worker 日志，确认 TMDB_BEARER_TOKEN 和 Worker 出网状态。", "gateway_upstream_error", status_code)
-        return tmdb_test_result(False, trace, "TMDB Worker 网关返回异常。", f"Worker 返回 HTTP {status_code}，应用无法确认具体原因。", "请检查 Worker Secret、路由和 Cloudflare Worker 日志。", "gateway_http_error", status_code)
-    if isinstance(exc, (TimeoutError, SocketTimeout, URLError)):
-        reason = str(getattr(exc, "reason", exc))
-        if phase == "health":
-            return tmdb_test_result(False, trace, "NAS 无法访问 Cloudflare Worker。", "后端容器连不上 Worker 的 /health 地址，因此还没有进入 TMDB Token 校验阶段。", f"请先确认 NAS 容器能访问你的 Worker 域名。底层提示：{reason}", "gateway_network_error")
-        return tmdb_test_result(False, trace, "Worker 到 TMDB 的链路异常。", "NAS 已能访问 Worker，但 Worker API 请求没有成功完成。", f"请检查 Worker 日志和 TMDB Secret。底层提示：{reason}", "gateway_upstream_network_error")
-    return tmdb_test_result(False, trace, "TMDB Worker 网关测试失败。", "应用遇到了未能自动识别的网关问题。", "请检查 Worker URL、Gateway Key 和 Cloudflare Worker 日志。", "gateway_unknown_error")
+    result = classify_tmdb_test_error(exc, trace)
+    result["message"] = "Cloudflare Worker 方案已停用。"
+    result["explanation"] = "当前版本只保留 TMDB 直连 + DoH 和 mihomo VPN 代理两种连接方式。"
+    result["next_step"] = "请在设置页选择“直连 + DoH”或“mihomo VPN 代理”，保存并重新测试。"
+    result["error_type"] = "gateway_removed"
+    return result
 
 
 def mock_test_result(provider: str, trace: str, row: IntegrationConfig | None) -> dict[str, Any]:
@@ -679,70 +769,49 @@ def get_qb_state_for_dashboard(db: Session, downloader_id: str) -> dict[str, Any
         return qb_placeholder_state(downloader_id, row, f"qB 真实数据读取失败：{exc}")
 
 
-def _unique_storage_paths_from_configs(db: Session) -> list[str]:
-    paths: list[str] = []
-    for provider in ("qb1", "qb2", "qb3"):
-        config = get_decrypted_config(db, provider) or {}
-        for value in config.get("nas_mount_paths") or []:
-            if str(value).strip():
-                paths.append(str(value).strip())
-        for mapping in config.get("path_mappings") or []:
-            if isinstance(mapping, dict) and str(mapping.get("to") or "").strip():
-                paths.append(str(mapping.get("to")).strip())
-    unique: list[str] = []
-    seen = set()
-    for path in paths:
-        key = os.path.normcase(os.path.normpath(path))
-        if key not in seen:
-            seen.add(key)
-            unique.append(path)
-    return unique
+def _storage_disk_key(path: Path, raw_path: str) -> Any:
+    try:
+        return path.stat().st_dev
+    except OSError:
+        return os.path.normcase(path.anchor or raw_path)
 
 
 def nas_storage_from_configs(db: Session) -> dict[str, Any]:
-    configured_paths = _unique_storage_paths_from_configs(db)
-    if not configured_paths:
-        return {
-            "nas_free_space": 0,
-            "nas_total_space": 0,
-            "nas_used_space": 0,
-            "nas_usage_percent": None,
-            "nas_free_space_label": "-",
-            "nas_free_space_source": "",
-            "nas_space_label": "-",
-            "nas_space_helper": "请在设置的下载器配置中填写 NAS/本机挂载路径",
-            "nas_storage_configured": False,
-            "nas_storage_readable": False,
-            "nas_storage_paths": [],
-            "nas_storage_errors": [],
-        }
-
+    del db
     disks_seen: set[Any] = set()
-    total_space = 0.0
-    free_space = 0.0
+    primary_usage: Any | None = None
     readable_paths: list[str] = []
     errors: list[dict[str, str]] = []
-    for raw_path in configured_paths:
-        path = Path(raw_path).expanduser()
+    primary_path = DEFAULT_STORAGE_MOUNT_PATHS[0]
+
+    for raw_path in DEFAULT_STORAGE_MOUNT_PATHS:
+        path = Path(raw_path)
         try:
             if not path.exists():
-                errors.append({"path": raw_path, "message": "路径不存在或后端容器无法访问"})
+                errors.append({"path": raw_path, "message": "Path is not mounted or the container cannot access it."})
                 continue
-            disk_key: Any
-            try:
-                disk_key = path.stat().st_dev
-            except OSError:
-                disk_key = os.path.normcase(path.anchor or str(path))
-            if disk_key in disks_seen:
-                readable_paths.append(raw_path)
-                continue
-            usage = shutil.disk_usage(path)
-            disks_seen.add(disk_key)
             readable_paths.append(raw_path)
-            total_space += float(usage.total)
-            free_space += float(usage.free)
+            disk_key = _storage_disk_key(path, raw_path)
+            disks_seen.add(disk_key)
+            if raw_path == primary_path:
+                primary_usage = shutil.disk_usage(path)
         except Exception as exc:
             errors.append({"path": raw_path, "message": str(exc)})
+
+    pool_count = len(disks_seen)
+    folder_count = len(readable_paths)
+    summary_label = f"已识别 {pool_count} 个存储池，{folder_count} 个文件夹可访问" if folder_count else "未检测到存储挂载"
+    common = {
+        "nas_storage_pool_count": pool_count,
+        "nas_storage_folder_count": folder_count,
+        "nas_storage_detected_paths": readable_paths,
+        "nas_storage_summary_label": summary_label,
+        "nas_storage_paths": readable_paths,
+        "nas_storage_errors": errors,
+    }
+
+    total_space = float(primary_usage.total) if primary_usage else 0.0
+    free_space = float(primary_usage.free) if primary_usage else 0.0
 
     if total_space <= 0:
         return {
@@ -753,11 +822,10 @@ def nas_storage_from_configs(db: Session) -> dict[str, Any]:
             "nas_free_space_label": "-",
             "nas_free_space_source": "",
             "nas_space_label": "-",
-            "nas_space_helper": "已配置挂载路径，但后端无法访问，请检查路径或容器挂载",
-            "nas_storage_configured": True,
+            "nas_space_helper": f"请在部署 YAML 中把 qB1 的 NAS 路径挂载到 {primary_path}",
+            "nas_storage_configured": folder_count > 0,
             "nas_storage_readable": False,
-            "nas_storage_paths": readable_paths,
-            "nas_storage_errors": errors,
+            **common,
         }
 
     used_space = max(0.0, total_space - free_space)
@@ -768,13 +836,12 @@ def nas_storage_from_configs(db: Session) -> dict[str, Any]:
         "nas_used_space": used_space,
         "nas_usage_percent": usage_percent,
         "nas_free_space_label": bytes_label(free_space, 2),
-        "nas_free_space_source": "NAS/本机挂载路径",
-        "nas_space_label": f"{bytes_label(used_space, 2)}/{bytes_label(total_space, 2)}",
-        "nas_space_helper": f"已使用 {usage_percent}% · {len(disks_seen)} 个磁盘",
+        "nas_free_space_source": "Docker 固定存储挂载",
+        "nas_space_label": f"{bytes_label(used_space, 2)} / {bytes_label(total_space, 2)}",
+        "nas_space_helper": f"已使用 {usage_percent}%",
         "nas_storage_configured": True,
         "nas_storage_readable": True,
-        "nas_storage_paths": readable_paths,
-        "nas_storage_errors": errors,
+        **common,
     }
 
 
@@ -984,6 +1051,11 @@ def list_integrations(_: User = Depends(require_admin), db: Session = Depends(ge
     }
 
 
+@router.get("/admin/storage/status")
+def admin_storage_status(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    return nas_storage_from_configs(db)
+
+
 @router.put("/admin/integrations/{provider}")
 def save_integration(provider: str, request: IntegrationPayload, user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
     if provider not in PROVIDERS:
@@ -998,22 +1070,19 @@ def test_integration(provider: str, request: IntegrationPayload | None = None, u
     row = upsert_config(db, provider, request.payload, actor_user_id=user.id, action="save_and_test") if request and request.payload else get_config(db, provider)
     test_trace_id = trace_id("CFGTEST")
     if provider == "tmdb":
-        gateway_phase = "api"
+        config = get_decrypted_config(db, provider) or {}
+        network_detail = tmdb_network_detail_from_config(config)
         try:
-            config = get_decrypted_config(db, provider) or {}
             adapter = TmdbAdapter(config)
-            if adapter.mode == "gateway":
-                gateway_phase = "health"
-                adapter.test_gateway_health()
-                gateway_phase = "api"
-            adapter.test_connection()
-            result = tmdb_test_result(True, test_trace_id, "TMDB 连接成功。", "应用已经成功访问 TMDB，并验证了当前 Bearer Token 可以使用。", "你现在可以点击“启用”，然后回到“发现”页查看真实 TMDB 数据。", None, 200)
+            detail = adapter.test_connection().get("network") or adapter.network_detail()
+            result = tmdb_test_result(True, test_trace_id, "TMDB 连接成功。", "应用已经成功访问 TMDB，并验证了当前 Bearer Token 可以使用。", "你现在可以点击“启用”，然后回到“发现”页查看真实 TMDB 数据。", None, 200, detail)
         except Exception as exc:
-            config = get_decrypted_config(db, provider) or {}
-            if str(config.get("mode") or settings.tmdb_mode or "direct").strip().lower() == "gateway":
-                result = classify_tmdb_gateway_test_error(exc, test_trace_id, gateway_phase)
-            else:
-                result = classify_tmdb_test_error(exc, test_trace_id)
+            result = classify_tmdb_test_error(exc, test_trace_id)
+            result["detail"] = network_detail
+            if network_detail.get("network_mode") == "proxy" and result.get("error_type") in {"network_error", "timeout", "unknown_error"}:
+                result["message"] = "无法通过 mihomo 代理连接 TMDB。"
+                result["explanation"] = "TMDB 已按设置交给 mihomo 代理，但代理容器、节点或上游网络没有完成请求。APP 的 qB、M-Team 和 NAS 功能仍会直连，不受这个错误影响。"
+                result["next_step"] = "请确认 nas-mihomo/config.yaml 已部署，mihomo 容器正在监听 7890，并在 mihomo 面板里切换到可用节点后重试。"
         result["config_version"] = row.config_version if row else 0
     elif provider == "mteam":
         try:
@@ -1055,35 +1124,7 @@ def test_integration(provider: str, request: IntegrationPayload | None = None, u
 
 @router.post("/admin/integrations/tmdb/cloudflare-secrets")
 def set_tmdb_cloudflare_secrets(request: IntegrationPayload, _: User = Depends(require_admin)) -> dict[str, Any]:
-    payload = request.payload or {}
-    gateway_key = str(payload.get("gateway_key") or "").strip()
-    bearer_token = str(payload.get("bearer_token") or payload.get("token") or "").strip()
-    if not gateway_key:
-        raise HTTPException(status_code=400, detail="请先填写 Gateway Key。")
-    if not bearer_token:
-        raise HTTPException(status_code=400, detail="请先填写 TMDB v4 Bearer Token。")
-    worker_name = _normalize_worker_name(payload)
-    cwd = _wrangler_cwd()
-
-    written: list[str] = []
-    for secret_name, secret_value in (("GATEWAY_KEY", gateway_key), ("TMDB_BEARER_TOKEN", bearer_token)):
-        ok, detail = _put_worker_secret(cwd, worker_name, secret_name, secret_value)
-        if not ok:
-            partial = f"已写入：{', '.join(written)}。" if written else ""
-            raise HTTPException(status_code=502, detail=f"{partial}写入 {secret_name} 失败：{detail}")
-        written.append(secret_name)
-
-    return {
-        "success": True,
-        "provider": "tmdb",
-        "mode": "real",
-        "can_enable": False,
-        "message": "Cloudflare Worker Secrets 已写入。",
-        "explanation": f"GATEWAY_KEY 和 TMDB_BEARER_TOKEN 已通过本机 Wrangler CLI 写入 Worker：{worker_name}。",
-        "next_step": "现在点击“保存并测试”，确认 Worker 可以访问 TMDB；测试成功后再启用 TMDB。",
-        "written": written,
-        "worker_name": worker_name,
-    }
+    raise HTTPException(status_code=410, detail="Cloudflare Worker 方案已停用。请改用 TMDB 直连 + DoH 或 mihomo VPN 代理。")
 
 
 @router.post("/admin/integrations/{provider}/enable")
@@ -1161,6 +1202,10 @@ def build_dashboard_payload(db: Session) -> dict[str, Any]:
             "nas_storage_configured": nas_space["nas_storage_configured"],
             "nas_storage_readable": nas_space["nas_storage_readable"],
             "nas_storage_paths": nas_space["nas_storage_paths"],
+            "nas_storage_pool_count": nas_space["nas_storage_pool_count"],
+            "nas_storage_folder_count": nas_space["nas_storage_folder_count"],
+            "nas_storage_detected_paths": nas_space["nas_storage_detected_paths"],
+            "nas_storage_summary_label": nas_space["nas_storage_summary_label"],
             "nas_storage_errors": nas_space["nas_storage_errors"],
             "download_tasks": sum(item.get("active_downloads", 0) for item in qbs),
             "upload_tasks": sum(item.get("active_uploads", 0) for item in qbs),
@@ -1251,7 +1296,6 @@ def dashboard(
     if cached and not refresh:
         cache = get_preload_cache(db, "dashboard")
         if cache:
-            add_preload_task_once(background_tasks, "dashboard", refresh_dashboard_preload_task)
             return with_preload_meta(cache["payload"], cache, True)
     payload = refresh_dashboard_preload(db)
     return with_preload_meta(payload, get_preload_cache(db, "dashboard"), False)
@@ -1491,7 +1535,7 @@ def default_discover_filter() -> dict[str, Any]:
         "year": "",
         "min_rating": None,
         "page": 1,
-        "pages": 4,
+        "pages": 1,
     }
 
 
@@ -1542,7 +1586,6 @@ def discover_lists(
     if cached and not refresh:
         cache = get_preload_cache(db, "discover")
         if cache:
-            add_preload_task_once(background_tasks, "discover", refresh_discover_preload_task)
             return with_preload_meta(cache["payload"], cache, True)
     payload = refresh_discover_preload(db)
     return with_preload_meta(payload, get_preload_cache(db, "discover"), False)
@@ -1582,10 +1625,60 @@ def discover_filter(
     if cached and not refresh:
         cache = get_preload_cache(db, cache_name)
         if cache:
-            add_preload_task_once(background_tasks, cache_name, refresh_discover_filter_preload_task, filters)
             return with_preload_meta(cache["payload"], cache, True)
     payload = refresh_discover_filter_preload(db, filters)
     return with_preload_meta(payload, get_preload_cache(db, cache_name), False)
+
+
+@router.get("/tmdb/image/{size}/{image_path:path}")
+def tmdb_image_proxy(size: str, image_path: str, db: Session = Depends(get_db)) -> Response:
+    if size not in TMDB_IMAGE_SIZES:
+        raise HTTPException(status_code=400, detail="Unsupported TMDB image size")
+    clean_path = _safe_tmdb_image_path(image_path)
+    cache_dir = Path(settings.tmdb_image_cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = _tmdb_image_cache_file(size, clean_path)
+    media_type = mimetypes.guess_type(clean_path)[0] or "image/jpeg"
+    if cache_file.exists() and cache_file.stat().st_size > 0:
+        if _valid_tmdb_image_file(cache_file):
+            cached_media_type = _tmdb_cached_image_media_type(cache_file, media_type)
+            return FileResponse(cache_file, media_type=cached_media_type, headers=_tmdb_image_headers(cache_file))
+        try:
+            cache_file.unlink()
+            logger.warning("Removed invalid TMDB image cache file: size=%s path=%s file=%s", size, clean_path, cache_file)
+        except OSError:
+            logger.warning("TMDB image cache file is invalid but could not be removed: size=%s path=%s file=%s", size, clean_path, cache_file)
+
+    url = f"https://image.tmdb.org/t/p/{size}/{clean_path}"
+    request = Request(url, headers={"Accept": "image/jpeg,image/png,image/webp,*/*", "User-Agent": "PT-Media-Hub"})
+    mode, proxy_url, timeout = _tmdb_image_network_config(db)
+    try:
+        with open_tmdb_network_request(request, mode, proxy_url, timeout) as response:
+            content = response.read(TMDB_IMAGE_MAX_BYTES + 1)
+            if len(content) > TMDB_IMAGE_MAX_BYTES:
+                logger.warning("TMDB image fetch rejected because it is too large: size=%s path=%s mode=%s", size, clean_path, mode)
+                return _tmdb_image_placeholder_response("image_too_large")
+            if not _valid_tmdb_image_bytes(content):
+                logger.warning("TMDB image fetch returned non-image content: size=%s path=%s mode=%s content_type=%s", size, clean_path, mode, media_type)
+                return _tmdb_image_placeholder_response("invalid_image_content")
+            media_type = _tmdb_image_media_type_from_bytes(content, response.headers.get_content_type() or media_type)
+    except (HTTPError, HTTPException, Exception) as exc:
+        reason = _tmdb_image_error_label(exc)
+        logger.warning(
+            "TMDB image fetch failed: size=%s path=%s mode=%s proxy=%s error=%s",
+            size,
+            clean_path,
+            mode,
+            urlparse(proxy_url if "://" in proxy_url else f"http://{proxy_url}").netloc if proxy_url else "",
+            reason,
+        )
+        return _tmdb_image_placeholder_response(reason)
+
+    tmp_file = cache_file.with_suffix(f"{cache_file.suffix}.tmp")
+    tmp_file.write_bytes(content)
+    tmp_file.replace(cache_file)
+    _prune_tmdb_image_cache(cache_dir)
+    return FileResponse(cache_file, media_type=media_type, headers=_tmdb_image_headers(cache_file))
 
 
 @router.get("/search/media")

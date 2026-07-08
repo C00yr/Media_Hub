@@ -1,0 +1,40 @@
+# Copy this file to config.yaml, then replace the sample proxy with nodes
+# exported from Clash Verge or your proxy provider.
+mixed-port: 7890
+external-controller: 0.0.0.0:9090
+allow-lan: false
+mode: rule
+log-level: info
+
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  ipv6: false
+  enhanced-mode: fake-ip
+  nameserver:
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
+
+proxies:
+  - name: replace-with-your-node
+    type: ss
+    server: 127.0.0.1
+    port: 8388
+    cipher: aes-128-gcm
+    password: replace-me
+
+proxy-groups:
+  - name: TMDB-PROXY
+    type: url-test
+    proxies:
+      - replace-with-your-node
+    url: https://api.themoviedb.org/3/configuration
+    interval: 300
+    tolerance: 100
+
+rules:
+  - DOMAIN-SUFFIX,themoviedb.org,TMDB-PROXY
+  - DOMAIN-SUFFIX,tmdb.org,TMDB-PROXY
+  - DOMAIN-SUFFIX,tmdb.com,TMDB-PROXY
+  - DOMAIN-SUFFIX,image.tmdb.org,TMDB-PROXY
+  - MATCH,DIRECT

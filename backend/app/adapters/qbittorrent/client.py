@@ -4,7 +4,7 @@ from http.cookiejar import CookieJar
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import HTTPCookieProcessor, Request, build_opener
+from urllib.request import HTTPCookieProcessor, ProxyHandler, Request, build_opener
 
 from app.adapters.base import QbittorrentAdapter
 from app.utils.ids import trace_id
@@ -34,7 +34,7 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
         if not self.base_url or not self.username or not self.password:
             raise QbittorrentConfigError("qB WebUI 地址、用户名和密码必须填写")
         self.cookie_jar = CookieJar()
-        self.opener = build_opener(HTTPCookieProcessor(self.cookie_jar))
+        self.opener = build_opener(ProxyHandler({}), HTTPCookieProcessor(self.cookie_jar))
         self._logged_in = False
 
     def get_server_state(self, downloader_id: str) -> dict[str, Any]:

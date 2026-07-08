@@ -19,20 +19,17 @@ services:
       DATABASE_URL: sqlite:////data/pt_media_hub.db
       STATIC_DIR: /app/static
       TMDB_MODE: ${TMDB_MODE:-direct}
-      TMDB_GATEWAY_URL: ${TMDB_GATEWAY_URL:-}
-      TMDB_GATEWAY_KEY: ${TMDB_GATEWAY_KEY:-}
-      HTTP_PROXY: http://mihomo:7890
-      HTTPS_PROXY: http://mihomo:7890
-      ALL_PROXY: socks5://mihomo:7890
-      NO_PROXY: localhost,127.0.0.1,pt-media-hub,mihomo,frontend,backend,qbittorrent,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12
+      TMDB_PROXY_URL: ${TMDB_PROXY_URL:-http://mihomo:7890}
     ports:
       - "8000:8000"
     volumes:
       - ./data:/data
-      # 将 NAS/下载目录挂载到容器内后，APP 才能探查总空间。
-      # 在 .env 中把左侧改成你的真实 NAS 路径，然后在下载器配置里填写右侧路径：
-      #   MEDIA_HUB_STORAGE_1=/volume1/downloads  ->  /mnt/storage1
-      #   MEDIA_HUB_STORAGE_2=/volume2/media      ->  /mnt/storage2
+      # 把左侧替换成你的 NAS 文件夹路径；右侧 /mnt/storage1~3 不要改。
+      # APP 会自动扫描右侧固定路径，并按底层存储池去重统计容量。
+      # 例如：
+      #   /volume1/qb1-downloads:/mnt/storage1:ro
+      #   /volume1/qb2-downloads:/mnt/storage2:ro
+      #   /volume1/qb3-downloads:/mnt/storage3:ro
       - ${MEDIA_HUB_STORAGE_1:-./data}:/mnt/storage1:ro
       - ${MEDIA_HUB_STORAGE_2:-./data}:/mnt/storage2:ro
       - ${MEDIA_HUB_STORAGE_3:-./data}:/mnt/storage3:ro

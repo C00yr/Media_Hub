@@ -30,8 +30,8 @@ import {
   Users,
   Wrench
 } from "lucide-react";
-import { FormEvent, MouseEvent, PointerEvent, ReactNode, RefObject, useEffect, useMemo, useRef, useState } from "react";
-import { api, formatBytes, formatSpeed, getToken, setToken } from "../api/client";
+import { FormEvent, KeyboardEvent, MouseEvent, PointerEvent, ReactNode, RefObject, SyntheticEvent, useEffect, useMemo, useRef, useState } from "react";
+import { api, formatBytes, formatSpeed, getToken, normalizeApiErrorMessage, setToken } from "../api/client";
 
 type User = { username: string; role: string };
 type NavKey = "discover" | "dashboard" | "downloads" | "notifications" | "settings" | "diagnostics";
@@ -69,15 +69,27 @@ type IntegrationTestResult = {
   http_status?: number | null;
   can_enable?: boolean;
   trace_id?: string;
+  detail?: {
+    network_mode?: string;
+    route_label?: string;
+    proxy_enabled?: boolean;
+    proxy_url?: string;
+    non_tmdb_policy?: string;
+    image_host?: string;
+    image_probe?: {
+      checked?: boolean;
+      ok?: boolean;
+      error?: string;
+      reason?: string;
+    };
+  };
 };
 
 type TmdbForm = {
   mode: string;
   api_key: string;
   bearer_token: string;
-  gateway_url: string;
-  worker_name: string;
-  gateway_key: string;
+  proxy_url: string;
   language: string;
   region: string;
   timeout: string;
@@ -108,7 +120,6 @@ type QbForm = {
   password: string;
   timeout: string;
   default_save_path: string;
-  nas_mount_paths: string;
 };
 
 const navItems: { key: NavKey; label: string; icon: typeof Film; admin?: boolean }[] = [
@@ -129,8 +140,8 @@ const pageDescriptions: Record<NavKey, string> = {
   diagnostics: "查看核心模块是否正常运行，并导出脱敏诊断信息。"
 };
 
-function useLoad<T>(loader: () => Promise<T>, deps: unknown[]) {
-  const [data, setData] = useState<T | null>(null);
+function useLoad<T>(loader: () => Promise<T>, deps: unknown[], initialData: T | null = null, clearOnLoad = true) {
+  const [data, setData] = useState<T | null>(initialData);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -138,7 +149,7 @@ function useLoad<T>(loader: () => Promise<T>, deps: unknown[]) {
     let alive = true;
     setLoading(true);
     setError("");
-    setData(null);
+    if (clearOnLoad) setData(null);
     loader()
       .then((value) => alive && setData(value))
       .catch((err) => alive && setError((err as Error).message))
@@ -170,6 +181,66 @@ function useLoad<T>(loader: () => Promise<T>, deps: unknown[]) {
 }
 
 const SEARCH_HISTORY_STORAGE_KEY = "ptmh_search_history";
+const LOCAL_SNAPSHOT_PREFIX = "ptmh_snapshot:v2:";
+const LOCAL_SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024;
+const REVALIDATE_DELAY_MS = 3000;
+const TMDB_DIRECT_IMAGE_RE = /https:\/\/image\.tmdb\.org\/t\/p\/(w\d+|original)\/([A-Za-z0-9_./-]+\.(?:jpg|jpeg|png|webp))/gi;
+const IMAGE_FALLBACK_SRC = `data:image/svg+xml;utf8,${encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="342" height="513" viewBox="0 0 342 513"><rect width="342" height="513" fill="#e5e9f0"/><path d="M96 208h150v97H96z" fill="#cbd5e1"/><circle cx="130" cy="238" r="17" fill="#94a3b8"/><path d="M107 288l44-45 31 31 21-22 34 36z" fill="#94a3b8"/><text x="171" y="350" text-anchor="middle" font-family="Arial,sans-serif" font-size="24" font-weight="700" fill="#64748b">No Image</text></svg>'
+)}`;
+
+function rewriteTmdbImageUrl(value: string) {
+  return value.replace(TMDB_DIRECT_IMAGE_RE, (_match, size: string, imagePath: string) => `/api/tmdb/image/${size}/${imagePath.replace(/^\/+/, "")}`);
+}
+
+function rewriteTmdbImageUrls<T>(payload: T): T {
+  if (typeof payload === "string") return rewriteTmdbImageUrl(payload) as T;
+  if (Array.isArray(payload)) return payload.map((item) => rewriteTmdbImageUrls(item)) as T;
+  if (payload && typeof payload === "object") {
+    return Object.fromEntries(Object.entries(payload).map(([key, value]) => [key, rewriteTmdbImageUrls(value)])) as T;
+  }
+  return payload;
+}
+
+function handleImageError(event: SyntheticEvent<HTMLImageElement>) {
+  const image = event.currentTarget;
+  if (image.dataset.fallbackApplied === "1") return;
+  image.dataset.fallbackApplied = "1";
+  image.src = IMAGE_FALLBACK_SRC;
+}
+
+function readLocalSnapshot<T>(key: string): T | null {
+  try {
+    const raw = localStorage.getItem(`${LOCAL_SNAPSHOT_PREFIX}${key}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return rewriteTmdbImageUrls(parsed?.payload ?? null);
+  } catch {
+    return null;
+  }
+}
+
+function writeLocalSnapshot(key: string, payload: unknown) {
+  try {
+    const value = JSON.stringify({ saved_at: new Date().toISOString(), payload: rewriteTmdbImageUrls(payload) });
+    if (new Blob([value]).size > LOCAL_SNAPSHOT_MAX_BYTES) return;
+    localStorage.setItem(`${LOCAL_SNAPSHOT_PREFIX}${key}`, value);
+  } catch {
+    // Local cache is opportunistic; quota or privacy errors should not affect the app.
+  }
+}
+
+function eagerPosterLimit() {
+  return window.matchMedia("(max-width: 720px)").matches ? 4 : 8;
+}
+
+function isMobilePosterInteraction() {
+  return window.matchMedia("(hover: none), (pointer: coarse), (max-width: 720px)").matches;
+}
+
+function shouldRevalidateFromCache(payload: any) {
+  return Boolean(payload?._preload?.preloaded);
+}
 
 function readSearchHistory(): string[] {
   try {
@@ -272,12 +343,12 @@ export function App() {
         />
       </main>
       <nav className="bottom-nav">
-        {visibleNav.filter((item) => ["discover", "dashboard", "downloads", "settings"].includes(item.key)).map((item) => {
+        {visibleNav.filter((item) => ["discover", "dashboard", "downloads", "settings", "diagnostics"].includes(item.key)).map((item) => {
           const Icon = item.icon;
           return (
             <button className={active === item.key ? "active" : ""} onClick={() => openNav(item.key)} key={item.key} aria-label={item.label}>
               <Icon size={20} />
-              <span>{item.key === "settings" ? "我的" : item.label}</span>
+              <span>{item.label}</span>
             </button>
           );
         })}
@@ -318,20 +389,20 @@ function storageDisplay(source: any) {
   if (total > 0) {
     return {
       percent,
-      helper: `已用 ${formatBytesFixed(used, 1)} / ${formatBytesFixed(total, 1)}`,
+      helper: `${formatBytesFixed(used, 1)} / ${formatBytesFixed(total, 1)}`,
       value: `${numberLabel(percent, 0)}%`,
     };
   }
   if (free > 0) {
     return {
       percent: 0,
-      helper: "请在设置中配置 NAS/本机挂载路径以显示总空间",
+      helper: "请在部署 YAML 中配置 NAS 文件夹挂载以显示总空间",
       value: formatBytesFixed(free, 2),
     };
   }
   return {
     percent: 0,
-    helper: "请在设置中配置 NAS/本机挂载路径",
+    helper: "请在部署 YAML 中配置 NAS 文件夹挂载",
     value: "-",
   };
 }
@@ -423,22 +494,55 @@ function mergeDashboardQbs(current: any, realtime: any) {
 }
 
 function DashboardPage({ onOpenDownloader }: { onOpenDownloader?: (downloaderId: string) => void }) {
-  const { data, loading, setData } = useLoad<any>(() => api("/api/dashboard?cached=true"), []);
+  const initialDashboard = useMemo(() => readLocalSnapshot<any>("dashboard"), []);
+  const { data, loading, setData } = useLoad<any>(() => api("/api/dashboard?cached=true"), [], initialDashboard, false);
   const [refreshingMTeam, setRefreshingMTeam] = useState(false);
   const [testingMTeam, setTestingMTeam] = useState(false);
+  const [testingQbId, setTestingQbId] = useState("");
   const [mteamStatusOverride, setMteamStatusOverride] = useState<{ success: boolean; message: string } | null>(null);
   const [dashboardError, setDashboardError] = useState("");
+  const delayedRefreshKey = useRef("");
+
+  async function loadDashboard(url: string, silent = false) {
+    try {
+      const value = await api<any>(url);
+      setData(value);
+      writeLocalSnapshot("dashboard", value);
+      if (!silent) setDashboardError("");
+      return value;
+    } catch (err) {
+      if (!silent) setDashboardError((err as Error).message);
+      return null;
+    }
+  }
+
+  useEffect(() => {
+    if (data) writeLocalSnapshot("dashboard", data);
+  }, [data]);
+
+  useEffect(() => {
+    if (!shouldRevalidateFromCache(data)) return;
+    const key = String(data?._preload?.cached_at || data?.updated_at || "dashboard");
+    if (delayedRefreshKey.current === key) return;
+    delayedRefreshKey.current = key;
+    const timer = window.setTimeout(() => {
+      if (!document.hidden) loadDashboard("/api/dashboard?refresh=true", true);
+    }, REVALIDATE_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [data?._preload?.cached_at, data?._preload?.preloaded, data?.updated_at]);
 
   useEffect(() => {
     let alive = true;
     let inFlight = false;
-    async function loadDashboard(url: string) {
+    async function loadCachedDashboard() {
+      if (document.hidden) return;
       if (inFlight) return;
       inFlight = true;
       try {
-        const value = await api<any>(url);
+        const value = await api<any>("/api/dashboard?cached=true");
         if (alive) {
           setData(value);
+          writeLocalSnapshot("dashboard", value);
           setDashboardError("");
         }
       } catch (err) {
@@ -447,9 +551,8 @@ function DashboardPage({ onOpenDownloader }: { onOpenDownloader?: (downloaderId:
         inFlight = false;
       }
     }
-    loadDashboard("/api/dashboard?refresh=true");
     const timer = window.setInterval(() => {
-      loadDashboard("/api/dashboard?cached=true");
+      loadCachedDashboard();
     }, 60000);
     return () => {
       alive = false;
@@ -461,6 +564,7 @@ function DashboardPage({ onOpenDownloader }: { onOpenDownloader?: (downloaderId:
     let alive = true;
     let inFlight = false;
     async function loadQbRealtime() {
+      if (document.hidden) return;
       if (inFlight) return;
       inFlight = true;
       try {
@@ -474,9 +578,14 @@ function DashboardPage({ onOpenDownloader }: { onOpenDownloader?: (downloaderId:
     }
     loadQbRealtime();
     const timer = window.setInterval(loadQbRealtime, 5000);
+    const onVisibilityChange = () => {
+      if (!document.hidden) loadQbRealtime();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
       alive = false;
       window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, []);
 
@@ -509,20 +618,36 @@ function DashboardPage({ onOpenDownloader }: { onOpenDownloader?: (downloaderId:
     }
   }
 
-  if (loading || !data) return <Panel title="仪表盘"><p>正在加载运行数据...</p></Panel>;
+  async function testQbConnection(downloaderId: string) {
+    if (testingQbId) return;
+    setTestingQbId(downloaderId);
+    setDashboardError("");
+    try {
+      const result = await api<{ success: boolean; message: string }>(`/api/qb/${downloaderId}/test`, { method: "POST" });
+      if (!result.success) setDashboardError(result.message);
+      const realtime = await api<any>("/api/dashboard/qbs");
+      setData((current: any) => mergeDashboardQbs(current, realtime));
+    } catch (err) {
+      setDashboardError((err as Error).message);
+    } finally {
+      setTestingQbId("");
+    }
+  }
+
+  if (!data) return <Panel title="仪表盘"><p>正在加载运行数据...</p></Panel>;
 
   return (
     <div className="grid-page dashboard-page">
       <div className="dashboard-composite">
         <section className="metric-grid dashboard-overview">
-          <Metric title="总下载速度" value={formatSpeed(data.overview.total_download_speed)} source="" />
-          <Metric title="总上传速度" value={formatSpeed(data.overview.total_upload_speed)} source="" />
-          <Metric title="活跃上传/下载" value={<ActiveTransferCounts upload={data.overview.upload_tasks ?? 0} download={data.overview.download_tasks ?? 0} />} source={`共 ${(data.overview.upload_tasks ?? 0) + (data.overview.download_tasks ?? 0)} 个活跃任务`} />
+          <Metric icon={Download} title="总下载速度" value={formatSpeed(data.overview.total_download_speed)} source="" />
+          <Metric icon={Upload} title="总上传速度" value={formatSpeed(data.overview.total_upload_speed)} source="" />
+          <Metric icon={Activity} title="活跃上传/下载" value={<ActiveTransferCounts upload={data.overview.upload_tasks ?? 0} download={data.overview.download_tasks ?? 0} />} source={`共 ${(data.overview.upload_tasks ?? 0) + (data.overview.download_tasks ?? 0)} 个活跃任务`} />
           <StorageMetric overview={data.overview} />
         </section>
         <section className="dashboard-downloaders">
           <div className="cards-row downloader-card-grid">
-            {data.qbs.map((qb: any) => qb.locked ? <LockedCard key={qb.id} title={downloaderDashboardTitle(qb)} message={qb.message} onOpen={() => onOpenDownloader?.(qb.id)} /> : <DownloaderCard key={qb.id} qb={qb} onOpen={onOpenDownloader} />)}
+            {data.qbs.map((qb: any) => qb.locked ? <LockedCard key={qb.id} title={downloaderDashboardTitle(qb)} message={qb.message} onOpen={() => onOpenDownloader?.(qb.id)} /> : <DownloaderCard key={qb.id} qb={qb} onOpen={onOpenDownloader} onTestConnection={testQbConnection} testingConnection={testingQbId === qb.id} />)}
           </div>
         </section>
       </div>
@@ -796,7 +921,8 @@ function InfoTile({ icon: Icon, label, value, delta, negative, className }: { ic
 }
 
 function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
-  const { data, error, loading, setData } = useLoad<any>(() => api("/api/discover/lists?cached=true"), []);
+  const initialDiscover = useMemo(() => readLocalSnapshot<any>("discover.lists"), []);
+  const { data, error, loading, setData } = useLoad<any>(() => api("/api/discover/lists?cached=true"), [], initialDiscover, false);
   const [query, setQuery] = useState("");
   const [media, setMedia] = useState<any[]>([]);
   const [torrents, setTorrents] = useState<any[]>([]);
@@ -834,10 +960,44 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
   const expandedDiscoverList = expandedDiscoverTitle ? lists.find((list) => list.title === expandedDiscoverTitle) : null;
   const filterViewActive = discoverMode === "home" && browseMode === "filter" && !selectedPerson && !selectedMedia && !expandedDiscoverTitle;
   const sortedTorrents = useMemo(() => sortResources(torrents, resourceSort, resourceSortDirection), [torrents, resourceSort, resourceSortDirection]);
+  const discoverRefreshKey = useRef("");
+  const discoverGenreRefreshKey = useRef("");
 
   useEffect(() => {
-    api<any>("/api/discover/lists?refresh=true").then(setData).catch(() => undefined);
-  }, []);
+    if (data) writeLocalSnapshot("discover.lists", data);
+  }, [data]);
+
+  useEffect(() => {
+    if (!shouldRevalidateFromCache(data)) return;
+    const key = String(data?._preload?.cached_at || "discover");
+    if (discoverRefreshKey.current === key) return;
+    discoverRefreshKey.current = key;
+    const timer = window.setTimeout(() => {
+      if (!document.hidden) {
+        api<any>("/api/discover/lists?refresh=true").then((value) => {
+          setData(value);
+          writeLocalSnapshot("discover.lists", value);
+        }).catch(() => undefined);
+      }
+    }, REVALIDATE_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [data?._preload?.cached_at, data?._preload?.preloaded]);
+
+  useEffect(() => {
+    if (!data?.configured || !discoverListsNeedGenres(data)) return;
+    const key = String(data?._preload?.cached_at || data?.updated_at || "missing-genres");
+    if (discoverGenreRefreshKey.current === key) return;
+    discoverGenreRefreshKey.current = key;
+    const timer = window.setTimeout(() => {
+      if (!document.hidden) {
+        api<any>("/api/discover/lists?refresh=true").then((value) => {
+          setData(value);
+          writeLocalSnapshot("discover.lists", value);
+        }).catch(() => undefined);
+      }
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [data]);
 
   useEffect(() => {
     resetDiscoverHome();
@@ -848,9 +1008,11 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
     const filterKey = discoverFilterKey(discoverFilters);
     filterKeyRef.current = filterKey;
     const timer = window.setTimeout(() => {
-      loadDiscoverFilter(discoverFilters, { page: 1, pages: 4, cached: true }).then((result) => {
+      loadDiscoverFilter(discoverFilters, { page: 1, pages: 1, cached: true }).then((result) => {
         if (filterKeyRef.current === filterKey && result?._preload?.preloaded) {
-          loadDiscoverFilter(discoverFilters, { page: 1, pages: 4, refresh: true, silent: true }).catch(() => undefined);
+          window.setTimeout(() => {
+            if (!document.hidden) loadDiscoverFilter(discoverFilters, { page: 1, pages: 1, refresh: true, silent: true }).catch(() => undefined);
+          }, REVALIDATE_DELAY_MS);
         }
       });
     }, 220);
@@ -1020,7 +1182,9 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
   async function loadDiscoverFilter(filters: DiscoverFilters, options: { append?: boolean; page?: number; pages?: number; cached?: boolean; refresh?: boolean; silent?: boolean } = {}) {
     const append = Boolean(options.append);
     const page = options.page ?? 1;
-    const pages = options.pages ?? (append ? 2 : 4);
+    const pages = options.pages ?? (append ? 2 : 1);
+    const snapshotKey = `discover.filter:${discoverFilterKey(filters)}:${page}:${pages}`;
+    const localSnapshot = !append && options.cached ? readLocalSnapshot<any>(snapshotKey) : null;
     if (append) {
       if (filterLoadingPageRef.current === page) return;
       filterLoadingPageRef.current = page;
@@ -1030,6 +1194,13 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
     const requestId = append ? filterRequestId.current : filterRequestId.current + 1;
     if (!append) filterRequestId.current = requestId;
     if (append) setFilterLoadingMore(true);
+    else if (localSnapshot) {
+      setFilterPayload(localSnapshot);
+      setFilterItems(localSnapshot?.items ?? []);
+      setFilterNextPage(localSnapshot?.next_page ?? null);
+      setFilterHasMore(Boolean(localSnapshot?.next_page));
+      setFilterLoading(false);
+    }
     else if (!options.silent) {
       setFilterLoading(true);
       setFilterItems([]);
@@ -1044,16 +1215,17 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
     });
     params.set("page", String(page));
     params.set("pages", String(pages));
-    if (append) params.set("include_options", "false");
+    if (append || ((options.refresh || options.silent) && filterPayload?.options)) params.set("include_options", "false");
     if (options.cached) params.set("cached", "true");
     if (options.refresh) params.set("refresh", "true");
     try {
       const result = await api<any>(`/api/discover/filter?${params.toString()}`);
       if (filterRequestId.current === requestId) {
-        setFilterPayload((current: any) => append ? { ...(current ?? {}), ...result, options: result?.options ?? current?.options } : result);
+        setFilterPayload((current: any) => append ? { ...(current ?? {}), ...result, options: result?.options ?? current?.options } : { ...result, options: result?.options ?? current?.options });
         setFilterNextPage(result?.next_page ?? null);
         setFilterHasMore(Boolean(result?.next_page));
         setFilterItems((current) => append ? mergeMediaItems(current, result?.items ?? []) : (result?.items ?? []));
+        if (!append && page === 1) writeLocalSnapshot(snapshotKey, result);
       }
       return result;
     } catch (err) {
@@ -1136,10 +1308,10 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
           ) : null}
           {discoverMode === "home" && browseMode === "casual" && (
             <>
-              {loading && <Panel title="发现"><p>正在从 TMDB 加载片单...</p></Panel>}
+              {loading && !data && <Panel title="发现"><p>正在从 TMDB 加载片单...</p></Panel>}
               {error && <Panel title="TMDB 获取失败"><p className="error">{error}</p></Panel>}
               {data && !data.configured && <Panel title="需要配置 TMDB"><p>{data.message}</p><p className="muted">进入“设置”，在 TMDB 配置里填写 API Key 或 Bearer Token，保存并启用后再回到发现页。</p></Panel>}
-              {lists.map((list) => <PosterRail title={list.title} items={list.items} onMore={() => setExpandedDiscoverTitle(list.title)} onSelect={openMediaDetail} key={list.title} />)}
+              {lists.map((list, index) => <PosterRail title={list.title} items={list.items} eagerLimit={index === 0 ? eagerPosterLimit() : 0} onMore={() => setExpandedDiscoverTitle(list.title)} onSelect={openMediaDetail} key={list.title} />)}
             </>
           )}
           {discoverMode === "home" && browseMode === "filter" && (
@@ -1255,7 +1427,7 @@ function DiscoverFilterPage({
       </div>
       <div className="poster-grid discover-filter-grid">
         {loading && <SearchLoadingState title="正在筛选 TMDB" detail="正在按类型、题材、地区和评分刷新海报墙" />}
-        {items.map((item: any) => <DiscoverPosterCard item={item} onSelect={onSelect} key={item.id} />)}
+        {items.map((item: any, index: number) => <DiscoverPosterCard item={item} eager={index < eagerPosterLimit()} onSelect={onSelect} key={item.id} />)}
         {!loading && !items.length && <p className="muted">没有符合条件的条目，可以放宽题材、地区或评分。</p>}
       </div>
       <div className="discover-load-sentinel" ref={sentinelRef}>
@@ -1322,6 +1494,17 @@ function mergeMediaItems(current: any[], incoming: any[]) {
     }
   });
   return merged;
+}
+
+function discoverListsNeedGenres(payload: any): boolean {
+  const groups = [
+    payload?.trending,
+    payload?.popular_movies,
+    payload?.popular_tv,
+    payload?.top_rated_movies,
+    payload?.top_rated_tv,
+  ];
+  return groups.some((group) => Array.isArray(group) && group.some((item) => !Array.isArray(item?.genres) || item.genres.length === 0));
 }
 
 function discoverFilterKey(filters: DiscoverFilters) {
@@ -1638,6 +1821,7 @@ function NotificationsPage() {
 
 function SettingsPage() {
   const { data, reload } = useLoad<any>(() => api("/api/admin/integrations"), []);
+  const storage = useLoad<any>(() => api("/api/admin/storage/status"), []);
   if (!data) return <Panel title="设置"><p>正在加载...</p></Panel>;
 
   return (
@@ -1645,10 +1829,44 @@ function SettingsPage() {
       <Panel title="运行时凭据中心">
         <p className="muted">凭据由后端加密保存；保存过的 API、账号、密码和路径会直接回填在输入框里，可显示或复制。</p>
       </Panel>
+      <StorageSettingsCard status={storage.data} loading={storage.loading} error={storage.error} />
       {data.providers
         .filter((provider: any) => ["mteam", "qb1", "qb2", "qb3", "tmdb"].includes(provider.provider))
         .map((provider: any) => <IntegrationEditor provider={provider} onChanged={reload} key={provider.provider} />)}
     </div>
+  );
+}
+
+function StorageSettingsCard({ status, loading, error }: { status: any; loading: boolean; error: string }) {
+  const detectedPaths = Array.isArray(status?.nas_storage_detected_paths) ? status.nas_storage_detected_paths : [];
+  const errors = Array.isArray(status?.nas_storage_errors) ? status.nas_storage_errors : [];
+  return (
+    <Panel title="存储空间">
+      <div className="integration">
+        <div className={`notice ${status?.nas_storage_readable ? "success" : "info"}`}>
+          <strong>{loading ? "正在检测存储挂载..." : status?.nas_storage_summary_label || "未检测到存储挂载"}</strong>
+          <span>只需要在部署 YAML 左侧填写 NAS 真实文件夹路径；右侧 /mnt/storage1、/mnt/storage2、/mnt/storage3 由 APP 固定识别，不需要在设置里填写。</span>
+        </div>
+        {error && <p className="error">{error}</p>}
+        {detectedPaths.length > 0 ? (
+          <div className="field-help">
+            <strong>已检测路径：</strong>
+            <span className="storage-path-list">{detectedPaths.map((path: string) => <code key={path}>{path}</code>)}</span>
+          </div>
+        ) : (
+          <div className="field-help">
+            <strong>未检测到挂载时：</strong>
+            <span>请重新部署容器，并把 docker-compose.yml 里 storage volumes 的左侧替换成 NAS 文件夹路径，例如 /volume1/qb1-downloads:/mnt/storage1:ro。</span>
+          </div>
+        )}
+        {errors.length > 0 && (
+          <div className="field-help">
+            <strong>检测提示：</strong>
+            <span>{errors.slice(0, 3).map((item: any) => `${item.path}: ${item.message}`).join("；")}</span>
+          </div>
+        )}
+      </div>
+    </Panel>
   );
 }
 
@@ -1695,8 +1913,7 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
     username: String(saved.username ?? ""),
     password: String(saved.password ?? ""),
     timeout: String(saved.timeout ?? "10"),
-    default_save_path: String(saved.default_save_path ?? ""),
-    nas_mount_paths: Array.isArray(saved.nas_mount_paths) ? saved.nas_mount_paths.join("\n") : String(saved.nas_mount_paths ?? saved.storage_paths ?? "")
+    default_save_path: String(saved.default_save_path ?? "")
   });
   const [busy, setBusy] = useState("");
   const [localError, setLocalError] = useState("");
@@ -1716,7 +1933,6 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
       password: form.password,
       timeout: Number(form.timeout) || 10,
       default_save_path: form.default_save_path.trim(),
-      nas_mount_paths: form.nas_mount_paths.split(/\r?\n|,|;/).map((item) => item.trim()).filter(Boolean),
     };
   }
 
@@ -1773,7 +1989,7 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
       <div className="integration tmdb-editor">
         <div className="notice info">
           <strong>用于实时读取 qBittorrent WebUI 中的下载器状态和任务列表</strong>
-          <span>必填：WebUI 地址、用户名、密码。NAS/本机挂载路径用于仪表盘统计总空间、已用空间和使用率。</span>
+          <span>必填：WebUI 地址、用户名、密码。存储空间由部署 YAML 的固定挂载自动检测，qB 设置里不需要填写容器路径。</span>
         </div>
         <div className="settings-grid">
           <label>显示名称
@@ -1794,13 +2010,10 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
           <label>默认保存路径（可选）
             <CopyableInput value={form.default_save_path} onChange={(value) => updateField("default_save_path", value)} placeholder="例如 /downloads/media 或 D:\\Downloads" />
           </label>
-          <label>NAS/本机挂载路径（用于空间统计）
-            <CopyableTextarea value={form.nas_mount_paths} onChange={(value) => updateField("nas_mount_paths", value)} placeholder={"/mnt/storage1\n/mnt/storage2\n多个路径可换行填写，会按磁盘去重"} />
-          </label>
         </div>
         <div className="field-help">
           <strong>实际需要你提供：</strong>
-          <span>局域网地址就是 qB WebUI 地址；账号密码用于登录 Web API；默认保存路径用于添加新任务时指定位置；挂载路径请填写 docker-compose 里映射到容器内的路径，例如 /mnt/storage1，仪表盘会用它统计总空间并自动去重。</span>
+          <span>局域网地址就是 qB WebUI 地址；账号密码用于登录 Web API；默认保存路径用于添加新任务时指定位置。NAS 总空间请在部署 YAML 左侧填写真实 NAS 文件夹路径，APP 会自动读取 /mnt/storage1~3 并按存储池去重。</span>
         </div>
         <div className="actions">
           <button onClick={saveDraft} disabled={busy !== ""}>{busy === "draft" ? "正在保存..." : "保存草稿"}</button>
@@ -1948,44 +2161,14 @@ function MTeamIntegrationEditor({ provider, onChanged }: { provider: any; onChan
   );
 }
 
-function generateGatewayKey(): string {
-  const bytes = new Uint8Array(32);
-  if (globalThis.crypto?.getRandomValues) {
-    globalThis.crypto.getRandomValues(bytes);
-  } else {
-    for (let index = 0; index < bytes.length; index += 1) bytes[index] = Math.floor(Math.random() * 256);
-  }
-  let binary = "";
-  bytes.forEach((value) => {
-    binary += String.fromCharCode(value);
-  });
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-}
-
-function inferWorkerNameFromUrl(value: string): string {
-  const input = value.trim();
-  if (!input) return "";
-  try {
-    const url = new URL(input.includes("://") ? input : `https://${input}`);
-    const suffix = ".workers.dev";
-    const host = url.hostname.toLowerCase();
-    if (!host.endsWith(suffix)) return "";
-    const parts = host.slice(0, -suffix.length).split(".");
-    return parts.length >= 2 ? parts[0] : "";
-  } catch {
-    return "";
-  }
-}
-
 function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
   const saved = provider.saved_payload ?? {};
+  const initialMode = ["direct", "proxy"].includes(String(saved.mode ?? "")) ? String(saved.mode) : "direct";
   const [form, setForm] = useState<TmdbForm>({
-    mode: String(saved.mode ?? "direct"),
+    mode: initialMode,
     api_key: String(saved.api_key ?? ""),
     bearer_token: String(saved.bearer_token ?? ""),
-    gateway_url: String(saved.gateway_url ?? ""),
-    worker_name: String(saved.worker_name ?? inferWorkerNameFromUrl(String(saved.gateway_url ?? ""))),
-    gateway_key: String(saved.gateway_key || generateGatewayKey()),
+    proxy_url: String(saved.proxy_url ?? "http://mihomo:7890"),
     language: String(saved.language ?? "zh-CN"),
     region: String(saved.region ?? "CN"),
     timeout: String(saved.timeout ?? "12"),
@@ -2002,23 +2185,12 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
     setForm((current) => ({ ...current, [key]: value }));
   }
 
-  function updateGatewayUrl(value: string) {
-    const inferred = inferWorkerNameFromUrl(value);
-    setForm((current) => ({
-      ...current,
-      gateway_url: value,
-      worker_name: current.worker_name.trim() ? current.worker_name : inferred,
-    }));
-  }
-
   function payload() {
     return {
       mode: form.mode,
       api_key: form.api_key.trim(),
       bearer_token: form.bearer_token.trim(),
-      gateway_url: form.gateway_url.trim(),
-      worker_name: form.worker_name.trim() || inferWorkerNameFromUrl(form.gateway_url),
-      gateway_key: form.gateway_key.trim(),
+      proxy_url: form.proxy_url.trim() || "http://mihomo:7890",
       language: form.language.trim() || "zh-CN",
       region: form.region.trim() || "CN",
       timeout: Number(form.timeout) || 12,
@@ -2038,7 +2210,8 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
         can_enable: false,
         message: "草稿已保存。",
         explanation: "密钥已经加密保存到后端，并会回填到当前输入框。",
-        next_step: "如果你还没有测试，请点击“保存并测试”。测试成功后再启用 TMDB。"
+        next_step: "如果你还没有测试，请点击“保存并测试”。测试成功后再启用 TMDB。",
+        detail: tmdbNetworkDetail(form)
       });
       onChanged();
     } catch (err) {
@@ -2077,47 +2250,44 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
     }
   }
 
-  const isGatewayMode = form.mode !== "direct";
-
-  function regenerateGatewayKey() {
-    updateField("gateway_key", generateGatewayKey());
-  }
+  const isProxyMode = form.mode === "proxy";
+  const networkDetail = result?.detail ?? tmdbNetworkDetail(form);
 
   return (
     <Panel title="TMDB 配置">
       <div className="integration tmdb-editor">
         <div className="notice info">
-          <strong>NAS 推荐使用直连 TMDB + DoH</strong>
-          <span>只需要填写 TMDB v4 Bearer Token。后端会用 doh.pub 解析 TMDB，并优先使用 IPv4，绕开 NAS/Docker 的异常 DNS 和不可用 IPv6。</span>
+          <strong>TMDB 只支持两种网络模式</strong>
+          <span>默认使用直连 + DoH。只有选择 mihomo VPN 代理时，TMDB 请求才会交给 mihomo；qB、M-Team 和 NAS 功能始终直连。</span>
         </div>
         <div className="tmdb-mode-row">
           <span>连接方式</span>
           <div className="segmented compact">
-            <button type="button" className={!isGatewayMode ? "active" : ""} onClick={() => updateField("mode", "direct")}>
+            <button type="button" className={!isProxyMode ? "active" : ""} onClick={() => updateField("mode", "direct")}>
               <Radar size={16} /> 直连 TMDB + DoH
             </button>
-            <button type="button" className={isGatewayMode ? "active" : ""} onClick={() => updateField("mode", "gateway")}>
-              <ShieldCheck size={16} /> Cloudflare Worker 备用
+            <button type="button" className={isProxyMode ? "active" : ""} onClick={() => updateField("mode", "proxy")}>
+              <ShieldCheck size={16} /> mihomo VPN 代理
             </button>
           </div>
         </div>
-        {isGatewayMode ? (
+        <div className="field-help compact-help">
+          <strong>网络边界</strong>
+          <span>{networkDetail.route_label || "TMDB：直连 + DoH"}</span>
+          <span>qB 下载器：强制直连</span>
+          <span>M-Team：强制直连</span>
+          {networkDetail.proxy_enabled && <span>TMDB 请求路径：{networkDetail.proxy_url || form.proxy_url || "mihomo:7890"}</span>}
+        </div>
+        {isProxyMode ? (
           <>
             <div className="settings-grid">
-              <label>Cloudflare Worker 地址
-                <CopyableInput value={form.gateway_url} onChange={updateGatewayUrl} placeholder="https://your-worker.your-subdomain.workers.dev" inputMode="url" />
-                <small className="field-note">高级备用：适合已经有自有域名绑定 Worker，或 NAS 能稳定访问 Worker 域名的用户。</small>
-              </label>
-              <label>Gateway Key
-                <div className="input-with-actions">
-                  <SecretInput value={form.gateway_key} onChange={(value) => updateField("gateway_key", value)} placeholder="自动生成，用作 Worker Secret：GATEWAY_KEY" autoComplete="off" />
-                  <button type="button" className="inline-tool" onClick={regenerateGatewayKey}><RefreshCw size={16} /> 重新生成</button>
-                </div>
-                <small className="field-note">APP 和 Worker 共用这串密码，防止别人随便调用你的 Worker。</small>
+              <label>mihomo 代理地址
+                <CopyableInput value={form.proxy_url} onChange={(value) => updateField("proxy_url", value)} placeholder="http://mihomo:7890" inputMode="url" />
+                <small className="field-note">Docker Compose 默认服务名是 mihomo，端口是 7890。这个地址只用于 TMDB。</small>
               </label>
               <label>TMDB Bearer Token
                 <SecretInput value={form.bearer_token} onChange={(value) => updateField("bearer_token", value)} placeholder="从 TMDB 账号后台复制，通常以 eyJ 开头" autoComplete="off" />
-                <small className="field-note">需要手动填到 Cloudflare Worker Secret：TMDB_BEARER_TOKEN。</small>
+                <small className="field-note">推荐只填 Bearer Token。代理只改变网络路径，不改变 TMDB 鉴权方式。</small>
               </label>
               <label>语言 / 地区
                 <div className="split-inputs">
@@ -2127,8 +2297,8 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
               </label>
             </div>
             <div className="field-help compact-help">
-              <strong>Cloudflare 手动设置</strong>
-              <span>在 Worker 的 Variables and Secrets 中添加 Secret：GATEWAY_KEY 填上方 Gateway Key，TMDB_BEARER_TOKEN 填 TMDB v4 Bearer Token。保存后回到这里“保存并测试”。</span>
+              <strong>mihomo 配置要求</strong>
+              <span>请把 Clash Verge 导出的节点放到 nas-mihomo/config.yaml，并保留规则：TMDB 域名走代理，MATCH 走 DIRECT。</span>
             </div>
           </>
         ) : (
@@ -2177,6 +2347,27 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
   );
 }
 
+function tmdbNetworkDetail(form: TmdbForm): IntegrationTestResult["detail"] {
+  const proxyUrl = form.proxy_url.trim() || "http://mihomo:7890";
+  const proxyHost = displayProxyHost(proxyUrl);
+  return {
+    network_mode: form.mode === "proxy" ? "proxy" : "direct",
+    route_label: form.mode === "proxy" ? "TMDB：mihomo VPN 代理" : "TMDB：直连 + DoH",
+    proxy_enabled: form.mode === "proxy",
+    proxy_url: form.mode === "proxy" ? proxyHost : "",
+    non_tmdb_policy: "direct_only",
+  };
+}
+
+function displayProxyHost(value: string): string {
+  try {
+    const url = new URL(value.includes("://") ? value : `http://${value}`);
+    return url.host || value;
+  } catch {
+    return value;
+  }
+}
+
 function TestResultCard({ result, emptyProvider }: { result?: IntegrationTestResult | null; emptyProvider: string }) {
   if (!result) {
     return (
@@ -2192,6 +2383,10 @@ function TestResultCard({ result, emptyProvider }: { result?: IntegrationTestRes
       <strong>{result.message ?? (result.success ? "测试成功" : "测试失败")}</strong>
       {result.explanation && <span>{result.explanation}</span>}
       {result.next_step && <span>下一步：{result.next_step}</span>}
+      {result.detail?.route_label && <small>TMDB 请求路径：{result.detail.route_label}</small>}
+      {result.detail?.proxy_enabled && result.detail?.proxy_url && <small>代理地址：{result.detail.proxy_url}</small>}
+      {result.detail?.image_probe?.checked && <small>图片域：{result.detail.image_probe.ok ? "image.tmdb.org 可访问" : `image.tmdb.org 失败：${result.detail.image_probe.error || result.detail.image_probe.reason || "未知错误"}`}</small>}
+      {result.detail?.non_tmdb_policy === "direct_only" && <small>qB / M-Team / NAS：强制直连</small>}
       {result.http_status && <small>HTTP 状态码：{result.http_status}</small>}
       {result.trace_id && <small>诊断编号：{result.trace_id}</small>}
     </div>
@@ -2350,20 +2545,26 @@ function Panel({ title, children }: { title: string; children: ReactNode }) {
   return <section className="panel"><h2>{title}</h2>{children}</section>;
 }
 
-function Metric({ title, value, source }: { title: string; value: ReactNode; source: string }) {
-  return <div className="metric"><small>{title}</small><strong>{value}</strong>{source && <span>{source}</span>}</div>;
+function Metric({ icon: Icon, title, value, source }: { icon?: typeof Film; title: string; value: ReactNode; source: string }) {
+  return (
+    <div className="metric">
+      <small>{Icon && <span className="metric-icon"><Icon size={14} /></span>}{title}</small>
+      <strong>{value}</strong>
+      {source && <span>{source}</span>}
+    </div>
+  );
 }
 
 function StorageMetric({ overview }: { overview: any }) {
   const storage = storageDisplay(overview);
   return (
     <div className="metric storage-metric">
-      <small><Database size={14} /> 存储空间</small>
-      <div className="storage-line"><span style={{ width: `${storage.percent || 0}%` }} /></div>
-      <div className="storage-metric-row">
-        <span>{storage.helper}</span>
-        <strong>{storage.value}</strong>
+      <div className="storage-metric-head">
+        <small><span className="metric-icon"><Database size={14} /></span> 存储空间</small>
+        <strong className="storage-metric-percent">{storage.value}</strong>
       </div>
+      <div className="storage-line"><span style={{ width: `${storage.percent || 0}%` }} /></div>
+      <span className="storage-metric-capacity">{storage.helper}</span>
     </div>
   );
 }
@@ -2388,7 +2589,17 @@ function downloaderShortLabel(value: string): string {
   return match ? `qB${match[1]}` : String(value || "qB").replace(/^QB/i, "qB");
 }
 
-function DownloaderCard({ qb, onOpen }: { qb: any; onOpen?: (downloaderId: string) => void }) {
+function DownloaderCard({
+  qb,
+  onOpen,
+  onTestConnection,
+  testingConnection = false,
+}: {
+  qb: any;
+  onOpen?: (downloaderId: string) => void;
+  onTestConnection?: (downloaderId: string) => void;
+  testingConnection?: boolean;
+}) {
   const displayName = downloaderDashboardTitle(qb);
   const online = Boolean(qb.online);
   const configured = qb.configured !== false;
@@ -2403,13 +2614,27 @@ function DownloaderCard({ qb, onOpen }: { qb: any; onOpen?: (downloaderId: strin
     if (qb.id) onOpen?.(qb.id);
   }
 
+  function handleStatusTest(event: MouseEvent<HTMLButtonElement>) {
+    event.stopPropagation();
+    if (qb.id && configured) onTestConnection?.(qb.id);
+  }
+
+  function handleCardKeyDown(event: KeyboardEvent<HTMLElement>) {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      openDownloader();
+    }
+  }
+
   return (
-    <button className={configured ? "downloader-node" : "downloader-node empty"} type="button" onClick={openDownloader}>
+    <article className={configured ? "downloader-node" : "downloader-node empty"} role="button" tabIndex={0} onClick={openDownloader} onKeyDown={handleCardKeyDown}>
       <div className="downloader-node-top">
         <div className="downloader-node-title" title={statusTitle}>
           <h3>{displayName}</h3>
           <span className={connectionError ? "downloader-status-label error" : "downloader-status-label"}>
-            <span className={online ? "status-dot online" : "status-dot offline"} />
+            <button className={testingConnection ? "downloader-status-button spinning" : "downloader-status-button"} type="button" onClick={handleStatusTest} disabled={testingConnection || !configured} title={`测试 ${displayName} 连通性`} aria-label={`测试 ${displayName} 连通性`}>
+              <span className={online ? "status-dot online" : "status-dot offline"} />
+            </button>
             {statusLabel}
           </span>
         </div>
@@ -2432,7 +2657,7 @@ function DownloaderCard({ qb, onOpen }: { qb: any; onOpen?: (downloaderId: strin
       </div>
         </>
       )}
-    </button>
+    </article>
   );
 }
 
@@ -2475,9 +2700,9 @@ function MediaResultCard({ item, onSelect }: { item: any; onSelect: (item: any) 
         if (event.key === "Enter" || event.key === " ") onSelect(item);
       }}
     >
-      {item.backdrop && <img className="media-backdrop" src={item.backdrop} alt="" />}
+      {item.backdrop && <img className="media-backdrop" src={item.backdrop} alt="" loading="lazy" decoding="async" onError={handleImageError} />}
       <div className="media-card-shade" />
-      <img className="media-poster" src={item.poster} alt="" />
+      <img className="media-poster" src={item.poster} alt="" loading="lazy" decoding="async" onError={handleImageError} />
       <div className="media-card-body">
         <div className="media-card-heading">
           <div>
@@ -2651,7 +2876,7 @@ function InfoPill({ icon: Icon, text, tone }: { icon: typeof Film; text: string;
   return <span className={tone ? `info-pill ${tone}` : "info-pill"}><Icon size={14} />{text}</span>;
 }
 
-function PosterRail({ title, items = [], onMore, onSelect }: { title: string; items: any[]; onMore: () => void; onSelect: (item: any) => void }) {
+function PosterRail({ title, items = [], eagerLimit = 0, onMore, onSelect }: { title: string; items: any[]; eagerLimit?: number; onMore: () => void; onSelect: (item: any) => void }) {
   return (
     <section className="discover-section">
       <div className="discover-section-header">
@@ -2659,7 +2884,7 @@ function PosterRail({ title, items = [], onMore, onSelect }: { title: string; it
         <button className="discover-more" type="button" onClick={onMore}>更多 <span>›</span></button>
       </div>
       <div className="poster-rail" aria-label={title}>
-        {items.map((item) => <DiscoverPosterCard item={item} onSelect={onSelect} key={item.id} />)}
+        {items.map((item, index) => <DiscoverPosterCard item={item} eager={index < eagerLimit} onSelect={onSelect} key={item.id} />)}
       </div>
     </section>
   );
@@ -2676,35 +2901,49 @@ function DiscoverCollectionPage({ title, items = [], onBack, onSelect }: { title
         </div>
       </div>
       <div className="poster-grid">
-        {items.map((item) => <DiscoverPosterCard item={item} onSelect={onSelect} key={item.id} />)}
+        {items.map((item, index) => <DiscoverPosterCard item={item} eager={index < eagerPosterLimit()} onSelect={onSelect} key={item.id} />)}
         {!items.length && <p className="muted">暂无资源。</p>}
       </div>
     </section>
   );
 }
 
-function DiscoverPosterCard({ item, onSelect }: { item: any; onSelect: (item: any) => void }) {
+function DiscoverPosterCard({ item, eager = false, onSelect }: { item: any; eager?: boolean; onSelect: (item: any) => void }) {
+  const [infoOpen, setInfoOpen] = useState(false);
   const rating = Number(item.rating ?? 0);
+  const yearLabel = item.year && item.year !== "未知" ? String(item.year) : "";
+  const languageLabel = mediaLanguageLabel(item);
+  const genreLabel = mediaGenreLabel(item);
   const details = [
-    item.year && item.year !== "未知" ? String(item.year) : "",
-    tvSeasonEpisodeLabel(item),
-    tvLatestSeasonLabel(item, false),
-    mediaCountryLabel(item),
-    mediaGenreLabel(item),
-    mediaCreditLabel(item),
+    yearLabel,
+    languageLabel,
+    genreLabel,
   ].filter(Boolean);
+
+  useEffect(() => {
+    setInfoOpen(false);
+  }, [item.id, item.tmdb_id]);
+
+  function handlePosterClick() {
+    if (details.length && !infoOpen && isMobilePosterInteraction()) {
+      setInfoOpen(true);
+      return;
+    }
+    onSelect(item);
+  }
+
   return (
     <article
-      className="poster poster-clickable"
+      className={infoOpen ? "poster poster-clickable poster-info-open" : "poster poster-clickable"}
       role="button"
       tabIndex={0}
-      onClick={() => onSelect(item)}
+      onClick={handlePosterClick}
       onKeyDown={(event) => {
         if (event.key === "Enter" || event.key === " ") onSelect(item);
       }}
     >
       <div className="poster-art">
-        <img src={item.poster} alt="" />
+        <img src={item.poster} alt="" loading={eager ? "eager" : "lazy"} decoding="async" fetchPriority={eager ? "high" : "auto"} onError={handleImageError} />
         <span className="poster-type">{item.media_type === "tv" ? "电视剧" : "电影"}</span>
         {rating > 0 && <span className="poster-rating">{numberLabel(rating, 1)}</span>}
         <div className="poster-hover">
@@ -2755,7 +2994,7 @@ function MediaDetailPage({
   ];
   return (
     <section className="tmdb-detail">
-      {item.backdrop && <img className="tmdb-detail-backdrop" src={item.backdrop} alt="" />}
+      {item.backdrop && <img className="tmdb-detail-backdrop" src={item.backdrop} alt="" loading="lazy" decoding="async" onError={handleImageError} />}
       <div className="tmdb-detail-haze" />
       <div className="tmdb-detail-glass">
         <button className="tmdb-back" type="button" onClick={onBack}>返回发现</button>
@@ -2766,7 +3005,7 @@ function MediaDetailPage({
         {loading && <span className="tmdb-loading">正在读取 TMDB 详情...</span>}
         {error && <p className="error">{error}</p>}
         <div className="tmdb-detail-main">
-          <img className="tmdb-detail-poster" src={item.poster} alt="" />
+          <img className="tmdb-detail-poster" src={item.poster} alt="" loading="eager" decoding="async" fetchPriority="high" onError={handleImageError} />
           <div className="tmdb-detail-copy">
             <span className="tmdb-type-pill">{item.media_type === "tv" ? "电视剧" : "电影"}</span>
             <h2>{item.title} <small>{item.year && item.year !== "未知" ? `(${item.year})` : ""}</small></h2>
@@ -2803,7 +3042,7 @@ function MediaDetailPage({
         <div className="tmdb-cast-rail">
           {castMembers.map((person: any) => (
             <button className="tmdb-person-card" type="button" onClick={() => onPersonSelect(person)} key={person.id}>
-              <img src={person.profile} alt="" />
+              <img src={person.profile} alt="" loading="lazy" decoding="async" onError={handleImageError} />
               <strong>{person.name}</strong>
               <span>{person.character ? `饰 ${person.character}` : "演员"}</span>
             </button>
@@ -2847,7 +3086,7 @@ function PersonDetailPage({
         {loading && <span className="tmdb-loading">正在读取演员作品...</span>}
         {error && <p className="error">{error}</p>}
         <div className="tmdb-person-hero">
-          <img src={person.profile} alt="" />
+          <img src={person.profile} alt="" loading="eager" decoding="async" fetchPriority="high" onError={handleImageError} />
           <div>
             <span className="tmdb-type-pill">{person.known_for_department || "Acting"}</span>
             <h2>{person.name}</h2>
@@ -3084,23 +3323,7 @@ function numberLabel(value: number, digits = 0): string {
 }
 
 function apiErrorDetail(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  try {
-    const parsed = JSON.parse(message);
-    if (typeof parsed.detail === "string") return parsed.detail;
-    if (parsed.detail && typeof parsed.detail === "object") {
-      return [
-        `stage=${parsed.detail.stage ?? "-"}`,
-        `provider=${parsed.detail.provider ?? "-"}`,
-        `torrent_id=${parsed.detail.torrent_id ?? "-"}`,
-        `message=${parsed.detail.message ?? JSON.stringify(parsed.detail)}`,
-      ].join("\n");
-    }
-    if (parsed.detail) return JSON.stringify(parsed.detail);
-  } catch {
-    return message;
-  }
-  return message;
+  return normalizeApiErrorMessage(error);
 }
 
 function playDoneSound() {
@@ -3148,6 +3371,11 @@ function formatDateLabel(value: string): string {
 function mediaCountryLabel(item: any): string {
   const countries = Array.isArray(item.production_countries) ? item.production_countries.filter(Boolean) : [];
   if (countries.length) return countries.slice(0, 2).map(localizedCountryName).join(" / ");
+  const language = String(item.original_language ?? "").trim();
+  return language ? localizedLanguageName(language) : "";
+}
+
+function mediaLanguageLabel(item: any): string {
   const language = String(item.original_language ?? "").trim();
   return language ? localizedLanguageName(language) : "";
 }
