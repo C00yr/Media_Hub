@@ -10,7 +10,7 @@ from app.utils.ids import trace_id
 from app.utils.redaction import parse_raw_headers, redact_payload
 
 
-PROVIDERS = ["mteam", "qb1", "qb2", "qb3", "tmdb", "ai"]
+PROVIDERS = ["mteam", "qb1", "qb2", "qb3", "tmdb", "ai", "wechat_claw"]
 
 
 def normalize_payload(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -78,6 +78,23 @@ def normalize_payload(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
         if not normalized.get("temperature"):
             normalized["temperature"] = 0.1
         normalized = {key: value for key, value in normalized.items() if value not in ("", None)}
+    if provider == "wechat_claw":
+        for key in ["mode", "name", "base_url", "default_target", "admin_user_ids", "public_base_url", "inbound_token", "webhook_url", "webhook_secret", "default_downloader_id"]:
+            if key in normalized and isinstance(normalized[key], str):
+                normalized[key] = normalized[key].strip()
+        if normalized.get("mode") not in {"ilink", "direct"}:
+            normalized["mode"] = "ilink"
+        if not normalized.get("name"):
+            normalized["name"] = "通知1"
+        if not normalized.get("base_url"):
+            normalized["base_url"] = "https://ilinkai.weixin.qq.com"
+        if not normalized.get("poll_timeout"):
+            normalized["poll_timeout"] = 25
+        if not normalized.get("timeout"):
+            normalized["timeout"] = 10
+        if normalized.get("default_downloader_id") not in {"qb1", "qb2", "qb3", "all"}:
+            normalized["default_downloader_id"] = "all"
+        normalized = {key: value for key, value in normalized.items() if value not in ("", None)}
     return normalized
 
 
@@ -131,6 +148,11 @@ def upsert_config(
             previous = json.loads(decrypt_text(row.encrypted_payload))
             if "api_key" not in normalized and previous.get("api_key"):
                 normalized["api_key"] = previous["api_key"]
+        if provider == "wechat_claw" and row.encrypted_payload:
+            previous = json.loads(decrypt_text(row.encrypted_payload))
+            for key in ("inbound_token", "webhook_secret"):
+                if key not in normalized and previous.get(key):
+                    normalized[key] = previous[key]
     row.encrypted_payload = encrypt_text(json.dumps(normalized, ensure_ascii=True))
     row.redacted_summary = redact_payload(normalized)
     row.last_tested_at = None

@@ -18,7 +18,7 @@ Allowed JSON shape:
   "action": "resource_search" | "download_started" | "download_completed" | "status_query",
   "query": "movie or torrent keywords, empty when not needed",
   "downloader_id": "qb1" | "qb2" | "qb3" | "all",
-  "target": "dashboard" | "mteam" | "qb" | "notifications" | "downloads",
+  "target": "dashboard" | "mteam" | "qb" | "notifications" | "downloads" | "stats" | "diagnostics" | "discover",
   "torrent_id": "optional torrent id",
   "torrent_hash": "optional qB hash",
   "limit": 5,
@@ -31,19 +31,34 @@ Rules:
 - For "download finished", "completed", or similar, use "download_completed".
 - For status questions about qB, M-Team, NAS, dashboard, notifications, or downloads, use "status_query".
 - downloader_id defaults to "all" unless the user says qB1/qB2/qB3.
-- target defaults to "dashboard" for general status, "qb" for qB status, "mteam" for M-Team status.
+- target defaults to "dashboard" for general status, "qb" for qB status, "mteam" for M-Team status, "stats" for statistics, "diagnostics" for health checks, and "discover" for TMDB/discovery status.
 - limit must be between 1 and 10.
 """.strip()
 
 
 SUMMARY_SYSTEM_PROMPT = """
-You are PT Media Hub's notification assistant.
-Reply to the user in concise Chinese. Be factual and action-oriented.
-Use the execution result JSON as the only data source.
-For resource search, list the best matches with title, size, resolution, seeders, and torrent id when present.
-For status queries, summarize M-Team, qB downloaders, NAS space, and errors if present.
-For download notifications, confirm what was recorded and mention the notification id if present.
-Do not expose API keys, cookies, tokens, raw headers, or passwords.
+You are PT Media Hub's mobile response composer for WeChat claw and the in-app assistant.
+Use the execution result JSON as the only data source. Output strict JSON only.
+
+Allowed JSON shape:
+{
+  "title": "short Chinese title, max 18 chars",
+  "summary": "one concise Chinese sentence",
+  "sections": [
+    {"heading": "Chinese heading, max 8 chars", "items": ["short item text", "..."]}
+  ],
+  "actions": ["optional next action text"],
+  "footer": "optional short safety or source note"
+}
+
+Mobile formatting rules:
+- Keep section order stable: summary first, then sections, then actions, then footer.
+- Use 1 to 4 sections and at most 5 items per section.
+- Do not use markdown tables, HTML, code blocks, raw JSON, or long paragraphs.
+- For resource search, list title, size, resolution, seeders, and torrent id when present.
+- For status queries, summarize M-Team, qB downloaders, NAS space, and errors if present.
+- For download notifications, confirm whether a notification was created or skipped, and include notification id when present.
+- Never expose API keys, cookies, tokens, raw headers, passwords, or inbound webhook secrets.
 """.strip()
 
 
@@ -108,10 +123,13 @@ class DeepSeekChatAdapter:
                     ),
                 },
             ],
-            json_mode=False,
+            json_mode=True,
             max_tokens=self.max_tokens,
         )
-        return content.strip()
+        payload = _json_loads(content)
+        if not isinstance(payload, dict):
+            raise AIServiceError("AI did not return a mobile reply JSON object")
+        return render_mobile_reply(payload)
 
     def test_connection(self) -> dict[str, Any]:
         content = self._chat(
@@ -180,7 +198,7 @@ def normalize_assistant_intent(payload: dict[str, Any]) -> dict[str, Any]:
     if downloader_id not in {"qb1", "qb2", "qb3", "all"}:
         downloader_id = "all"
     target = str(payload.get("target") or "").strip().lower()
-    if target not in {"dashboard", "mteam", "qb", "notifications", "downloads"}:
+    if target not in {"dashboard", "mteam", "qb", "notifications", "downloads", "stats", "diagnostics", "discover"}:
         target = "qb" if downloader_id != "all" else "dashboard"
     try:
         limit = int(payload.get("limit") or 5)
@@ -205,3 +223,39 @@ def _json_loads(content: str) -> Any:
         if text.lower().startswith("json"):
             text = text[4:].strip()
     return json.loads(text)
+
+
+def render_mobile_reply(payload: dict[str, Any]) -> str:
+    title = str(payload.get("title") or "处理结果").strip()[:18]
+    summary = str(payload.get("summary") or "").strip()
+    lines = [f"【{title}】"]
+    if summary:
+        lines.append(summary)
+    sections = payload.get("sections") or []
+    if isinstance(sections, list):
+        for section in sections[:4]:
+            if not isinstance(section, dict):
+                continue
+            heading = str(section.get("heading") or "详情").strip()[:8]
+            items = section.get("items") or []
+            if not isinstance(items, list) or not items:
+                continue
+            lines.append("")
+            lines.append(f"{heading}")
+            for item in items[:5]:
+                text = str(item or "").strip()
+                if text:
+                    lines.append(f"- {text[:120]}")
+    actions = payload.get("actions") or []
+    if isinstance(actions, list) and actions:
+        lines.append("")
+        lines.append("下一步")
+        for action in actions[:3]:
+            text = str(action or "").strip()
+            if text:
+                lines.append(f"- {text[:100]}")
+    footer = str(payload.get("footer") or "").strip()
+    if footer:
+        lines.append("")
+        lines.append(footer[:120])
+    return "\n".join(lines).strip()

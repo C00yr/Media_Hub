@@ -30,6 +30,7 @@ import {
   Users,
   Wrench
 } from "lucide-react";
+import QRCode from "qrcode";
 import { FormEvent, KeyboardEvent, MouseEvent, PointerEvent, ReactNode, RefObject, SyntheticEvent, useEffect, useMemo, useRef, useState } from "react";
 import { api, formatBytes, formatSpeed, getToken, normalizeApiErrorMessage, setToken } from "../api/client";
 
@@ -132,6 +133,33 @@ type AiForm = {
   thinking: "enabled" | "disabled";
   reasoning_effort: "high" | "max";
 };
+
+type WechatClawForm = {
+  mode: "ilink" | "direct";
+  name: string;
+  base_url: string;
+  default_target: string;
+  admin_user_ids: string;
+  poll_timeout: string;
+  public_base_url: string;
+  inbound_token: string;
+  webhook_url: string;
+  webhook_secret: string;
+  default_downloader_id: "all" | "qb1" | "qb2" | "qb3";
+  timeout: string;
+};
+
+type WechatClawInteraction = {
+  user_id?: string;
+  conversation_id?: string;
+  message?: string;
+  reply?: string;
+  action?: string;
+  target?: string;
+  created_at?: string;
+};
+
+type NotificationPreferenceKey = "download_started" | "download_completed" | "resource_search" | "status_query" | "wechat_claw_push";
 
 const navItems: { key: NavKey; label: string; icon: typeof Film; admin?: boolean }[] = [
   { key: "discover", label: "发现", icon: Film },
@@ -1858,6 +1886,7 @@ function NotificationsAssistantPage() {
 
   return (
     <div className="grid-page notifications-page">
+      <NotificationPreferencesCard />
       <Panel title="AI 通知助手">
         <form className="assistant-box" onSubmit={submit}>
           <div className="notice info">
@@ -1902,6 +1931,60 @@ function NotificationsAssistantPage() {
   );
 }
 
+function NotificationPreferencesCard() {
+  const { data, reload } = useLoad<any>(() => api("/api/notification-preferences"), []);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const preferences: Record<NotificationPreferenceKey, boolean> = {
+    download_started: true,
+    download_completed: true,
+    resource_search: false,
+    status_query: false,
+    wechat_claw_push: true,
+    ...(data?.preferences ?? {}),
+  };
+  const labels: Record<NotificationPreferenceKey, { title: string; help: string }> = {
+    download_started: { title: "下载开始通知", help: "AI 或微信 claw 记录下载开始时写入通知中心。" },
+    download_completed: { title: "下载完成通知", help: "AI 或微信 claw 记录下载完成时写入通知中心。" },
+    resource_search: { title: "资源查询提醒", help: "开启后，AI/微信 claw 的资源查询结果会写入通知中心。" },
+    status_query: { title: "状态查询提醒", help: "开启后，各板块状态查询结果会写入通知中心。" },
+    wechat_claw_push: { title: "推送到 WeChat claw", help: "通知中心写入后，如果配置了 webhook，同步推送到手机端。" },
+  };
+
+  async function toggle(key: NotificationPreferenceKey) {
+    setSaving(true);
+    setError("");
+    try {
+      await api("/api/notification-preferences", {
+        method: "PUT",
+        body: JSON.stringify({ preferences: { ...preferences, [key]: !preferences[key] } }),
+      });
+      await reload();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Panel title="通知偏好">
+      <div className="preference-list">
+        {(Object.keys(labels) as NotificationPreferenceKey[]).map((key) => (
+          <label className="preference-row" key={key}>
+            <input type="checkbox" checked={Boolean(preferences[key])} disabled={saving || !data} onChange={() => toggle(key)} />
+            <span>
+              <strong>{labels[key].title}</strong>
+              <small>{labels[key].help}</small>
+            </span>
+          </label>
+        ))}
+        {error && <p className="error">{error}</p>}
+      </div>
+    </Panel>
+  );
+}
+
 function SettingsPage() {
   const { data, reload } = useLoad<any>(() => api("/api/admin/integrations"), []);
   const storage = useLoad<any>(() => api("/api/admin/storage/status"), []);
@@ -1914,7 +1997,7 @@ function SettingsPage() {
       </Panel>
       <StorageSettingsCard status={storage.data} loading={storage.loading} error={storage.error} />
       {data.providers
-        .filter((provider: any) => ["mteam", "qb1", "qb2", "qb3", "tmdb", "ai"].includes(provider.provider))
+        .filter((provider: any) => ["mteam", "qb1", "qb2", "qb3", "tmdb", "ai", "wechat_claw"].includes(provider.provider))
         .map((provider: any) => <IntegrationEditor provider={provider} onChanged={reload} key={provider.provider} />)}
     </div>
   );
@@ -1957,6 +2040,7 @@ function IntegrationEditor({ provider, onChanged }: { provider: any; onChanged: 
   if (provider.provider === "mteam") return <MTeamIntegrationEditor provider={provider} onChanged={onChanged} />;
   if (provider.provider === "tmdb") return <TmdbIntegrationEditor provider={provider} onChanged={onChanged} />;
   if (provider.provider === "ai") return <AiIntegrationEditor provider={provider} onChanged={onChanged} />;
+  if (provider.provider === "wechat_claw") return <WechatClawIntegrationEditor provider={provider} onChanged={onChanged} />;
   if (["qb1", "qb2", "qb3"].includes(provider.provider)) return <QbIntegrationEditor provider={provider} onChanged={onChanged} />;
 
   const providerNames: Record<string, string> = { ai: "AI" };
@@ -2122,6 +2206,444 @@ function AiIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
         {!provider.enabled && !canEnable && <p className="muted">请先保存并测试，测试成功后再启用 AI 模块。</p>}
         {localError && <p className="error">{localError}</p>}
         <TestResultCard result={result} emptyProvider="AI / DeepSeek" />
+      </div>
+    </Panel>
+  );
+}
+
+function WechatClawQrCode({ value }: { value: string }) {
+  const [src, setSrc] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let alive = true;
+    if (!value.trim()) {
+      setSrc("");
+      setError("");
+      return () => {
+        alive = false;
+      };
+    }
+    QRCode.toDataURL(value, { margin: 1, width: 220, errorCorrectionLevel: "M" })
+      .then((dataUrl) => {
+        if (!alive) return;
+        setSrc(dataUrl);
+        setError("");
+      })
+      .catch((err) => {
+        if (!alive) return;
+        setSrc("");
+        setError((err as Error).message);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [value]);
+
+  if (value.trim().toLowerCase().startsWith("data:image/")) {
+    return <img className="wechat-qr-image" src={value} alt="WeChat claw iLink 登录二维码" />;
+  }
+  if (src) return <img className="wechat-qr-image" src={src} alt="WeChat claw 配置二维码" />;
+  return (
+    <div className="wechat-qr-placeholder">
+      <RefreshCw size={24} />
+      <span>{error || "正在生成二维码..."}</span>
+    </div>
+  );
+}
+
+function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
+  const saved = provider.saved_payload ?? {};
+  const [form, setForm] = useState<WechatClawForm>({
+    mode: saved.mode === "direct" ? "direct" : "ilink",
+    name: String(saved.name ?? "通知1"),
+    base_url: String(saved.base_url ?? "https://ilinkai.weixin.qq.com"),
+    default_target: String(saved.default_target ?? ""),
+    admin_user_ids: String(saved.admin_user_ids ?? ""),
+    poll_timeout: String(saved.poll_timeout ?? saved.timeout ?? "25"),
+    public_base_url: String(saved.public_base_url ?? ""),
+    inbound_token: String(saved.inbound_token ?? ""),
+    webhook_url: String(saved.webhook_url ?? ""),
+    webhook_secret: String(saved.webhook_secret ?? ""),
+    default_downloader_id: ["qb1", "qb2", "qb3", "all"].includes(saved.default_downloader_id) ? saved.default_downloader_id : "all",
+    timeout: String(saved.timeout ?? "10"),
+  });
+  const setup = useLoad<any>(() => api("/api/admin/wechat-claw/setup"), [provider.config_version, provider.enabled], null, false);
+  const [busy, setBusy] = useState("");
+  const [localError, setLocalError] = useState("");
+  const [localResult, setLocalResult] = useState<IntegrationTestResult | null>(provider.last_test_result);
+  const result = localResult ?? provider.last_test_result;
+  const canEnable = result?.provider === "wechat_claw" && result?.success === true && result?.can_enable === true;
+
+  useEffect(() => {
+    const current = provider.saved_payload ?? {};
+    setForm({
+      mode: current.mode === "direct" ? "direct" : "ilink",
+      name: String(current.name ?? "通知1"),
+      base_url: String(current.base_url ?? "https://ilinkai.weixin.qq.com"),
+      default_target: String(current.default_target ?? ""),
+      admin_user_ids: String(current.admin_user_ids ?? ""),
+      poll_timeout: String(current.poll_timeout ?? current.timeout ?? "25"),
+      public_base_url: String(current.public_base_url ?? ""),
+      inbound_token: String(current.inbound_token ?? ""),
+      webhook_url: String(current.webhook_url ?? ""),
+      webhook_secret: String(current.webhook_secret ?? ""),
+      default_downloader_id: ["qb1", "qb2", "qb3", "all"].includes(current.default_downloader_id) ? current.default_downloader_id : "all",
+      timeout: String(current.timeout ?? "10"),
+    });
+    setLocalResult(provider.last_test_result);
+  }, [provider.config_version, provider.last_test_result]);
+
+  function updateField<K extends keyof WechatClawForm>(key: K, value: WechatClawForm[K]) {
+    setForm((current) => ({ ...current, [key]: value }));
+  }
+
+  function payload() {
+    return {
+      mode: "ilink",
+      name: form.name.trim() || "通知1",
+      base_url: form.base_url.trim() || "https://ilinkai.weixin.qq.com",
+      default_target: form.default_target.trim(),
+      admin_user_ids: form.admin_user_ids.trim(),
+      poll_timeout: Number(form.poll_timeout) || 25,
+      public_base_url: form.public_base_url.trim(),
+      inbound_token: form.inbound_token.trim(),
+      webhook_url: form.webhook_url.trim(),
+      webhook_secret: form.webhook_secret.trim(),
+      default_downloader_id: form.default_downloader_id,
+      timeout: Number(form.timeout) || 10,
+    };
+  }
+
+  async function saveDraft() {
+    setBusy("draft");
+    setLocalError("");
+    try {
+      await api("/api/admin/integrations/wechat_claw", { method: "PUT", body: JSON.stringify({ payload: payload() }) });
+      setLocalResult({
+        success: false,
+        provider: "wechat_claw",
+        mode: "real",
+        message: "WeChat claw iLink 草稿已保存。",
+        explanation: "iLink 地址、默认目标、管理员白名单和轮询超时已保存。启用前请先测试。",
+        next_step: "测试并启用后点击刷新二维码，用微信扫码绑定。",
+      });
+      onChanged();
+      await setup.reload();
+    } catch (err) {
+      setLocalError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function saveAndTest() {
+    setBusy("test");
+    setLocalError("");
+    try {
+      const updated = await api<any>("/api/admin/integrations/wechat_claw/test", { method: "POST", body: JSON.stringify({ payload: payload() }) });
+      setLocalResult(updated.last_test_result);
+      onChanged();
+      await setup.reload();
+    } catch (err) {
+      setLocalError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function toggleEnabled() {
+    setBusy("enable");
+    setLocalError("");
+    try {
+      await api(`/api/admin/integrations/wechat_claw${provider.enabled ? "/disable" : "/enable"}`, { method: "POST" });
+      onChanged();
+      await setup.reload();
+    } catch (err) {
+      setLocalError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  function generateToken() {
+    const bytes = new Uint8Array(24);
+    window.crypto?.getRandomValues(bytes);
+    const token = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    updateField("inbound_token", token || Math.random().toString(36).slice(2));
+  }
+
+  const setupPayload = setup.data?.qr_payload ?? {};
+  const qrText = String(setup.data?.qr_text || "");
+  const qrcode = setup.data?.qrcode ?? {};
+  const qrReady = Boolean(qrcode.qrcode_url || setupPayload.qrcode_url);
+  const interactions: WechatClawInteraction[] = Array.isArray(setup.data?.recent_interactions) ? setup.data.recent_interactions : [];
+  const loginStatus = setup.data?.connected ? "已登录" : provider.enabled ? "等待扫码" : "未启用";
+
+  async function refreshQrcode() {
+    setBusy("refresh");
+    setLocalError("");
+    try {
+      await api("/api/admin/wechat-claw/refresh", { method: "POST" });
+      await setup.reload();
+    } catch (err) {
+      setLocalError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function logoutWechat() {
+    setBusy("logout");
+    setLocalError("");
+    try {
+      await api("/api/admin/wechat-claw/logout", { method: "POST" });
+      await setup.reload();
+    } catch (err) {
+      setLocalError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function pollOnce() {
+    setBusy("poll");
+    setLocalError("");
+    try {
+      await api("/api/admin/wechat-claw/poll", { method: "POST" });
+      await setup.reload();
+    } catch (err) {
+      setLocalError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <Panel title="WeChat claw 配置">
+      <div className="integration wechat-config">
+        <div className={`notice ${setup.data?.connected ? "success" : "info"}`}>
+          <strong>iLink 扫码登录</strong>
+          <span>和 MoviePilot 一样，NAS 主动长轮询 iLink 服务收微信消息，不需要公网 IP。扫码绑定后可从微信发起资源查询、下载通知记录和各板块状态查询。</span>
+        </div>
+
+        <div className="settings-grid">
+          <label>名称
+            <CopyableInput value={form.name} onChange={(value) => updateField("name", value)} placeholder="通知1" />
+          </label>
+          <label>iLink 地址
+            <CopyableInput value={form.base_url} onChange={(value) => updateField("base_url", value)} placeholder="https://ilinkai.weixin.qq.com" inputMode="url" />
+          </label>
+          <label>默认通知目标
+            <CopyableInput value={form.default_target} onChange={(value) => updateField("default_target", value)} placeholder="可填用户 userid；留空发给最近互动用户" />
+          </label>
+          <label>管理员白名单
+            <CopyableInput value={form.admin_user_ids} onChange={(value) => updateField("admin_user_ids", value)} placeholder="多个 userid 用英文逗号分隔" />
+          </label>
+          <label>默认下载器
+            <select value={form.default_downloader_id} onChange={(event) => updateField("default_downloader_id", event.target.value as WechatClawForm["default_downloader_id"])}>
+              <option value="all">自动 / 全部</option>
+              <option value="qb1">qB1</option>
+              <option value="qb2">qB2</option>
+              <option value="qb3">qB3</option>
+            </select>
+          </label>
+          <label>轮询超时（秒）
+            <CopyableInput value={form.poll_timeout} onChange={(value) => updateField("poll_timeout", value)} inputMode="numeric" placeholder="25" />
+          </label>
+        </div>
+
+        <div className="wechat-setup-card">
+          <div className="wechat-setup-main">
+            <div className="wechat-status-line">
+              <span>配置状态</span>
+              <strong>{loginStatus}</strong>
+            </div>
+            {qrReady ? <WechatClawQrCode value={qrText} /> : (
+              <div className="wechat-qr-placeholder">
+                <Lock size={24} />
+                <span>保存并测试后点击刷新二维码</span>
+              </div>
+            )}
+            <div className="actions compact-actions">
+              <button type="button" onClick={refreshQrcode} disabled={busy !== "" || !provider.enabled}>{busy === "refresh" ? "刷新中..." : "刷新二维码"}</button>
+              <button type="button" onClick={pollOnce} disabled={busy !== "" || !setup.data?.connected}>{busy === "poll" ? "轮询中..." : "轮询一次"}</button>
+              <button type="button" onClick={logoutWechat} disabled={busy !== "" || !setup.data?.connected}>{busy === "logout" ? "退出中..." : "退出登录"}</button>
+            </div>
+          </div>
+
+          <div className="wechat-setup-side">
+            <div className="field-help compact-help">
+              <strong>iLink 状态</strong>
+              <span>服务：<code>{setup.data?.base_url || form.base_url}</code></span>
+              <span>账号：<code>{setup.data?.account_id || "-"}</code></span>
+              <span>二维码状态：<code>{qrcode.status || "waiting"}</code></span>
+            </div>
+            <div className="wechat-interactions">
+              <div className="wechat-interactions-head">
+                <strong>最近互动用户</strong>
+                <small>{interactions.length ? `${interactions.length} 条` : "暂无记录"}</small>
+              </div>
+              {interactions.length > 0 ? interactions.map((item, index) => (
+                <div className="wechat-interaction-item" key={`${item.created_at || index}-${item.user_id || "user"}`}>
+                  <strong>{item.user_id || "unknown"} <span>{item.action || "message"}{item.target ? ` / ${item.target}` : ""}</span></strong>
+                  <p>{item.message}</p>
+                  <small>{item.created_at ? new Date(item.created_at).toLocaleString() : ""}</small>
+                </div>
+              )) : <p className="muted">扫码后，手机端首次发消息会出现在这里。</p>}
+            </div>
+          </div>
+        </div>
+
+        <div className="actions">
+          <button onClick={saveDraft} disabled={busy !== ""}>{busy === "draft" ? "正在保存..." : "保存草稿"}</button>
+          <button className="primary" onClick={saveAndTest} disabled={busy !== ""}>{busy === "test" ? "正在测试..." : "保存并测试"}</button>
+          <button onClick={toggleEnabled} disabled={busy !== "" || (!provider.enabled && !canEnable)}>{provider.enabled ? "停用" : "启用"}</button>
+        </div>
+        {!provider.enabled && !canEnable && <p className="muted">请先保存并测试，测试成功后再启用 WeChat claw。</p>}
+        {setup.error && <p className="error">{setup.error}</p>}
+        {localError && <p className="error">{localError}</p>}
+        <TestResultCard result={result} emptyProvider="WeChat claw" />
+      </div>
+    </Panel>
+  );
+}
+
+function LegacyWechatClawIntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
+  const saved = provider.saved_payload ?? {};
+  const [form, setForm] = useState<WechatClawForm>({
+    mode: saved.mode === "direct" ? "direct" : "ilink",
+    name: String(saved.name ?? "通知1"),
+    base_url: String(saved.base_url ?? "https://ilinkai.weixin.qq.com"),
+    default_target: String(saved.default_target ?? ""),
+    admin_user_ids: String(saved.admin_user_ids ?? ""),
+    poll_timeout: String(saved.poll_timeout ?? saved.timeout ?? "25"),
+    public_base_url: String(saved.public_base_url ?? ""),
+    inbound_token: String(saved.inbound_token ?? ""),
+    webhook_url: String(saved.webhook_url ?? ""),
+    webhook_secret: String(saved.webhook_secret ?? ""),
+    default_downloader_id: ["qb1", "qb2", "qb3", "all"].includes(saved.default_downloader_id) ? saved.default_downloader_id : "all",
+    timeout: String(saved.timeout ?? "10"),
+  });
+  const [busy, setBusy] = useState("");
+  const [localError, setLocalError] = useState("");
+  const [localResult, setLocalResult] = useState<IntegrationTestResult | null>(provider.last_test_result);
+  const result = localResult ?? provider.last_test_result;
+  const canEnable = result?.provider === "wechat_claw" && result?.success === true && result?.can_enable === true;
+
+  function updateField<K extends keyof WechatClawForm>(key: K, value: WechatClawForm[K]) {
+    setForm((current) => ({ ...current, [key]: value }));
+  }
+
+  function payload() {
+    return {
+      public_base_url: form.public_base_url.trim(),
+      inbound_token: form.inbound_token.trim(),
+      webhook_url: form.webhook_url.trim(),
+      webhook_secret: form.webhook_secret.trim(),
+      default_downloader_id: form.default_downloader_id,
+      timeout: Number(form.timeout) || 10,
+    };
+  }
+
+  async function saveDraft() {
+    setBusy("draft");
+    setLocalError("");
+    try {
+      await api(`/api/admin/integrations/wechat_claw`, { method: "PUT", body: JSON.stringify({ payload: payload() }) });
+      setLocalResult({
+        success: false,
+        provider: "wechat_claw",
+        mode: "real",
+        message: "WeChat claw 草稿已保存。",
+        explanation: "入口密钥和 webhook secret 已加密保存。启用前请先测试。",
+        next_step: "确认公网或局域网手机可访问地址后，点击保存并测试。",
+      });
+      onChanged();
+    } catch (err) {
+      setLocalError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function saveAndTest() {
+    setBusy("test");
+    setLocalError("");
+    try {
+      const updated = await api<any>(`/api/admin/integrations/wechat_claw/test`, { method: "POST", body: JSON.stringify({ payload: payload() }) });
+      setLocalResult(updated.last_test_result);
+      onChanged();
+    } catch (err) {
+      setLocalError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function toggleEnabled() {
+    setBusy("enable");
+    setLocalError("");
+    try {
+      await api(`/api/admin/integrations/wechat_claw${provider.enabled ? "/disable" : "/enable"}`, { method: "POST" });
+      onChanged();
+    } catch (err) {
+      setLocalError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  const publicBaseUrl = form.public_base_url.trim().replace(/\/+$/, "");
+  const endpoint = publicBaseUrl ? `${publicBaseUrl}/api/wechat-claw/message` : "/api/wechat-claw/message";
+  const capabilitiesEndpoint = publicBaseUrl ? `${publicBaseUrl}/api/wechat-claw/capabilities` : "/api/wechat-claw/capabilities";
+
+  return (
+    <Panel title="WeChat claw 配置">
+      <div className="integration tmdb-editor">
+        <div className="notice info">
+          <strong>手机端 AI 对话与通知入口</strong>
+          <span>WeChat claw 调用后端入口后，会复用 DeepSeek 配置完成自然语言资源查询、下载通知记录和各板块状态查询。公开访问地址可以是内网穿透、反向代理或手机能访问的局域网地址。</span>
+        </div>
+        <div className="settings-grid">
+          <label>APP 公开访问地址
+            <CopyableInput value={form.public_base_url} onChange={(value) => updateField("public_base_url", value)} placeholder="例如 https://media.example.com 或 http://192.168.1.20:8000" inputMode="url" />
+          </label>
+          <label>Inbound token
+            <SecretInput value={form.inbound_token} onChange={(value) => updateField("inbound_token", value)} placeholder="手机端调用 /api/wechat-claw/message 时携带" autoComplete="off" />
+          </label>
+          <label>Webhook URL（可选）
+            <CopyableInput value={form.webhook_url} onChange={(value) => updateField("webhook_url", value)} placeholder="WeChat claw 接收主动通知的 webhook" inputMode="url" />
+          </label>
+          <label>Webhook secret（可选）
+            <SecretInput value={form.webhook_secret} onChange={(value) => updateField("webhook_secret", value)} placeholder="作为 X-Wechat-Claw-Secret 发送" autoComplete="off" />
+          </label>
+          <label>默认下载器
+            <select value={form.default_downloader_id} onChange={(event) => updateField("default_downloader_id", event.target.value as WechatClawForm["default_downloader_id"])}>
+              <option value="all">自动 / 全部</option>
+              <option value="qb1">qB1</option>
+              <option value="qb2">qB2</option>
+              <option value="qb3">qB3</option>
+            </select>
+          </label>
+          <label>超时秒数
+            <CopyableInput value={form.timeout} onChange={(value) => updateField("timeout", value)} inputMode="numeric" placeholder="10" />
+          </label>
+        </div>
+        <div className="field-help">
+          <strong>手机端请求地址</strong>
+          <span><code>{endpoint}</code></span>
+          <span>Capabilities: <code>{capabilitiesEndpoint}</code></span>
+          <span>请求头携带 <code>X-Wechat-Claw-Token</code>，请求体使用 <code>{`{"message":"帮我查一下 qB 状态"}`}</code>。</span>
+        </div>
+        <div className="actions">
+          <button onClick={saveDraft} disabled={busy !== ""}>{busy === "draft" ? "正在保存..." : "保存草稿"}</button>
+          <button className="primary" onClick={saveAndTest} disabled={busy !== ""}>{busy === "test" ? "正在测试..." : "保存并测试"}</button>
+          <button onClick={toggleEnabled} disabled={busy !== "" || (!provider.enabled && !canEnable)}>{provider.enabled ? "停用" : "启用"}</button>
+        </div>
+        {!provider.enabled && !canEnable && <p className="muted">请先保存并测试，测试成功后再启用 WeChat claw。</p>}
+        {localError && <p className="error">{localError}</p>}
+        <TestResultCard result={result} emptyProvider="WeChat claw" />
       </div>
     </Panel>
   );

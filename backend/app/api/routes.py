@@ -25,6 +25,7 @@ from app.adapters.mteam import MTeamAdapter, MTeamApiError, MTeamConfigError
 from app.adapters.qbittorrent import QbittorrentApiError, QbittorrentConfigError, QbittorrentWebAdapter
 from app.adapters.tmdb import TmdbAdapter
 from app.adapters.tmdb.client import DEFAULT_TMDB_PROXY_URL, TmdbConfigError, TmdbDohError, TmdbImageError, open_tmdb_network_request
+from app.adapters.wechat_claw import WechatClawAdapter, WechatClawApiError, WechatClawConfigError
 from app.api.deps import get_current_user, has_qb2_grant, require_admin
 from app.auth.security import create_access_token, decode_token, hash_password, verify_password
 from app.config.settings import get_settings
@@ -102,6 +103,51 @@ class AssistantChatRequest(BaseModel):
 class AssistantExecuteRequest(BaseModel):
     intent: dict[str, Any] = Field(default_factory=dict)
     message: str = ""
+
+
+class NotificationPreferencesPayload(BaseModel):
+    preferences: dict[str, bool] = Field(default_factory=dict)
+
+
+class WechatClawMessageRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+    user_id: str = ""
+    conversation_id: str = ""
+
+
+DEFAULT_NOTIFICATION_PREFERENCES: dict[str, bool] = {
+    "download_started": True,
+    "download_completed": True,
+    "resource_search": False,
+    "status_query": False,
+    "wechat_claw_push": True,
+}
+
+NOTIFICATION_PREFERENCES_KEY = "notification.preferences"
+WECHAT_CLAW_INTERACTIONS_KEY = "wechat_claw.interactions"
+WECHAT_CLAW_ILINK_STATE_KEY = "wechat_claw.ilink_state"
+WECHAT_CLAW_INTERACTION_LIMIT = 20
+
+WECHAT_CLAW_MOBILE_SECTIONS: list[dict[str, Any]] = [
+    {"key": "discover", "label": "发现", "description": "TMDB 趋势、热门、筛选和 M-Team 搜索入口。"},
+    {"key": "dashboard", "label": "仪表盘", "description": "M-Team、qB 下载器、NAS 空间总览。"},
+    {"key": "downloads", "label": "下载", "description": "qB1/qB2/qB3 下载任务状态与操作入口。"},
+    {"key": "notifications", "label": "通知", "description": "通知中心、AI 助手和通知偏好。"},
+    {"key": "settings", "label": "设置", "description": "M-Team、qB、TMDB、AI、WeChat claw 等运行配置。"},
+    {"key": "diagnostics", "label": "诊断", "description": "管理员诊断健康检查与脱敏导出。"},
+]
+
+WECHAT_CLAW_CAPABILITIES: list[dict[str, Any]] = [
+    {"action": "resource_search", "label": "资源查询", "examples": ["帮我搜一下沙丘 2160p", "查 M-Team 上有没有周处除三害"]},
+    {"action": "download_started", "label": "下载开始通知", "examples": ["记录一下沙丘已经开始下载"]},
+    {"action": "download_completed", "label": "下载完成通知", "examples": ["沙丘下载完成了，提醒我"]},
+    {
+        "action": "status_query",
+        "label": "状态查询",
+        "targets": ["dashboard", "mteam", "qb", "downloads", "notifications", "stats", "diagnostics", "discover"],
+        "examples": ["qB1 现在速度多少", "查一下仪表盘状态", "诊断模块是否正常"],
+    },
+]
 
 
 def bytes_label(value: float, digits: int = 1) -> str:
@@ -820,6 +866,345 @@ def execute_assistant_intent(db: Session, intent: dict[str, Any], message: str, 
     raise HTTPException(status_code=400, detail="不支持的 AI 指令。")
 
 
+def get_wechat_claw_adapter_or_error(db: Session) -> WechatClawAdapter:
+    row = get_config(db, "wechat_claw")
+    if not row or not row.encrypted_payload:
+        raise HTTPException(status_code=409, detail="请先在设置中配置 WeChat claw。")
+    if not row.enabled:
+        raise HTTPException(status_code=409, detail="WeChat claw 尚未启用，请先在设置中测试并启用。")
+    try:
+        config = get_decrypted_config(db, "wechat_claw") or {}
+        state = get_wechat_claw_ilink_state(db)
+        return WechatClawAdapter(wechat_claw_config_with_state(config, state))
+    except WechatClawConfigError as exc:
+        raise HTTPException(status_code=409, detail=f"WeChat claw 配置不完整：{exc}") from exc
+
+
+def get_notification_preferences(db: Session) -> dict[str, bool]:
+    row = db.query(Setting).filter(Setting.key == NOTIFICATION_PREFERENCES_KEY).one_or_none()
+    value = row.value if row and isinstance(row.value, dict) else {}
+    merged = dict(DEFAULT_NOTIFICATION_PREFERENCES)
+    for key in DEFAULT_NOTIFICATION_PREFERENCES:
+        if key in value:
+            merged[key] = bool(value[key])
+    return merged
+
+
+def save_notification_preferences(db: Session, preferences: dict[str, bool]) -> dict[str, bool]:
+    current = get_notification_preferences(db)
+    normalized = {
+        key: bool(preferences.get(key, current[key]))
+        for key in DEFAULT_NOTIFICATION_PREFERENCES
+    }
+    row = db.query(Setting).filter(Setting.key == NOTIFICATION_PREFERENCES_KEY).one_or_none()
+    if row is None:
+        row = Setting(key=NOTIFICATION_PREFERENCES_KEY, value=normalized)
+        db.add(row)
+    else:
+        row.value = normalized
+        row.updated_at = datetime.utcnow()
+    db.commit()
+    return normalized
+
+
+def get_wechat_claw_recent_interactions(db: Session) -> list[dict[str, Any]]:
+    row = db.query(Setting).filter(Setting.key == WECHAT_CLAW_INTERACTIONS_KEY).one_or_none()
+    value = row.value if row and isinstance(row.value, dict) else {}
+    items = value.get("items") if isinstance(value, dict) else []
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)][:WECHAT_CLAW_INTERACTION_LIMIT]
+
+
+def get_wechat_claw_ilink_state(db: Session) -> dict[str, Any]:
+    row = db.query(Setting).filter(Setting.key == WECHAT_CLAW_ILINK_STATE_KEY).one_or_none()
+    return row.value if row and isinstance(row.value, dict) else {}
+
+
+def save_wechat_claw_ilink_state(db: Session, state: dict[str, Any]) -> dict[str, Any]:
+    row = db.query(Setting).filter(Setting.key == WECHAT_CLAW_ILINK_STATE_KEY).one_or_none()
+    if row is None:
+        row = Setting(key=WECHAT_CLAW_ILINK_STATE_KEY, value=state)
+        db.add(row)
+    else:
+        row.value = state
+        row.updated_at = datetime.utcnow()
+    db.commit()
+    return state
+
+
+def update_wechat_claw_ilink_state(db: Session, **kwargs: Any) -> dict[str, Any]:
+    state = get_wechat_claw_ilink_state(db)
+    state.update({key: value for key, value in kwargs.items() if value is not None})
+    return save_wechat_claw_ilink_state(db, state)
+
+
+def clear_wechat_claw_ilink_state(db: Session) -> dict[str, Any]:
+    return save_wechat_claw_ilink_state(db, {"qrcode": {}, "known_targets": {}})
+
+
+def wechat_claw_config_with_state(config: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(config)
+    merged.update(
+        {
+            "bot_token": state.get("bot_token"),
+            "account_id": state.get("account_id"),
+            "sync_buf": state.get("sync_buf"),
+            "known_targets": state.get("known_targets") or {},
+            "base_url": state.get("base_url") or config.get("base_url"),
+        }
+    )
+    return merged
+
+
+def trim_wechat_claw_text(value: Any, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit - 1]}…"
+
+
+def wechat_claw_qr_payload(config: dict[str, Any]) -> dict[str, Any]:
+    try:
+        timeout = int(config.get("poll_timeout") or config.get("timeout") or 25)
+    except (TypeError, ValueError):
+        timeout = 25
+    qrcode = config.get("qrcode") if isinstance(config.get("qrcode"), dict) else {}
+    return {
+        "type": "pt-media-hub.wechat-claw",
+        "version": 1,
+        "name": "PT Media Hub",
+        "mode": str(config.get("mode") or "ilink"),
+        "base_url": str(config.get("base_url") or "https://ilinkai.weixin.qq.com").rstrip("/"),
+        "qrcode": qrcode.get("qrcode"),
+        "qrcode_url": qrcode.get("qrcode_url"),
+        "qrcode_status": qrcode.get("status"),
+        "default_downloader_id": str(config.get("default_downloader_id") or "all"),
+        "default_target": str(config.get("default_target") or ""),
+        "timeout": timeout,
+    }
+
+
+def build_wechat_claw_setup(db: Session) -> dict[str, Any]:
+    row = get_config(db, "wechat_claw")
+    config = get_decrypted_config(db, "wechat_claw") or {}
+    state = get_wechat_claw_ilink_state(db)
+    qrcode = state.get("qrcode") if isinstance(state.get("qrcode"), dict) else {}
+    qr_payload = wechat_claw_qr_payload({**config, **state, "qrcode": qrcode})
+    return {
+        "configured": bool(row and row.encrypted_payload),
+        "enabled": bool(row and row.enabled),
+        "mode": str(config.get("mode") or "ilink"),
+        "connected": bool(state.get("bot_token")),
+        "account_id": state.get("account_id"),
+        "base_url": state.get("base_url") or config.get("base_url") or "https://ilinkai.weixin.qq.com",
+        "config_version": row.config_version if row else 0,
+        "last_test_result": row.last_test_result if row else None,
+        "qr_payload": qr_payload,
+        "qr_text": qrcode.get("qrcode_url") or json.dumps(qr_payload, ensure_ascii=False, separators=(",", ":")),
+        "qrcode": qrcode,
+        "known_targets": state.get("known_targets") or {},
+        "mobile_sections": WECHAT_CLAW_MOBILE_SECTIONS,
+        "capabilities": WECHAT_CLAW_CAPABILITIES,
+        "recent_interactions": get_wechat_claw_recent_interactions(db),
+    }
+
+
+def record_wechat_claw_interaction(
+    db: Session,
+    request: WechatClawMessageRequest,
+    intent: dict[str, Any],
+    result: dict[str, Any],
+    reply: str,
+) -> dict[str, Any]:
+    action = str(intent.get("action") or "")
+    target = str(intent.get("target") or intent.get("downloader_id") or result.get("target") or "")
+    item = {
+        "user_id": trim_wechat_claw_text(request.user_id or "unknown", 120),
+        "conversation_id": trim_wechat_claw_text(request.conversation_id, 120),
+        "message": trim_wechat_claw_text(request.message, 240),
+        "reply": trim_wechat_claw_text(reply, 360),
+        "action": action,
+        "target": target,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    current = get_wechat_claw_recent_interactions(db)
+    row = db.query(Setting).filter(Setting.key == WECHAT_CLAW_INTERACTIONS_KEY).one_or_none()
+    value = {"items": [item, *current][:WECHAT_CLAW_INTERACTION_LIMIT]}
+    if row is None:
+        row = Setting(key=WECHAT_CLAW_INTERACTIONS_KEY, value=value)
+        db.add(row)
+    else:
+        row.value = value
+        row.updated_at = datetime.utcnow()
+    db.commit()
+    state = get_wechat_claw_ilink_state(db)
+    known_targets = state.get("known_targets") if isinstance(state.get("known_targets"), dict) else {}
+    if item["user_id"] and item["user_id"] != "unknown":
+        known_targets[item["user_id"]] = {
+            "username": item["user_id"],
+            "last_active": int(datetime.utcnow().timestamp()),
+        }
+        update_wechat_claw_ilink_state(db, known_targets=known_targets)
+    return item
+
+
+def push_wechat_claw_notification(db: Session, notification: Notification, action: str) -> dict[str, Any]:
+    preferences = get_notification_preferences(db)
+    if not preferences.get("wechat_claw_push", True):
+        return {"sent": False, "reason": "disabled_by_preferences"}
+    row = get_config(db, "wechat_claw")
+    if not row or not row.enabled or not row.encrypted_payload:
+        return {"sent": False, "reason": "wechat_claw_not_enabled"}
+    try:
+        config = get_decrypted_config(db, "wechat_claw") or {}
+        state = get_wechat_claw_ilink_state(db)
+        adapter = WechatClawAdapter(wechat_claw_config_with_state(config, state))
+        return adapter.send_message(
+            {
+                "type": action,
+                "title": notification.title,
+                "message": notification.message,
+                "level": notification.level,
+                "source": notification.source,
+                "notification_id": notification.id,
+                "created_at": notification.created_at.isoformat() if notification.created_at else None,
+            }
+        )
+    except (WechatClawConfigError, WechatClawApiError) as exc:
+        return {"sent": False, "reason": str(exc), "http_status": getattr(exc, "http_status", None)}
+
+
+def format_assistant_result_v2(intent: dict[str, Any], result: dict[str, Any]) -> str:
+    action = intent.get("action")
+    if action == "resource_search":
+        items = result.get("items") or []
+        if not items:
+            return "【资源查询】\n没有找到匹配的 M-Team 资源。"
+        lines = ["【资源查询】", f"找到 {len(items)} 个资源。", "", "结果"]
+        for index, item in enumerate(items[:5], 1):
+            lines.append(f"- {index}. {item.get('title') or item.get('name') or '-'} / {item.get('resolution') or '-'} / {item.get('size') or '-'} / 做种 {item.get('seeders', 0)} / ID {item.get('id') or '-'}")
+        return "\n".join(lines)
+    if action in {"download_started", "download_completed"}:
+        label = "下载开始" if action == "download_started" else "下载完成"
+        notification = result.get("notification") or {}
+        if result.get("notification_skipped"):
+            return f"【{label}】\n已按通知偏好跳过通知中心记录。"
+        lines = [f"【{label}】", f"已记录通知：{notification.get('title', label)}", f"通知 ID：{notification.get('id', '-')}"]
+        push = result.get("wechat_claw_push") or {}
+        if push:
+            lines.append(f"WeChat claw：{'已推送' if push.get('sent') else push.get('reason', '未推送')}")
+        return "\n".join(lines)
+    if action == "status_query":
+        if result.get("target") == "stats":
+            series = result.get("series") or []
+            return f"【统计状态】\n可用区间：{', '.join(result.get('ranges') or [])}\n最近样本：{len(series)} 条"
+        if result.get("target") == "diagnostics":
+            modules = result.get("modules") or []
+            failed = [item for item in modules if item.get("status") == "failed"]
+            return f"【诊断状态】\n模块数：{len(modules)}\n异常：{len(failed)}"
+        if result.get("target") == "discover":
+            return f"【发现页状态】\n已配置：{'是' if result.get('configured') else '否'}\n已启用：{'是' if result.get('enabled') else '否'}\n{result.get('message') or ''}".strip()
+        if result.get("target") == "mteam":
+            data = result.get("mteam") or result
+            return f"【M-Team 状态】\n等级：{data.get('user_level', '-')}\n分享率：{data.get('ratio', 0)}\n做种：{data.get('seed_count', 0)}"
+        if result.get("target") in {"qb", "downloads"}:
+            qbs = result.get("qbs") or []
+            if qbs:
+                lines = ["【qB 状态】"]
+                lines.extend(f"- {item.get('name') or item.get('id')}：下载 {bytes_label(item.get('download_speed') or 0)}/s，上传 {bytes_label(item.get('upload_speed') or 0)}/s，任务 {item.get('active_downloads', 0)}" for item in qbs)
+                return "\n".join(lines)
+        overview = result.get("overview") or {}
+        return f"【总览状态】\n下载：{bytes_label(overview.get('total_download_speed') or 0)}/s\n上传：{bytes_label(overview.get('total_upload_speed') or 0)}/s\n活动下载：{overview.get('download_tasks', 0)}\nNAS：{overview.get('nas_space_label') or '-'}"
+    return "【处理结果】\n请求已处理。"
+
+
+def attach_optional_assistant_notification(db: Session, intent: dict[str, Any], result: dict[str, Any], title: str, level: str = "info") -> dict[str, Any]:
+    action = str(intent.get("action") or "")
+    if not get_notification_preferences(db).get(action, False):
+        return result
+    detail = format_assistant_result_v2(intent, result)
+    row = Notification(title=title[:200], message=detail, level=level, source="ai")
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    updated = dict(result)
+    updated["notification"] = {
+        "id": row.id,
+        "title": row.title,
+        "message": row.message,
+        "level": row.level,
+        "source": row.source,
+        "created_at": row.created_at.isoformat(),
+    }
+    updated["wechat_claw_push"] = push_wechat_claw_notification(db, row, action)
+    return updated
+
+
+def execute_assistant_intent_v2(db: Session, intent: dict[str, Any], message: str, user: User) -> dict[str, Any]:
+    action = str(intent.get("action") or "")
+    if action == "status_query":
+        target = str(intent.get("target") or "dashboard")
+        if target == "stats":
+            result = {"action": action, "target": target, **stats(user, db)}
+            return attach_optional_assistant_notification(db, intent, result, "状态查询：统计")
+        if target == "diagnostics":
+            if user.role != "admin":
+                raise HTTPException(status_code=403, detail="诊断状态需要管理员权限。")
+            result = {"action": action, "target": target, **diagnostics_health(user, db)}
+            return attach_optional_assistant_notification(db, intent, result, "状态查询：诊断")
+        if target == "discover":
+            row = get_config(db, "tmdb")
+            result = {
+                "action": action,
+                "target": target,
+                "configured": bool(row and row.redacted_summary),
+                "enabled": bool(row and row.enabled),
+                "last_test_result": row.last_test_result if row else None,
+                "message": "发现页使用 TMDB 配置获取趋势、热门和筛选内容。",
+            }
+            return attach_optional_assistant_notification(db, intent, result, "状态查询：发现页")
+        result = execute_assistant_intent(db, intent, message, user)
+        return attach_optional_assistant_notification(db, intent, result, "状态查询")
+
+    if action == "resource_search":
+        result = execute_assistant_intent(db, intent, message, user)
+        query = str(intent.get("query") or "").strip()
+        title = f"资源查询：{query}" if query else "资源查询"
+        return attach_optional_assistant_notification(db, intent, result, title)
+
+    if action in {"download_started", "download_completed"}:
+        title = "下载已开始" if action == "download_started" else "下载已完成"
+        detail = str(intent.get("message") or message or "").strip() or title
+        if not get_notification_preferences(db).get(action, True):
+            return {
+                "action": action,
+                "notification_skipped": True,
+                "reason": "disabled_by_preferences",
+                "title": title,
+                "message": detail,
+            }
+        row = Notification(title=title, message=detail, level="info" if action == "download_started" else "success", source="ai")
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        push_result = push_wechat_claw_notification(db, row, action)
+        return {
+            "action": action,
+            "notification": {
+                "id": row.id,
+                "title": row.title,
+                "message": row.message,
+                "level": row.level,
+                "source": row.source,
+                "created_at": row.created_at.isoformat(),
+            },
+            "wechat_claw_push": push_result,
+        }
+
+    raise HTTPException(status_code=400, detail="不支持的 AI 指令。")
+
+
 def empty_mteam_stats(message: str = "请先在设置中启用 M-Team。") -> dict[str, Any]:
     return {
         "user_level": "-",
@@ -1281,6 +1666,40 @@ def test_integration(provider: str, request: IntegrationPayload | None = None, u
         except Exception as exc:
             result = classify_ai_test_error(exc, test_trace_id)
         result["config_version"] = row.config_version if row else 0
+    elif provider == "wechat_claw":
+        config = get_decrypted_config(db, provider) or {}
+        try:
+            detail = WechatClawAdapter(config).test_connection()
+            result = {
+                "success": True,
+                "provider": "wechat_claw",
+                "mode": "real",
+                "http_status": 200,
+                "duration_ms": 0,
+                "message": "WeChat claw iLink 配置可用。",
+                "explanation": "当前模式通过 iLink 长轮询接收微信消息，不需要 NAS 拥有公网 IP。",
+                "next_step": "启用后点击刷新二维码，用微信扫码绑定；绑定后可轮询测试消息速度。",
+                "error_type": None,
+                "can_enable": True,
+                "trace_id": test_trace_id,
+                "detail": detail,
+                "config_version": row.config_version if row else 0,
+            }
+        except WechatClawConfigError as exc:
+            result = {
+                "success": False,
+                "provider": "wechat_claw",
+                "mode": "real",
+                "http_status": None,
+                "duration_ms": 0,
+                "message": "WeChat claw 配置不完整。",
+                "explanation": str(exc),
+                "next_step": "请检查 iLink 地址，默认通常使用 https://ilinkai.weixin.qq.com。",
+                "error_type": "missing_required_fields",
+                "can_enable": False,
+                "trace_id": test_trace_id,
+                "config_version": row.config_version if row else 0,
+            }
     else:
         result = mock_test_result(provider, test_trace_id, row)
     return serialize_config(record_test_result(db, provider, result, actor_user_id=user.id))
@@ -1315,6 +1734,11 @@ def enable_integration(provider: str, user: User = Depends(require_admin), db: S
         result = row.last_test_result if row else None
         if not result or result.get("provider") != "ai" or result.get("mode") != "real" or result.get("success") is not True or result.get("can_enable") is not True:
             raise HTTPException(status_code=409, detail="请先保存并测试 DeepSeek，确认 AI 模块可用后再启用。")
+    if provider == "wechat_claw":
+        row = get_config(db, provider)
+        result = row.last_test_result if row else None
+        if not result or result.get("provider") != "wechat_claw" or result.get("success") is not True or result.get("can_enable") is not True:
+            raise HTTPException(status_code=409, detail="请先保存并测试 WeChat claw，确认手机端入口配置可用后再启用。")
     return serialize_config(set_enabled(db, provider, True, actor_user_id=user.id))
 
 
@@ -1909,11 +2333,11 @@ def stats(_: User = Depends(get_current_user), db: Session = Depends(get_db)) ->
 @router.post("/assistant/execute")
 def assistant_execute(request: AssistantExecuteRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     intent = request.intent
-    result = execute_assistant_intent(db, intent, request.message, user)
+    result = execute_assistant_intent_v2(db, intent, request.message, user)
     return {
         "intent": intent,
         "result": result,
-        "reply": format_assistant_result(intent, result),
+        "reply": format_assistant_result_v2(intent, result),
         "source": "structured_json",
         "handled_at": datetime.utcnow().isoformat(),
     }
@@ -1926,17 +2350,191 @@ def assistant_chat(request: AssistantChatRequest, user: User = Depends(get_curre
         intent = adapter.parse_intent(request.message)
     except AIServiceError as exc:
         raise HTTPException(status_code=502, detail=f"DeepSeek 解析失败：{exc}") from exc
-    result = execute_assistant_intent(db, intent, request.message, user)
+    result = execute_assistant_intent_v2(db, intent, request.message, user)
     try:
         reply = adapter.summarize_result(request.message, intent, result)
     except AIServiceError:
-        reply = format_assistant_result(intent, result)
+        reply = format_assistant_result_v2(intent, result)
     return {
         "intent": intent,
         "result": result,
         "reply": reply,
         "source": "deepseek",
         "handled_at": datetime.utcnow().isoformat(),
+    }
+
+
+@router.get("/notification-preferences")
+def notification_preferences(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    return {"preferences": get_notification_preferences(db), "defaults": DEFAULT_NOTIFICATION_PREFERENCES}
+
+
+@router.put("/notification-preferences")
+def update_notification_preferences(request: NotificationPreferencesPayload, _: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    return {"preferences": save_notification_preferences(db, request.preferences), "defaults": DEFAULT_NOTIFICATION_PREFERENCES}
+
+
+@router.get("/admin/wechat-claw/setup")
+def admin_wechat_claw_setup(
+    refresh_remote: bool = Query(default=True),
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if refresh_remote:
+        config = get_decrypted_config(db, "wechat_claw") or {}
+        state = get_wechat_claw_ilink_state(db)
+        qrcode = state.get("qrcode") if isinstance(state.get("qrcode"), dict) else {}
+        if qrcode.get("qrcode") and not state.get("bot_token"):
+            try:
+                adapter = WechatClawAdapter(wechat_claw_config_with_state(config, state))
+                result = adapter.get_qrcode_status(str(qrcode.get("qrcode")))
+                updated_qrcode = dict(qrcode)
+                updated_qrcode["status"] = result.get("status") or updated_qrcode.get("status") or "waiting"
+                updated_qrcode["updated_at"] = int(datetime.utcnow().timestamp())
+                if result.get("qrcode_url"):
+                    updated_qrcode["qrcode_url"] = result.get("qrcode_url")
+                update_payload: dict[str, Any] = {"qrcode": updated_qrcode}
+                if result.get("token"):
+                    update_payload.update(
+                        {
+                            "bot_token": result.get("token"),
+                            "account_id": result.get("account_id"),
+                            "sync_buf": "",
+                            "base_url": (result.get("base_url") or adapter.base_url).rstrip("/"),
+                        }
+                    )
+                update_wechat_claw_ilink_state(db, **update_payload)
+            except Exception as exc:
+                logger.warning("刷新 WeChat claw iLink 扫码状态失败：%s", exc)
+    return build_wechat_claw_setup(db)
+
+
+@router.post("/admin/wechat-claw/refresh")
+def admin_wechat_claw_refresh(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    config = get_decrypted_config(db, "wechat_claw") or {}
+    adapter = WechatClawAdapter(config)
+    result = adapter.get_qrcode()
+    if not result.get("success"):
+        raise HTTPException(status_code=502, detail=result.get("message") or "获取 iLink 二维码失败")
+    qrcode = {
+        "qrcode": result.get("qrcode"),
+        "qrcode_url": result.get("qrcode_url"),
+        "status": result.get("status") or "waiting",
+        "updated_at": int(datetime.utcnow().timestamp()),
+    }
+    update_wechat_claw_ilink_state(db, qrcode=qrcode, base_url=adapter.base_url)
+    return build_wechat_claw_setup(db)
+
+
+@router.post("/admin/wechat-claw/logout")
+def admin_wechat_claw_logout(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    clear_wechat_claw_ilink_state(db)
+    return build_wechat_claw_setup(db)
+
+
+def require_wechat_claw_token(db: Session, header_token: str | None, query_token: str | None) -> None:
+    config = get_decrypted_config(db, "wechat_claw") or {}
+    expected = str(config.get("inbound_token") or "").strip()
+    provided = str(header_token or query_token or "").strip()
+    if not expected or not provided or provided != expected:
+        raise HTTPException(status_code=401, detail="Invalid WeChat claw token")
+
+
+def assistant_actor_for_wechat_claw(db: Session) -> User:
+    user = db.query(User).filter(User.role == "admin", User.is_active.is_(True)).order_by(User.id.asc()).first()
+    if user is None:
+        user = db.query(User).filter(User.is_active.is_(True)).order_by(User.id.asc()).first()
+    if user is None:
+        raise HTTPException(status_code=409, detail="No active user is available for WeChat claw actions")
+    return user
+
+
+def handle_wechat_claw_text(db: Session, request: WechatClawMessageRequest) -> dict[str, Any]:
+    user = assistant_actor_for_wechat_claw(db)
+    ai_adapter = get_ai_adapter_or_error(db)
+    try:
+        parsed_intent = ai_adapter.parse_intent(request.message)
+    except AIServiceError as exc:
+        raise HTTPException(status_code=502, detail=f"DeepSeek 解析失败：{exc}") from exc
+    result = execute_assistant_intent_v2(db, parsed_intent, request.message, user)
+    try:
+        reply = ai_adapter.summarize_result(request.message, parsed_intent, result)
+    except AIServiceError:
+        reply = format_assistant_result_v2(parsed_intent, result)
+    interaction = record_wechat_claw_interaction(db, request, parsed_intent, result, reply)
+    return {
+        "reply": reply,
+        "intent": parsed_intent,
+        "result": result,
+        "interaction": interaction,
+        "source": "wechat_claw",
+        "conversation_id": request.conversation_id,
+        "handled_at": datetime.utcnow().isoformat(),
+    }
+
+
+@router.post("/wechat-claw/message")
+def wechat_claw_message(
+    request: WechatClawMessageRequest,
+    x_wechat_claw_token: str | None = Header(default=None),
+    token: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    get_wechat_claw_adapter_or_error(db)
+    require_wechat_claw_token(db, x_wechat_claw_token, token)
+    return handle_wechat_claw_text(db, request)
+
+
+@router.post("/admin/wechat-claw/poll")
+def admin_wechat_claw_poll(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    row = get_config(db, "wechat_claw")
+    if not row or not row.enabled:
+        raise HTTPException(status_code=409, detail="WeChat claw 未启用")
+    config = get_decrypted_config(db, "wechat_claw") or {}
+    state = get_wechat_claw_ilink_state(db)
+    adapter = WechatClawAdapter(wechat_claw_config_with_state(config, state))
+    poll_result = adapter.poll_updates(timeout_seconds=int(config.get("poll_timeout") or 25))
+    if poll_result.get("sync_buf") is not None:
+        update_wechat_claw_ilink_state(db, sync_buf=poll_result.get("sync_buf"))
+    handled = []
+    for item in poll_result.get("messages") or []:
+        message = WechatClawMessageRequest(
+            message=str(item.get("text") or ""),
+            user_id=str(item.get("user_id") or ""),
+            conversation_id=str(item.get("message_id") or ""),
+        )
+        if not message.message.strip() or not message.user_id.strip():
+            continue
+        response = handle_wechat_claw_text(db, message)
+        sent = adapter.send_text(message.user_id, response["reply"])
+        handled.append({"user_id": message.user_id, "message_id": message.conversation_id, "reply_sent": sent, "reply": response["reply"]})
+    return {
+        "success": bool(poll_result.get("success")),
+        "raw_count": poll_result.get("raw_count", 0),
+        "handled_count": len(handled),
+        "handled": handled,
+        "message": poll_result.get("message"),
+    }
+
+
+@router.get("/wechat-claw/capabilities")
+def wechat_claw_capabilities(
+    x_wechat_claw_token: str | None = Header(default=None),
+    token: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    adapter = get_wechat_claw_adapter_or_error(db)
+    require_wechat_claw_token(db, x_wechat_claw_token, token)
+    preferences = get_notification_preferences(db)
+    return {
+        "name": "PT Media Hub WeChat claw",
+        "public_base_url": adapter.public_base_url,
+        "mobile_app_url": adapter.public_base_url,
+        "message_endpoint": f"{adapter.public_base_url}/api/wechat-claw/message",
+        "capabilities_endpoint": f"{adapter.public_base_url}/api/wechat-claw/capabilities",
+        "mobile_sections": WECHAT_CLAW_MOBILE_SECTIONS,
+        "capabilities": WECHAT_CLAW_CAPABILITIES,
+        "notification_preferences": preferences,
     }
 
 
