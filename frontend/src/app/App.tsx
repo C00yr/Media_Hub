@@ -122,6 +122,17 @@ type QbForm = {
   default_save_path: string;
 };
 
+type AiForm = {
+  base_url: string;
+  api_key: string;
+  model: string;
+  timeout: string;
+  max_tokens: string;
+  temperature: string;
+  thinking: "enabled" | "disabled";
+  reasoning_effort: "high" | "max";
+};
+
 const navItems: { key: NavKey; label: string; icon: typeof Film; admin?: boolean }[] = [
   { key: "discover", label: "发现", icon: Film },
   { key: "dashboard", label: "仪表盘", icon: Gauge },
@@ -343,7 +354,7 @@ export function App() {
         />
       </main>
       <nav className="bottom-nav">
-        {visibleNav.filter((item) => ["discover", "dashboard", "downloads", "settings", "diagnostics"].includes(item.key)).map((item) => {
+        {visibleNav.filter((item) => ["discover", "dashboard", "downloads", "notifications", "settings", "diagnostics"].includes(item.key)).map((item) => {
           const Icon = item.icon;
           return (
             <button className={active === item.key ? "active" : ""} onClick={() => openNav(item.key)} key={item.key} aria-label={item.label}>
@@ -642,7 +653,7 @@ function DashboardPage({ onOpenDownloader }: { onOpenDownloader?: (downloaderId:
         <section className="metric-grid dashboard-overview">
           <Metric icon={Download} title="总下载速度" value={formatSpeed(data.overview.total_download_speed)} source="" />
           <Metric icon={Upload} title="总上传速度" value={formatSpeed(data.overview.total_upload_speed)} source="" />
-          <Metric icon={Activity} title="活跃上传/下载" value={<ActiveTransferCounts upload={data.overview.upload_tasks ?? 0} download={data.overview.download_tasks ?? 0} />} source={`共 ${(data.overview.upload_tasks ?? 0) + (data.overview.download_tasks ?? 0)} 个活跃任务`} />
+          <Metric icon={Activity} title="活跃上传/下载" value={<ActiveTransferCounts upload={data.overview.upload_tasks ?? 0} download={data.overview.download_tasks ?? 0} />} source="" />
           <StorageMetric overview={data.overview} />
         </section>
         <section className="dashboard-downloaders">
@@ -1819,6 +1830,78 @@ function NotificationsPage() {
   return <Panel title="通知中心"><div className="table-list">{(data?.items ?? []).map((item: any) => <div className="row" key={`${item.title}-${item.created_at}`}><strong>{item.title}</strong><span>{item.message}</span><small>{item.level} / {item.source}</small></div>)}</div></Panel>;
 }
 
+function NotificationsAssistantPage() {
+  const { data, reload } = useLoad<any>(() => api("/api/notifications"), []);
+  const [mode, setMode] = useState<"chat" | "json">("chat");
+  const [message, setMessage] = useState("帮我查一下 qB 下载器状态");
+  const [jsonIntent, setJsonIntent] = useState('{"action":"status_query","target":"dashboard","downloader_id":"all","limit":5}');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [result, setResult] = useState<any | null>(null);
+
+  async function submit(event?: FormEvent) {
+    event?.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const payload = mode === "chat" ? { message } : { message, intent: JSON.parse(jsonIntent) };
+      const endpoint = mode === "chat" ? "/api/assistant/chat" : "/api/assistant/execute";
+      const response = await api<any>(endpoint, { method: "POST", body: JSON.stringify(payload) });
+      setResult(response);
+      if (["download_started", "download_completed"].includes(response.intent?.action)) reload();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="grid-page notifications-page">
+      <Panel title="AI 通知助手">
+        <form className="assistant-box" onSubmit={submit}>
+          <div className="notice info">
+            <strong>通过 DeepSeek 把自然语言转换成后端可执行 JSON</strong>
+            <span>先在设置页填写 DeepSeek API Key、模型名和 base_url。当前支持资源查询、下载开始通知、下载完成通知、各板块状态查询。</span>
+          </div>
+          <div className="segmented compact">
+            <button type="button" className={mode === "chat" ? "active" : ""} onClick={() => setMode("chat")}><MessageSquare size={16} />自然语言</button>
+            <button type="button" className={mode === "json" ? "active" : ""} onClick={() => setMode("json")}><Database size={16} />结构化 JSON</button>
+          </div>
+          {mode === "chat" ? (
+            <label>输入请求
+              <textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder="例如：帮我搜一下沙丘 2160p；qB1 现在下载速度多少；记录下载完成通知" />
+            </label>
+          ) : (
+            <label>后端可执行 JSON
+              <textarea value={jsonIntent} onChange={(event) => setJsonIntent(event.target.value)} />
+            </label>
+          )}
+          <div className="actions">
+            <button className="primary" disabled={busy}>{busy ? "处理中..." : "执行"}</button>
+          </div>
+          {error && <p className="error">{error}</p>}
+          {result && (
+            <div className="assistant-result">
+              <div className="result-card success">
+                <strong>回复</strong>
+                <span>{result.reply}</span>
+              </div>
+              <details>
+                <summary>查看结构化意图与后端结果</summary>
+                <pre>{JSON.stringify({ intent: result.intent, result: result.result }, null, 2)}</pre>
+              </details>
+            </div>
+          )}
+        </form>
+      </Panel>
+      <Panel title="通知中心">
+        <div className="table-list">{(data?.items ?? []).map((item: any) => <div className="row" key={`${item.title}-${item.created_at}`}><strong>{item.title}</strong><span>{item.message}</span><small>{item.level} / {item.source}</small></div>)}</div>
+      </Panel>
+    </div>
+  );
+}
+
 function SettingsPage() {
   const { data, reload } = useLoad<any>(() => api("/api/admin/integrations"), []);
   const storage = useLoad<any>(() => api("/api/admin/storage/status"), []);
@@ -1831,7 +1914,7 @@ function SettingsPage() {
       </Panel>
       <StorageSettingsCard status={storage.data} loading={storage.loading} error={storage.error} />
       {data.providers
-        .filter((provider: any) => ["mteam", "qb1", "qb2", "qb3", "tmdb"].includes(provider.provider))
+        .filter((provider: any) => ["mteam", "qb1", "qb2", "qb3", "tmdb", "ai"].includes(provider.provider))
         .map((provider: any) => <IntegrationEditor provider={provider} onChanged={reload} key={provider.provider} />)}
     </div>
   );
@@ -1873,6 +1956,7 @@ function StorageSettingsCard({ status, loading, error }: { status: any; loading:
 function IntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
   if (provider.provider === "mteam") return <MTeamIntegrationEditor provider={provider} onChanged={onChanged} />;
   if (provider.provider === "tmdb") return <TmdbIntegrationEditor provider={provider} onChanged={onChanged} />;
+  if (provider.provider === "ai") return <AiIntegrationEditor provider={provider} onChanged={onChanged} />;
   if (["qb1", "qb2", "qb3"].includes(provider.provider)) return <QbIntegrationEditor provider={provider} onChanged={onChanged} />;
 
   const providerNames: Record<string, string> = { ai: "AI" };
@@ -1899,6 +1983,145 @@ function IntegrationEditor({ provider, onChanged }: { provider: any; onChanged: 
           <button onClick={() => save("/test")}>保存并测试</button>
           <button onClick={() => save(provider.enabled ? "/disable" : "/enable")}>{provider.enabled ? "停用" : "启用"}</button>
         </div>
+      </div>
+    </Panel>
+  );
+}
+
+function AiIntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
+  const saved = provider.saved_payload ?? {};
+  const [form, setForm] = useState<AiForm>({
+    base_url: String(saved.base_url ?? "https://api.deepseek.com"),
+    api_key: String(saved.api_key ?? ""),
+    model: String(saved.model ?? "deepseek-v4-flash"),
+    timeout: String(saved.timeout ?? "30"),
+    max_tokens: String(saved.max_tokens ?? "1200"),
+    temperature: String(saved.temperature ?? "0.1"),
+    thinking: saved.thinking === "enabled" ? "enabled" : "disabled",
+    reasoning_effort: saved.reasoning_effort === "max" ? "max" : "high",
+  });
+  const [busy, setBusy] = useState("");
+  const [localError, setLocalError] = useState("");
+  const [localResult, setLocalResult] = useState<IntegrationTestResult | null>(provider.last_test_result);
+  const result = localResult ?? provider.last_test_result;
+  const canEnable = result?.provider === "ai" && result?.mode === "real" && result?.success === true;
+
+  function updateField<K extends keyof AiForm>(key: K, value: AiForm[K]) {
+    setForm((current) => ({ ...current, [key]: value }));
+  }
+
+  function payload() {
+    return {
+      base_url: form.base_url.trim() || "https://api.deepseek.com",
+      api_key: form.api_key.trim(),
+      model: form.model.trim() || "deepseek-v4-flash",
+      timeout: Number(form.timeout) || 30,
+      max_tokens: Number(form.max_tokens) || 1200,
+      temperature: Number(form.temperature) || 0.1,
+      thinking: form.thinking,
+      reasoning_effort: form.reasoning_effort,
+    };
+  }
+
+  async function saveDraft() {
+    setBusy("draft");
+    setLocalError("");
+    try {
+      await api(`/api/admin/integrations/ai`, { method: "PUT", body: JSON.stringify({ payload: payload() }) });
+      setLocalResult({
+        success: false,
+        provider: "ai",
+        mode: "real",
+        message: "AI 草稿已保存。",
+        explanation: "DeepSeek 配置已加密保存到后端。启用前请先保存并测试。",
+        next_step: "确认 API Key、模型和余额可用后，点击保存并测试。",
+      });
+      onChanged();
+    } catch (err) {
+      setLocalError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function saveAndTest() {
+    setBusy("test");
+    setLocalError("");
+    try {
+      const updated = await api<any>(`/api/admin/integrations/ai/test`, { method: "POST", body: JSON.stringify({ payload: payload() }) });
+      setLocalResult(updated.last_test_result);
+      onChanged();
+    } catch (err) {
+      setLocalError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function toggleEnabled() {
+    setBusy("enable");
+    setLocalError("");
+    try {
+      await api(`/api/admin/integrations/ai${provider.enabled ? "/disable" : "/enable"}`, { method: "POST" });
+      onChanged();
+    } catch (err) {
+      setLocalError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <Panel title="AI / DeepSeek 配置">
+      <div className="integration tmdb-editor">
+        <div className="notice info">
+          <strong>用于通知页和微信 claw 的自然语言入口</strong>
+          <span>DeepSeek 兼容 OpenAI Chat Completions。推荐 base_url 填 https://api.deepseek.com，模型填 deepseek-v4-flash 或 deepseek-v4-pro；deepseek-chat / deepseek-reasoner 将在 2026-07-24 15:59 UTC 弃用。</span>
+        </div>
+        <div className="settings-grid">
+          <label>DeepSeek base_url
+            <CopyableInput value={form.base_url} onChange={(value) => updateField("base_url", value)} placeholder="https://api.deepseek.com" inputMode="url" />
+          </label>
+          <label>API Key
+            <SecretInput value={form.api_key} onChange={(value) => updateField("api_key", value)} placeholder="从 platform.deepseek.com 创建并复制" autoComplete="off" />
+          </label>
+          <label>模型名称
+            <CopyableInput value={form.model} onChange={(value) => updateField("model", value)} placeholder="deepseek-v4-flash" />
+          </label>
+          <label>超时秒数
+            <CopyableInput value={form.timeout} onChange={(value) => updateField("timeout", value)} inputMode="numeric" placeholder="30" />
+          </label>
+          <label>max_tokens
+            <CopyableInput value={form.max_tokens} onChange={(value) => updateField("max_tokens", value)} inputMode="numeric" placeholder="1200" />
+          </label>
+          <label>temperature
+            <CopyableInput value={form.temperature} onChange={(value) => updateField("temperature", value)} inputMode="decimal" placeholder="0.1" />
+          </label>
+          <label>Thinking 模式
+            <select value={form.thinking} onChange={(event) => updateField("thinking", event.target.value as AiForm["thinking"])}>
+              <option value="disabled">disabled：稳定 JSON 解析推荐</option>
+              <option value="enabled">enabled：需要复杂推理时使用</option>
+            </select>
+          </label>
+          <label>Reasoning effort
+            <select value={form.reasoning_effort} onChange={(event) => updateField("reasoning_effort", event.target.value as AiForm["reasoning_effort"])}>
+              <option value="high">high</option>
+              <option value="max">max</option>
+            </select>
+          </label>
+        </div>
+        <div className="field-help">
+          <strong>提示词与结构化输出</strong>
+          <span>后端会用 JSON Output 调用 DeepSeek，先把自然语言转换为 action/query/downloader_id/target 等字段，再执行查询或写入通知，最后再调用模型把结果整理成中文回复。</span>
+        </div>
+        <div className="actions">
+          <button onClick={saveDraft} disabled={busy !== ""}>{busy === "draft" ? "正在保存..." : "保存草稿"}</button>
+          <button className="primary" onClick={saveAndTest} disabled={busy !== ""}>{busy === "test" ? "正在测试..." : "保存并测试"}</button>
+          <button onClick={toggleEnabled} disabled={busy !== "" || (!provider.enabled && !canEnable)}>{provider.enabled ? "停用" : "启用"}</button>
+        </div>
+        {!provider.enabled && !canEnable && <p className="muted">请先保存并测试，测试成功后再启用 AI 模块。</p>}
+        {localError && <p className="error">{localError}</p>}
+        <TestResultCard result={result} emptyProvider="AI / DeepSeek" />
       </div>
     </Panel>
   );
@@ -3588,7 +3811,7 @@ const pages: Record<NavKey, (props: { user: User; resetToken?: number; selectedD
   discover: DiscoverPage,
   dashboard: DashboardPage,
   downloads: DownloadsPage,
-  notifications: NotificationsPage,
+  notifications: NotificationsAssistantPage,
   settings: SettingsPage,
   diagnostics: DiagnosticsPage
 };

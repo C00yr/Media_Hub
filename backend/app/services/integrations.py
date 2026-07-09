@@ -10,7 +10,7 @@ from app.utils.ids import trace_id
 from app.utils.redaction import parse_raw_headers, redact_payload
 
 
-PROVIDERS = ["mteam", "qb1", "qb2", "qb3", "tmdb"]
+PROVIDERS = ["mteam", "qb1", "qb2", "qb3", "tmdb", "ai"]
 
 
 def normalize_payload(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -58,6 +58,25 @@ def normalize_payload(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
             normalized["region"] = "CN"
         if not normalized.get("timeout"):
             normalized["timeout"] = 12
+        normalized = {key: value for key, value in normalized.items() if value not in ("", None)}
+    if provider == "ai":
+        for key in ["base_url", "api_key", "model", "thinking", "reasoning_effort"]:
+            if key in normalized and isinstance(normalized[key], str):
+                normalized[key] = normalized[key].strip()
+        if not normalized.get("base_url"):
+            normalized["base_url"] = "https://api.deepseek.com"
+        if not normalized.get("model"):
+            normalized["model"] = "deepseek-v4-flash"
+        if normalized.get("thinking") not in {"enabled", "disabled"}:
+            normalized["thinking"] = "disabled"
+        if normalized.get("reasoning_effort") not in {"high", "max"}:
+            normalized["reasoning_effort"] = "high"
+        if not normalized.get("timeout"):
+            normalized["timeout"] = 30
+        if not normalized.get("max_tokens"):
+            normalized["max_tokens"] = 1200
+        if not normalized.get("temperature"):
+            normalized["temperature"] = 0.1
         normalized = {key: value for key, value in normalized.items() if value not in ("", None)}
     return normalized
 
@@ -108,6 +127,10 @@ def upsert_config(
             previous = json.loads(decrypt_text(row.encrypted_payload))
             if "password" not in normalized and previous.get("password"):
                 normalized["password"] = previous["password"]
+        if provider == "ai" and row.encrypted_payload:
+            previous = json.loads(decrypt_text(row.encrypted_payload))
+            if "api_key" not in normalized and previous.get("api_key"):
+                normalized["api_key"] = previous["api_key"]
     row.encrypted_payload = encrypt_text(json.dumps(normalized, ensure_ascii=True))
     row.redacted_summary = redact_payload(normalized)
     row.last_tested_at = None

@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.adapters.ai import AIConfigError, AIServiceError, DeepSeekChatAdapter
 from app.adapters.mock import MockMetadataAdapter
 from app.adapters.mteam import MTeamAdapter, MTeamApiError, MTeamConfigError
 from app.adapters.qbittorrent import QbittorrentApiError, QbittorrentConfigError, QbittorrentWebAdapter
@@ -92,6 +93,15 @@ class IntegrationPayload(BaseModel):
 class QbActionPayload(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     confirm_token: str | None = None
+
+
+class AssistantChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+
+
+class AssistantExecuteRequest(BaseModel):
+    intent: dict[str, Any] = Field(default_factory=dict)
+    message: str = ""
 
 
 def bytes_label(value: float, digits: int = 1) -> str:
@@ -673,6 +683,143 @@ def mteam_connection_payload(row: IntegrationConfig | None) -> dict[str, Any]:
     }
 
 
+def ai_test_result(success: bool, trace: str, message: str, explanation: str, next_step: str, error_type: str | None = None, http_status: int | None = None, can_enable: bool | None = None, detail: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "success": success,
+        "provider": "ai",
+        "mode": "real",
+        "http_status": http_status,
+        "duration_ms": 0,
+        "message": message,
+        "explanation": explanation,
+        "next_step": next_step,
+        "error_type": error_type,
+        "can_enable": success if can_enable is None else can_enable,
+        "trace_id": trace,
+        "detail": detail or {},
+    }
+
+
+def classify_ai_test_error(exc: Exception, trace: str) -> dict[str, Any]:
+    if isinstance(exc, AIConfigError):
+        return ai_test_result(
+            False,
+            trace,
+            "DeepSeek 配置不完整。",
+            "需要在设置页填写 API Key、base_url 和模型名称。base_url 默认是 https://api.deepseek.com。",
+            "请填写 DeepSeek API Key，模型建议使用 deepseek-v4-flash 或 deepseek-v4-pro。",
+            "missing_credentials",
+            can_enable=False,
+        )
+    if isinstance(exc, AIServiceError):
+        return ai_test_result(
+            False,
+            trace,
+            "DeepSeek 调用失败。",
+            str(exc),
+            "请检查 API Key、模型名称、余额、网络连通性和 base_url 后重试。",
+            "deepseek_api_error",
+            exc.http_status,
+            False,
+        )
+    return ai_test_result(
+        False,
+        trace,
+        "AI 模块测试失败。",
+        str(exc),
+        "请检查 DeepSeek 配置后重试。",
+        "unknown_error",
+        can_enable=False,
+    )
+
+
+def get_ai_adapter_or_error(db: Session) -> DeepSeekChatAdapter:
+    row = get_config(db, "ai")
+    if not row or not row.encrypted_payload:
+        raise HTTPException(status_code=409, detail="请先在设置中配置 DeepSeek API Key 和模型。")
+    if not row.enabled:
+        raise HTTPException(status_code=409, detail="AI 模块尚未启用，请先在设置中测试并启用。")
+    try:
+        return DeepSeekChatAdapter(get_decrypted_config(db, "ai") or {})
+    except AIConfigError as exc:
+        raise HTTPException(status_code=409, detail="DeepSeek API Key、base_url 或模型名称未配置。") from exc
+
+
+def format_assistant_result(intent: dict[str, Any], result: dict[str, Any]) -> str:
+    action = intent.get("action")
+    if action == "resource_search":
+        items = result.get("items") or []
+        if not items:
+            return "没有找到匹配的 M-Team 资源。"
+        lines = ["找到这些资源："]
+        for index, item in enumerate(items[:5], 1):
+            lines.append(f"{index}. {item.get('title') or item.get('name') or '-'} / {item.get('resolution') or '-'} / {item.get('size') or '-'} / 做种 {item.get('seeders', 0)} / ID {item.get('id') or '-'}")
+        return "\n".join(lines)
+    if action == "download_started":
+        return f"已记录下载开始通知：{result.get('notification', {}).get('title', '下载已开始')}"
+    if action == "download_completed":
+        return f"已记录下载完成通知：{result.get('notification', {}).get('title', '下载已完成')}"
+    if action == "status_query":
+        if result.get("target") == "mteam":
+            data = result.get("mteam") or result
+            return f"M-Team 状态：等级 {data.get('user_level', '-')}，分享率 {data.get('ratio', 0)}，做种 {data.get('seed_count', 0)}。"
+        if result.get("target") in {"qb", "downloads"}:
+            qbs = result.get("qbs") or []
+            if qbs:
+                return "qB 状态：" + "；".join(f"{item.get('name') or item.get('id')} 下载 {bytes_label(item.get('download_speed') or 0)}/s，上传 {bytes_label(item.get('upload_speed') or 0)}/s，任务 {item.get('active_downloads', 0)}" for item in qbs)
+        overview = result.get("overview") or {}
+        return f"总览：下载 {bytes_label(overview.get('total_download_speed') or 0)}/s，上传 {bytes_label(overview.get('total_upload_speed') or 0)}/s，活动下载 {overview.get('download_tasks', 0)}，NAS {overview.get('nas_space_label') or '-'}。"
+    return "请求已处理。"
+
+
+def execute_assistant_intent(db: Session, intent: dict[str, Any], message: str, user: User) -> dict[str, Any]:
+    action = str(intent.get("action") or "")
+    if action == "resource_search":
+        query = str(intent.get("query") or "").strip()
+        if not query:
+            raise HTTPException(status_code=400, detail="资源查询缺少关键词。")
+        try:
+            items = get_mteam_adapter_or_error(db).search_torrents(query)[: int(intent.get("limit") or 5)]
+        except MTeamApiError as exc:
+            raise HTTPException(status_code=502, detail=f"M-Team 搜索失败：{exc}") from exc
+        return {"action": action, "query": query, "items": items, "count": len(items)}
+
+    if action in {"download_started", "download_completed"}:
+        title = "下载已开始" if action == "download_started" else "下载已完成"
+        detail = str(intent.get("message") or message or "").strip() or title
+        row = Notification(title=title, message=detail, level="info" if action == "download_started" else "success", source="ai")
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return {
+            "action": action,
+            "notification": {
+                "id": row.id,
+                "title": row.title,
+                "message": row.message,
+                "level": row.level,
+                "source": row.source,
+                "created_at": row.created_at.isoformat(),
+            },
+        }
+
+    if action == "status_query":
+        target = str(intent.get("target") or "dashboard")
+        downloader_id = str(intent.get("downloader_id") or "all")
+        if target == "mteam":
+            return {"action": action, "target": target, "mteam": mteam_stats(db, user)}
+        if target in {"qb", "downloads"}:
+            if downloader_id in {"qb1", "qb2", "qb3"}:
+                state = get_qb_state_for_dashboard(db, downloader_id)
+                return {"action": action, "target": target, "qbs": [state]}
+            return {"action": action, "target": target, **build_dashboard_qbs_payload(db)}
+        if target == "notifications":
+            return {"action": action, "target": target, **notifications(user, db)}
+        return {"action": action, "target": "dashboard", **build_dashboard_payload(db)}
+
+    raise HTTPException(status_code=400, detail="不支持的 AI 指令。")
+
+
 def empty_mteam_stats(message: str = "请先在设置中启用 M-Team。") -> dict[str, Any]:
     return {
         "user_level": "-",
@@ -1117,6 +1264,23 @@ def test_integration(provider: str, request: IntegrationPayload | None = None, u
         except Exception as exc:
             result = classify_qb_test_error(provider, exc, test_trace_id)
         result["config_version"] = row.config_version if row else 0
+    elif provider == "ai":
+        config = get_decrypted_config(db, provider) or {}
+        try:
+            detail = DeepSeekChatAdapter(config).test_connection()
+            result = ai_test_result(
+                True,
+                test_trace_id,
+                "DeepSeek 连接成功。",
+                f"已成功调用 {detail.get('model') or 'DeepSeek'}，可以把自然语言转换为结构化 JSON。",
+                "现在可以启用 AI 模块，然后在通知页测试自然语言查询。",
+                None,
+                200,
+                detail=detail,
+            )
+        except Exception as exc:
+            result = classify_ai_test_error(exc, test_trace_id)
+        result["config_version"] = row.config_version if row else 0
     else:
         result = mock_test_result(provider, test_trace_id, row)
     return serialize_config(record_test_result(db, provider, result, actor_user_id=user.id))
@@ -1146,6 +1310,11 @@ def enable_integration(provider: str, user: User = Depends(require_admin), db: S
         result = row.last_test_result if row else None
         if not result or result.get("provider") != provider or result.get("mode") != "real" or result.get("success") is not True or result.get("can_enable") is not True:
             raise HTTPException(status_code=409, detail="请先点击“保存并测试”，确认 qB WebUI 连接成功后再启用。")
+    if provider == "ai":
+        row = get_config(db, provider)
+        result = row.last_test_result if row else None
+        if not result or result.get("provider") != "ai" or result.get("mode") != "real" or result.get("success") is not True or result.get("can_enable") is not True:
+            raise HTTPException(status_code=409, detail="请先保存并测试 DeepSeek，确认 AI 模块可用后再启用。")
     return serialize_config(set_enabled(db, provider, True, actor_user_id=user.id))
 
 
@@ -1734,6 +1903,40 @@ def stats(_: User = Depends(get_current_user), db: Session = Depends(get_db)) ->
         "ranges": ["24h", "7d", "30d", "custom"],
         "series": series,
         "explainability": {"source": "下载器原始数据与应用计算数据（Mock）", "formula": "周期增量 = 当前有效快照 - 起始有效快照", "completeness": "完整" if series else "部分缺失"},
+    }
+
+
+@router.post("/assistant/execute")
+def assistant_execute(request: AssistantExecuteRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    intent = request.intent
+    result = execute_assistant_intent(db, intent, request.message, user)
+    return {
+        "intent": intent,
+        "result": result,
+        "reply": format_assistant_result(intent, result),
+        "source": "structured_json",
+        "handled_at": datetime.utcnow().isoformat(),
+    }
+
+
+@router.post("/assistant/chat")
+def assistant_chat(request: AssistantChatRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    adapter = get_ai_adapter_or_error(db)
+    try:
+        intent = adapter.parse_intent(request.message)
+    except AIServiceError as exc:
+        raise HTTPException(status_code=502, detail=f"DeepSeek 解析失败：{exc}") from exc
+    result = execute_assistant_intent(db, intent, request.message, user)
+    try:
+        reply = adapter.summarize_result(request.message, intent, result)
+    except AIServiceError:
+        reply = format_assistant_result(intent, result)
+    return {
+        "intent": intent,
+        "result": result,
+        "reply": reply,
+        "source": "deepseek",
+        "handled_at": datetime.utcnow().isoformat(),
     }
 
 

@@ -380,6 +380,11 @@ class TmdbAdapter(MetadataAdapter):
         poster_path = item.get("poster_path")
         backdrop_path = item.get("backdrop_path")
         genres = item.get("genres") if isinstance(item.get("genres"), list) else []
+        genre_names = [genre.get("name") for genre in genres if genre.get("name")]
+        if not genre_names:
+            genre_ids = item.get("genre_ids") if isinstance(item.get("genre_ids"), list) else []
+            genre_map = self._genre_map(media_type)
+            genre_names = [genre_map[genre_id] for genre_id in genre_ids if genre_id in genre_map]
         credits = item.get("credits") if isinstance(item.get("credits"), dict) else {}
         cast = credits.get("cast") if isinstance(credits.get("cast"), list) else []
         crew = credits.get("crew") if isinstance(credits.get("crew"), list) else []
@@ -432,7 +437,7 @@ class TmdbAdapter(MetadataAdapter):
             "poster": _tmdb_image_url("w342", poster_path, PLACEHOLDER_POSTER),
             "backdrop": _tmdb_image_url("w780", backdrop_path, ""),
             "overview": item.get("overview") or "",
-            "genres": [genre.get("name") for genre in genres if genre.get("name")],
+            "genres": genre_names,
             "director": " / ".join(directors[:3]),
             "cast": [person.get("name") for person in cast[:8] if person.get("name")],
             "cast_members": cast_members,

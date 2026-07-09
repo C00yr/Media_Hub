@@ -71,3 +71,35 @@ def test_setup_login_integration_and_diagnostics(monkeypatch):
     assert export.status_code == 200
     payload_text = str(export.json()["payload"])
     assert "secret1234" not in payload_text
+
+
+def test_ai_provider_and_structured_assistant_execute():
+    logged_in = client.post("/api/auth/login", json={"username": "admin", "password": "password123"})
+    assert logged_in.status_code == 200
+    token = logged_in.json()["access_token"]
+
+    integrations = client.get("/api/admin/integrations", headers=auth_headers(token))
+    assert integrations.status_code == 200
+    assert "ai" in {item["provider"] for item in integrations.json()["providers"]}
+
+    saved = client.put(
+        "/api/admin/integrations/ai",
+        headers=auth_headers(token),
+        json={"payload": {"api_key": "deepseek-secret1234", "base_url": "https://api.deepseek.com", "model": "deepseek-v4-flash"}},
+    )
+    assert saved.status_code == 200
+    assert saved.json()["redacted_summary"]["api_key"] == "saved ending 1234"
+
+    executed = client.post(
+        "/api/assistant/execute",
+        headers=auth_headers(token),
+        json={"message": "测试下载完成", "intent": {"action": "download_completed", "message": "测试下载完成"}},
+    )
+    assert executed.status_code == 200
+    body = executed.json()
+    assert body["intent"]["action"] == "download_completed"
+    assert body["result"]["notification"]["level"] == "success"
+
+    notifications = client.get("/api/notifications", headers=auth_headers(token))
+    assert notifications.status_code == 200
+    assert any(item["source"] == "ai" and item["title"] == "下载已完成" for item in notifications.json()["items"])
