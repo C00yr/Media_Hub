@@ -9,7 +9,7 @@ from app.api.routes import router
 from app.config.settings import get_settings
 from app.db.session import Base, engine
 from app.models import entities  # noqa: F401
-from app.tasks.scheduler import build_scheduler, capture_snapshots
+from app.tasks.scheduler import build_scheduler, capture_snapshots, start_wechat_claw_polling, stop_wechat_claw_polling
 
 
 settings = get_settings()
@@ -50,11 +50,13 @@ def create_app() -> FastAPI:
         capture_snapshots()
         if not scheduler.running:
             scheduler.start()
+        start_wechat_claw_polling()
 
     @app.on_event("shutdown")
     def shutdown() -> None:
         if scheduler.running:
             scheduler.shutdown(wait=False)
+        stop_wechat_claw_polling()
 
     @app.get("/health")
     def health() -> dict[str, str]:

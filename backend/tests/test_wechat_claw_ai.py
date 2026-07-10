@@ -7,7 +7,19 @@ os.environ["JWT_SIGNING_KEY"] = "test-jwt"
 from fastapi.testclient import TestClient
 
 from app.adapters.ai.client import render_mobile_reply
-from app.api.routes import WechatClawMessageRequest, record_wechat_claw_interaction
+from app.adapters.wechat_claw import WechatClawAdapter
+from app.api.routes import (
+    WechatClawMessageRequest,
+    clear_wechat_claw_session,
+    get_wechat_claw_ilink_state,
+    get_wechat_claw_pending_messages,
+    is_wechat_claw_session_timeout,
+    queue_wechat_claw_messages,
+    record_wechat_claw_interaction,
+    remove_wechat_claw_pending_message,
+    update_wechat_claw_ilink_state,
+    update_wechat_claw_pending_message,
+)
 from app.db.session import SessionLocal
 from app.main import app
 
@@ -141,3 +153,103 @@ def test_status_query_preference_records_notification():
     body = response.json()
     assert body["result"]["notification"]["title"] == "状态查询：统计"
     assert body["result"]["wechat_claw_push"]["reason"] == "disabled_by_preferences"
+
+
+def test_ilink_message_protocol_parses_context_and_replies_with_msg_envelope():
+    adapter = WechatClawAdapter(
+        {
+            "mode": "ilink",
+            "base_url": "https://ilinkai.weixin.qq.com",
+            "bot_token": "ilinkbot-test",
+            "account_id": "bot@im.bot",
+        }
+    )
+    requests: list[dict] = []
+
+    def fake_request(method, url, body=None, **_kwargs):
+        requests.append({"method": method, "url": url, "body": body})
+        if url.endswith("/getupdates"):
+            return {
+                "ret": 0,
+                "get_updates_buf": "next-cursor",
+                "msgs": [
+                    {
+                        "message_id": "m-1",
+                        "from_user_id": "user@im.wechat",
+                        "message_type": 1,
+                        "context_token": "ctx-1",
+                        "item_list": [{"type": 1, "text_item": {"text": "查询 qB1 状态"}}],
+                    }
+                ],
+            }
+        return {}
+
+    adapter._json_request = fake_request  # type: ignore[method-assign]
+    updates = adapter.poll_updates(timeout_seconds=1)
+
+    assert updates["raw_count"] == 1
+    assert updates["parsed_count"] == 1
+    assert updates["messages"] == [
+        {
+            "user_id": "user@im.wechat",
+            "username": "user@im.wechat",
+            "message_id": "m-1",
+            "text": "查询 qB1 状态",
+            "context_token": "ctx-1",
+            "raw": updates["messages"][0]["raw"],
+        }
+    ]
+
+    delivery = adapter.send_text("user@im.wechat", "qB1 当前空闲", "ctx-1")
+
+    assert delivery["sent"] is True
+    body = requests[-1]["body"]
+    assert body["msg"]["from_user_id"] == "bot@im.bot"
+    assert body["msg"]["to_user_id"] == "user@im.wechat"
+    assert body["msg"]["context_token"] == "ctx-1"
+    assert body["msg"]["item_list"] == [{"type": 1, "text_item": {"text": "qB1 当前空闲"}}]
+
+
+def test_session_timeout_clears_old_token_but_keeps_waiting_qrcode():
+    with SessionLocal() as db:
+        update_wechat_claw_ilink_state(
+            db,
+            bot_token="expired-token",
+            account_id="bot@im.bot",
+            sync_buf="cursor",
+            known_targets={"user@im.wechat": {"context_token": "ctx"}},
+            qrcode={"qrcode": "new-login", "status": "waiting"},
+        )
+        clear_wechat_claw_session(db)
+        state = get_wechat_claw_ilink_state(db)
+
+    assert state["bot_token"] == ""
+    assert state["account_id"] == ""
+    assert state["sync_buf"] == ""
+    assert state["known_targets"] == {}
+    assert state["pending_messages"] == []
+    assert state["qrcode"] == {"qrcode": "new-login", "status": "waiting"}
+    assert is_wechat_claw_session_timeout("session timeout") is True
+    assert is_wechat_claw_session_timeout("ret=-14") is True
+
+
+def test_ilink_pending_messages_are_deduplicated_and_keep_reply_until_delivery():
+    update = {
+        "message_id": "m-queue-1",
+        "user_id": "user@im.wechat",
+        "text": "查询 qB1 状态",
+        "context_token": "ctx-queue-1",
+    }
+    with SessionLocal() as db:
+        update_wechat_claw_ilink_state(db, bot_token="token", sync_buf="old", pending_messages=[])
+        assert queue_wechat_claw_messages(db, [update], "new-cursor") == 1
+        assert queue_wechat_claw_messages(db, [update], "new-cursor") == 0
+        state = get_wechat_claw_ilink_state(db)
+        pending = get_wechat_claw_pending_messages(state)
+        assert state["sync_buf"] == "new-cursor"
+        assert len(pending) == 1
+        pending_id = pending[0]["id"]
+        update_wechat_claw_pending_message(db, pending_id, reply="qB1 当前空闲")
+        assert get_wechat_claw_pending_messages(get_wechat_claw_ilink_state(db))[0]["reply"] == "qB1 当前空闲"
+        remove_wechat_claw_pending_message(db, pending_id)
+        assert get_wechat_claw_pending_messages(get_wechat_claw_ilink_state(db)) == []

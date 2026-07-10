@@ -1985,13 +1985,91 @@ function NotificationPreferencesCard() {
   );
 }
 
-function SettingsPage() {
-  const { data, reload } = useLoad<any>(() => api("/api/admin/integrations"), []);
-  const storage = useLoad<any>(() => api("/api/admin/storage/status"), []);
+function PersonalWechatClawCard() {
+  const setup = useLoad<any>(() => api("/api/me/wechat-claw/setup"), []);
+  const [busy, setBusy] = useState("");
+  const [result, setResult] = useState<any | null>(null);
+  const [error, setError] = useState("");
+  const qrcode = setup.data?.qrcode ?? {};
+  const lastPoll = result ?? setup.data?.last_poll ?? {};
+
+  async function call(action: "refresh" | "logout" | "poll") {
+    setBusy(action);
+    setError("");
+    try {
+      const response = await api<any>(`/api/me/wechat-claw/${action}`, { method: "POST" });
+      if (action === "poll") setResult(response);
+      await setup.reload();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <Panel title="我的微信 claw">
+      <div className="integration wechat-config">
+        <div className={`notice ${setup.data?.connected ? "success" : "info"}`}>
+          <strong>{setup.data?.connected ? "已连接" : "等待绑定"}</strong>
+          <span>此二维码只绑定当前登录账号。你的微信消息、会话 token 和自动重试队列不会与其他成员共享。</span>
+        </div>
+        <div className="wechat-setup-card">
+          <div className="wechat-setup-main">
+            {qrcode.qrcode_url ? <WechatClawQrCode value={String(qrcode.qrcode_url)} /> : <div className="wechat-qr-placeholder"><Lock size={24} /><span>点击刷新二维码后扫码绑定</span></div>}
+            <div className="actions compact-actions">
+              <button type="button" onClick={() => call("refresh")} disabled={busy !== "" || !setup.data?.enabled}>{busy === "refresh" ? "刷新中..." : "刷新二维码"}</button>
+              <button type="button" onClick={() => call("poll")} disabled={busy !== "" || !setup.data?.connected}>{busy === "poll" ? "检查中..." : "立即检查"}</button>
+              <button type="button" onClick={() => call("logout")} disabled={busy !== "" || !setup.data?.connected}>退出登录</button>
+            </div>
+          </div>
+          <div className="wechat-setup-side">
+            <div className="field-help compact-help"><strong>绑定状态</strong><span>账号：<code>{setup.data?.account_id || "-"}</code></span><span>二维码：<code>{qrcode.status || "waiting"}</code></span></div>
+            <div className={lastPoll.success ? "field-help compact-help success" : "field-help compact-help"}>
+              <strong>最近处理</strong><span>原始 {lastPoll.raw_count ?? 0} / 解析 {lastPoll.parsed_count ?? 0} / 回发 {lastPoll.reply_sent_count ?? 0} / 待重试 {lastPoll.pending_count ?? 0}</span>{lastPoll.message && <span>{lastPoll.message}</span>}
+            </div>
+          </div>
+        </div>
+        {error && <p className="error">{error}</p>}
+      </div>
+    </Panel>
+  );
+}
+
+function MemberManagementCard() {
+  const members = useLoad<any>(() => api("/api/admin/users"), []);
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  async function createMember() {
+    setSaving(true);
+    setError("");
+    try {
+      await api("/api/admin/users", { method: "POST", body: JSON.stringify({ username, password }) });
+      setUsername("");
+      setPassword("");
+      await members.reload();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return <Panel title="成员账号"><div className="integration"><div className="settings-grid"><label>用户名<input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="成员用户名" /></label><label>初始密码<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="至少 8 位" /></label></div><div className="actions"><button type="button" className="primary" disabled={saving || username.trim().length < 3 || password.length < 8} onClick={createMember}>{saving ? "创建中..." : "创建成员"}</button></div><div className="field-help"><strong>已有成员</strong><span>{Array.isArray(members.data?.items) ? members.data.items.map((item: any) => `${item.username}（${item.role}）`).join(" / ") || "暂无" : "加载中..."}</span></div>{error && <p className="error">{error}</p>}</div></Panel>;
+}
+
+function SettingsPage({ user }: { user: User }) {
+  const { data, reload } = useLoad<any>(() => user.role === "admin" ? api("/api/admin/integrations") : Promise.resolve(null), [user.role]);
+  const storage = useLoad<any>(() => user.role === "admin" ? api("/api/admin/storage/status") : Promise.resolve(null), [user.role]);
+  if (user.role !== "admin") return <div className="grid-page"><PersonalWechatClawCard /></div>;
   if (!data) return <Panel title="设置"><p>正在加载...</p></Panel>;
 
   return (
     <div className="grid-page">
+      <MemberManagementCard />
       <Panel title="运行时凭据中心">
         <p className="muted">凭据由后端加密保存；保存过的 API、账号、密码和路径会直接回填在输入框里，可显示或复制。</p>
       </Panel>
@@ -2271,6 +2349,7 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
   const setup = useLoad<any>(() => api("/api/admin/wechat-claw/setup"), [provider.config_version, provider.enabled], null, false);
   const [busy, setBusy] = useState("");
   const [localError, setLocalError] = useState("");
+  const [pollResult, setPollResult] = useState<any | null>(null);
   const [localResult, setLocalResult] = useState<IntegrationTestResult | null>(provider.last_test_result);
   const result = localResult ?? provider.last_test_result;
   const canEnable = result?.provider === "wechat_claw" && result?.success === true && result?.can_enable === true;
@@ -2378,6 +2457,7 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
   const qrcode = setup.data?.qrcode ?? {};
   const qrReady = Boolean(qrcode.qrcode_url || setupPayload.qrcode_url);
   const interactions: WechatClawInteraction[] = Array.isArray(setup.data?.recent_interactions) ? setup.data.recent_interactions : [];
+  const lastPoll = pollResult ?? setup.data?.last_poll ?? {};
   const loginStatus = setup.data?.connected ? "已登录" : provider.enabled ? "等待扫码" : "未启用";
 
   async function refreshQrcode() {
@@ -2410,7 +2490,8 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
     setBusy("poll");
     setLocalError("");
     try {
-      await api("/api/admin/wechat-claw/poll", { method: "POST" });
+      const response = await api<any>("/api/admin/wechat-claw/poll", { method: "POST" });
+      setPollResult(response);
       await setup.reload();
     } catch (err) {
       setLocalError((err as Error).message);
@@ -2478,6 +2559,15 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
               <span>服务：<code>{setup.data?.base_url || form.base_url}</code></span>
               <span>账号：<code>{setup.data?.account_id || "-"}</code></span>
               <span>二维码状态：<code>{qrcode.status || "waiting"}</code></span>
+            </div>
+            <div className={lastPoll.success ? "field-help compact-help wechat-poll-status success" : "field-help compact-help wechat-poll-status"}>
+              <strong>最近轮询</strong>
+              <span>{lastPoll.updated_at ? new Date(lastPoll.updated_at).toLocaleString() : "尚未轮询"}</span>
+              {lastPoll.updated_at && <span>原始消息 {lastPoll.raw_count ?? 0} / 成功解析 {lastPoll.parsed_count ?? 0} / 已处理 {lastPoll.handled_count ?? 0} / 已回发 {lastPoll.reply_sent_count ?? 0} / 待重试 {lastPoll.pending_count ?? 0}</span>}
+              {lastPoll.message && <span>{lastPoll.message}</span>}
+              {Array.isArray(lastPoll.handled) && lastPoll.handled.filter((item: any) => item.error || item.delivery_reason).slice(0, 3).map((item: any, index: number) => (
+                <span key={`${item.message_id || item.user_id || index}-${index}`}>消息 {item.message_id || item.user_id || index + 1}：{item.error || item.delivery_reason}</span>
+              ))}
             </div>
             <div className="wechat-interactions">
               <div className="wechat-interactions-head">

@@ -1,6 +1,7 @@
 import base64
 import json
 import random
+import secrets
 from datetime import datetime
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -116,6 +117,13 @@ class WechatClawAdapter:
         payload["base_info"] = base_info
         return payload
 
+    @staticmethod
+    def _delivery_succeeded(payload: dict[str, Any]) -> bool:
+        # The official sendmessage response may be an empty JSON object on HTTP 200.
+        if not payload:
+            return True
+        return WechatClawAdapter._ok(payload)
+
     def _json_request(self, method: str, url: str, body: dict[str, Any] | None = None, auth_required: bool = True, timeout: int | None = None) -> dict[str, Any]:
         data = None if method == "GET" else json.dumps(body or {}, ensure_ascii=False).encode("utf-8")
         request = Request(url, data=data, headers=self._headers(auth_required=auth_required), method=method)
@@ -217,44 +225,63 @@ class WechatClawAdapter:
             "messages": [item for item in parsed if item],
             "sync_buf": str(sync_buf or ""),
             "raw_count": len(messages),
+            "parsed_count": len([item for item in parsed if item]),
             "message": payload.get("errmsg") or payload.get("message"),
         }
 
     def _parse_update(self, item: dict[str, Any]) -> dict[str, Any] | None:
         if not isinstance(item, dict):
             return None
-        user_id = self._pick_recursive(item, {"userid", "user_id", "from_user", "from_uid", "sender", "openid", "wxid"})
-        text = self._pick_recursive(item, {"text", "content", "message", "msg", "body", "msg_content", "msgContent", "cmd"})
-        message_id = self._pick_recursive(item, {"message_id", "msgid", "msg_id", "id", "client_msg_id"})
-        username = self._pick_recursive(item, {"username", "nickname", "from_user_name", "sender_name"})
-        if not user_id or not text:
+        if int(item.get("message_type") or 0) not in {0, 1}:
+            return None
+        user_id = str(item.get("from_user_id") or "").strip()
+        context_token = str(item.get("context_token") or "").strip()
+        message_id = item.get("message_id") or item.get("client_id") or item.get("seq") or ""
+        text = ""
+        item_list = item.get("item_list") if isinstance(item.get("item_list"), list) else []
+        for content_item in item_list:
+            if not isinstance(content_item, dict) or int(content_item.get("type") or 0) != 1:
+                continue
+            text_item = content_item.get("text_item") if isinstance(content_item.get("text_item"), dict) else {}
+            text = str(text_item.get("text") or "").strip()
+            if text:
+                break
+        if not user_id or not text or not context_token:
             return None
         return {
-            "user_id": str(user_id),
-            "username": str(username or user_id),
+            "user_id": user_id,
+            "username": user_id,
             "message_id": str(message_id or ""),
-            "text": str(text).strip(),
+            "text": text,
+            "context_token": context_token,
             "raw": item,
         }
 
-    def send_text(self, to_user: str, text: str) -> bool:
+    def send_text(self, to_user: str, text: str, context_token: str = "") -> dict[str, Any]:
         if not self.bot_token or not to_user or not text:
-            return False
-        bodies = [
-            {"to_user": to_user, "text": text},
-            {"userid": to_user, "text": text},
-            {"user_id": to_user, "message": text},
-            {"receiver": to_user, "content": text},
-        ]
-        for url in (f"{self.base_url}/ilink/bot/sendmessage", f"{self.base_url}/ilink/bot/sendmessage?bot_type=3"):
-            for body in bodies:
-                try:
-                    payload = self._json_request("POST", url, self._with_base_info(body), timeout=max(self.timeout, 20))
-                except WechatClawApiError:
-                    continue
-                if self._ok(payload):
-                    return True
-        return False
+            return {"sent": False, "reason": "missing_credentials_or_target"}
+        if not context_token:
+            return {"sent": False, "reason": "context_token_missing"}
+        message = {
+            "from_user_id": self.account_id,
+            "to_user_id": to_user,
+            "client_id": f"pt-media-hub:{int(datetime.utcnow().timestamp() * 1000)}:{secrets.token_hex(4)}",
+            "message_type": 2,
+            "message_state": 2,
+            "context_token": context_token,
+            "item_list": [{"type": 1, "text_item": {"text": text}}],
+        }
+        try:
+            payload = self._json_request(
+                "POST",
+                f"{self.base_url}/ilink/bot/sendmessage",
+                self._with_base_info({"msg": message}),
+                timeout=max(self.timeout, 20),
+            )
+        except WechatClawApiError as exc:
+            return {"sent": False, "reason": "send_request_failed", "message": str(exc), "http_status": exc.http_status}
+        sent = self._delivery_succeeded(payload)
+        return {"sent": sent, "reason": None if sent else "send_rejected", "response": payload}
 
     def send_message(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.mode == "ilink":
@@ -267,8 +294,10 @@ class WechatClawAdapter:
             text = str(payload.get("message") or payload.get("text") or payload.get("title") or "").strip()
             if payload.get("title") and payload.get("message"):
                 text = f"{payload.get('title')}\n{payload.get('message')}"
-            sent = self.send_text(target, text)
-            return {"sent": sent, "mode": "ilink", "target": target, "reason": None if sent else "send_failed"}
+            target_state = self.known_targets.get(target) if isinstance(self.known_targets.get(target), dict) else {}
+            context_token = str(payload.get("context_token") or target_state.get("context_token") or "").strip()
+            delivery = self.send_text(target, text, context_token)
+            return {"mode": "ilink", "target": target, **delivery}
         if not self.webhook_url:
             return {"sent": False, "reason": "webhook_not_configured"}
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")

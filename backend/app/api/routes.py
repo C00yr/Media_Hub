@@ -5,6 +5,7 @@ import logging
 import mimetypes
 import re
 import shutil
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from pathlib import Path
 from socket import timeout as SocketTimeout
@@ -62,6 +63,9 @@ settings = get_settings()
 logger = logging.getLogger(__name__)
 _PRELOAD_TASK_LOCK = Lock()
 _PRELOAD_TASKS_RUNNING: set[str] = set()
+_WECHAT_CLAW_POLL_LOCKS: dict[int, Lock] = {}
+_WECHAT_CLAW_POLL_LOCK_GUARD = Lock()
+_WECHAT_CLAW_ACTIVE_USER_ID: ContextVar[int | None] = ContextVar("wechat_claw_active_user_id", default=None)
 PRELOAD_PREFIX = "preload."
 TMDB_IMAGE_SIZES = {"w92", "w154", "w185", "w342", "w500", "w780", "w1280", "original"}
 TMDB_IMAGE_PATH_RE = re.compile(r"^[A-Za-z0-9_./-]+\.(jpg|jpeg|png|webp)$", re.IGNORECASE)
@@ -109,10 +113,16 @@ class NotificationPreferencesPayload(BaseModel):
     preferences: dict[str, bool] = Field(default_factory=dict)
 
 
+class CreateUserRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=80)
+    password: str = Field(min_length=8, max_length=200)
+
+
 class WechatClawMessageRequest(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
     user_id: str = ""
     conversation_id: str = ""
+    context_token: str = ""
 
 
 DEFAULT_NOTIFICATION_PREFERENCES: dict[str, bool] = {
@@ -126,7 +136,20 @@ DEFAULT_NOTIFICATION_PREFERENCES: dict[str, bool] = {
 NOTIFICATION_PREFERENCES_KEY = "notification.preferences"
 WECHAT_CLAW_INTERACTIONS_KEY = "wechat_claw.interactions"
 WECHAT_CLAW_ILINK_STATE_KEY = "wechat_claw.ilink_state"
+WECHAT_CLAW_LAST_POLL_KEY = "wechat_claw.last_poll"
 WECHAT_CLAW_INTERACTION_LIMIT = 20
+WECHAT_CLAW_PENDING_LIMIT = 100
+
+
+def wechat_claw_setting_key(key: str, user_id: int | None = None) -> str:
+    effective_user_id = user_id if user_id is not None else _WECHAT_CLAW_ACTIVE_USER_ID.get()
+    return key if effective_user_id is None else f"{key}.user.{effective_user_id}"
+
+
+def wechat_claw_poll_lock(user_id: int | None) -> Lock:
+    key = int(user_id or 0)
+    with _WECHAT_CLAW_POLL_LOCK_GUARD:
+        return _WECHAT_CLAW_POLL_LOCKS.setdefault(key, Lock())
 
 WECHAT_CLAW_MOBILE_SECTIONS: list[dict[str, Any]] = [
     {"key": "discover", "label": "发现", "description": "TMDB 趋势、热门、筛选和 M-Team 搜索入口。"},
@@ -907,8 +930,8 @@ def save_notification_preferences(db: Session, preferences: dict[str, bool]) -> 
     return normalized
 
 
-def get_wechat_claw_recent_interactions(db: Session) -> list[dict[str, Any]]:
-    row = db.query(Setting).filter(Setting.key == WECHAT_CLAW_INTERACTIONS_KEY).one_or_none()
+def get_wechat_claw_recent_interactions(db: Session, user_id: int | None = None) -> list[dict[str, Any]]:
+    row = db.query(Setting).filter(Setting.key == wechat_claw_setting_key(WECHAT_CLAW_INTERACTIONS_KEY, user_id)).one_or_none()
     value = row.value if row and isinstance(row.value, dict) else {}
     items = value.get("items") if isinstance(value, dict) else []
     if not isinstance(items, list):
@@ -916,15 +939,33 @@ def get_wechat_claw_recent_interactions(db: Session) -> list[dict[str, Any]]:
     return [item for item in items if isinstance(item, dict)][:WECHAT_CLAW_INTERACTION_LIMIT]
 
 
-def get_wechat_claw_ilink_state(db: Session) -> dict[str, Any]:
-    row = db.query(Setting).filter(Setting.key == WECHAT_CLAW_ILINK_STATE_KEY).one_or_none()
+def get_wechat_claw_ilink_state(db: Session, user_id: int | None = None) -> dict[str, Any]:
+    row = db.query(Setting).filter(Setting.key == wechat_claw_setting_key(WECHAT_CLAW_ILINK_STATE_KEY, user_id)).one_or_none()
     return row.value if row and isinstance(row.value, dict) else {}
 
 
-def save_wechat_claw_ilink_state(db: Session, state: dict[str, Any]) -> dict[str, Any]:
-    row = db.query(Setting).filter(Setting.key == WECHAT_CLAW_ILINK_STATE_KEY).one_or_none()
+def list_wechat_claw_binding_user_ids(db: Session) -> list[int | None]:
+    prefix = f"{WECHAT_CLAW_ILINK_STATE_KEY}.user."
+    rows = db.query(Setting).filter(Setting.key.like(f"{prefix}%")).all()
+    ids: list[int] = []
+    for row in rows:
+        try:
+            user_id = int(str(row.key).removeprefix(prefix))
+        except ValueError:
+            continue
+        if isinstance(row.value, dict) and row.value.get("bot_token"):
+            ids.append(user_id)
+    if ids:
+        active_ids = {item.id for item in db.query(User.id).filter(User.id.in_(ids), User.is_active.is_(True)).all()}
+        return sorted(active_ids)
+    return [None]
+
+
+def save_wechat_claw_ilink_state(db: Session, state: dict[str, Any], user_id: int | None = None) -> dict[str, Any]:
+    key = wechat_claw_setting_key(WECHAT_CLAW_ILINK_STATE_KEY, user_id)
+    row = db.query(Setting).filter(Setting.key == key).one_or_none()
     if row is None:
-        row = Setting(key=WECHAT_CLAW_ILINK_STATE_KEY, value=state)
+        row = Setting(key=key, value=state)
         db.add(row)
     else:
         row.value = state
@@ -933,14 +974,260 @@ def save_wechat_claw_ilink_state(db: Session, state: dict[str, Any]) -> dict[str
     return state
 
 
-def update_wechat_claw_ilink_state(db: Session, **kwargs: Any) -> dict[str, Any]:
-    state = get_wechat_claw_ilink_state(db)
+def update_wechat_claw_ilink_state(db: Session, user_id: int | None = None, **kwargs: Any) -> dict[str, Any]:
+    state = get_wechat_claw_ilink_state(db, user_id)
     state.update({key: value for key, value in kwargs.items() if value is not None})
-    return save_wechat_claw_ilink_state(db, state)
+    return save_wechat_claw_ilink_state(db, state, user_id)
+
+
+def get_wechat_claw_last_poll(db: Session, user_id: int | None = None) -> dict[str, Any]:
+    row = db.query(Setting).filter(Setting.key == wechat_claw_setting_key(WECHAT_CLAW_LAST_POLL_KEY, user_id)).one_or_none()
+    return row.value if row and isinstance(row.value, dict) else {}
+
+
+def save_wechat_claw_last_poll(db: Session, payload: dict[str, Any], user_id: int | None = None) -> dict[str, Any]:
+    safe_payload = {
+        "success": bool(payload.get("success")),
+        "stage": str(payload.get("stage") or "poll"),
+        "raw_count": int(payload.get("raw_count") or 0),
+        "parsed_count": int(payload.get("parsed_count") or 0),
+        "handled_count": int(payload.get("handled_count") or 0),
+        "reply_sent_count": int(payload.get("reply_sent_count") or 0),
+        "pending_count": int(payload.get("pending_count") or 0),
+        "message": trim_wechat_claw_text(payload.get("message"), 360),
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    key = wechat_claw_setting_key(WECHAT_CLAW_LAST_POLL_KEY, user_id)
+    row = db.query(Setting).filter(Setting.key == key).one_or_none()
+    if row is None:
+        row = Setting(key=key, value=safe_payload)
+        db.add(row)
+    else:
+        row.value = safe_payload
+        row.updated_at = datetime.utcnow()
+    db.commit()
+    return safe_payload
+
+
+def refresh_wechat_claw_login_state(db: Session) -> dict[str, Any]:
+    config = get_decrypted_config(db, "wechat_claw") or {}
+    state = get_wechat_claw_ilink_state(db)
+    qrcode = state.get("qrcode") if isinstance(state.get("qrcode"), dict) else {}
+    if not qrcode.get("qrcode") or state.get("bot_token"):
+        return state
+    try:
+        adapter = WechatClawAdapter(wechat_claw_config_with_state(config, state))
+        result = adapter.get_qrcode_status(str(qrcode.get("qrcode")))
+        updated_qrcode = dict(qrcode)
+        updated_qrcode["status"] = result.get("status") or updated_qrcode.get("status") or "waiting"
+        updated_qrcode["updated_at"] = int(datetime.utcnow().timestamp())
+        if result.get("qrcode_url"):
+            updated_qrcode["qrcode_url"] = result.get("qrcode_url")
+        update_payload: dict[str, Any] = {"qrcode": updated_qrcode}
+        if result.get("token"):
+            update_payload.update(
+                {
+                    "bot_token": result.get("token"),
+                    "account_id": result.get("account_id"),
+                    "sync_buf": "",
+                    "base_url": (result.get("base_url") or adapter.base_url).rstrip("/"),
+                }
+            )
+        return update_wechat_claw_ilink_state(db, **update_payload)
+    except Exception as exc:
+        logger.warning("刷新 WeChat claw iLink 扫码状态失败：%s", exc)
+        return state
 
 
 def clear_wechat_claw_ilink_state(db: Session) -> dict[str, Any]:
     return save_wechat_claw_ilink_state(db, {"qrcode": {}, "known_targets": {}})
+
+
+def clear_wechat_claw_session(db: Session, qrcode_status: str | None = None) -> dict[str, Any]:
+    state = get_wechat_claw_ilink_state(db)
+    qrcode = state.get("qrcode") if isinstance(state.get("qrcode"), dict) else {}
+    if qrcode_status and qrcode:
+        qrcode = {**qrcode, "status": qrcode_status, "updated_at": int(datetime.utcnow().timestamp())}
+    return update_wechat_claw_ilink_state(
+        db,
+        bot_token="",
+        account_id="",
+        sync_buf="",
+        known_targets={},
+        pending_messages=[],
+        qrcode=qrcode,
+    )
+
+
+def is_wechat_claw_session_timeout(message: Any) -> bool:
+    text = str(message or "").strip().lower()
+    return "session timeout" in text or "session expired" in text or "errcode=-14" in text or "ret=-14" in text
+
+
+def wechat_claw_pending_message_id(item: dict[str, Any]) -> str:
+    message_id = str(item.get("message_id") or item.get("conversation_id") or "").strip()
+    if message_id:
+        return f"message:{message_id}"
+    identity = json.dumps(
+        {
+            "user_id": str(item.get("user_id") or "").strip(),
+            "context_token": str(item.get("context_token") or "").strip(),
+            "text": str(item.get("text") or item.get("message") or "").strip(),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return f"hash:{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
+
+
+def get_wechat_claw_pending_messages(state: dict[str, Any]) -> list[dict[str, Any]]:
+    values = state.get("pending_messages") if isinstance(state.get("pending_messages"), list) else []
+    pending: list[dict[str, Any]] = []
+    for item in values:
+        if not isinstance(item, dict):
+            continue
+        pending_id = str(item.get("id") or "").strip()
+        if not pending_id:
+            continue
+        pending.append(dict(item, id=pending_id))
+    return pending[:WECHAT_CLAW_PENDING_LIMIT]
+
+
+def save_wechat_claw_pending_messages(db: Session, pending: list[dict[str, Any]], sync_buf: str | None = None) -> list[dict[str, Any]]:
+    values = pending[:WECHAT_CLAW_PENDING_LIMIT]
+    payload: dict[str, Any] = {"pending_messages": values}
+    if sync_buf is not None:
+        payload["sync_buf"] = sync_buf
+    update_wechat_claw_ilink_state(db, **payload)
+    return values
+
+
+def queue_wechat_claw_messages(db: Session, messages: list[dict[str, Any]], sync_buf: str | None) -> int:
+    state = get_wechat_claw_ilink_state(db)
+    pending = get_wechat_claw_pending_messages(state)
+    known_ids = {str(item.get("id")) for item in pending}
+    added = 0
+    for item in messages:
+        message = str(item.get("text") or "").strip()
+        user_id = str(item.get("user_id") or "").strip()
+        context_token = str(item.get("context_token") or "").strip()
+        if not message or not user_id or not context_token:
+            continue
+        pending_id = wechat_claw_pending_message_id(item)
+        if pending_id in known_ids:
+            continue
+        pending.append(
+            {
+                "id": pending_id,
+                "message": message,
+                "user_id": user_id,
+                "conversation_id": str(item.get("message_id") or "").strip(),
+                "context_token": context_token,
+                "received_at": datetime.utcnow().isoformat(),
+                "attempts": 0,
+            }
+        )
+        known_ids.add(pending_id)
+        added += 1
+    save_wechat_claw_pending_messages(db, pending, str(sync_buf or ""))
+    return added
+
+
+def update_wechat_claw_pending_message(db: Session, pending_id: str, **changes: Any) -> None:
+    state = get_wechat_claw_ilink_state(db)
+    pending = get_wechat_claw_pending_messages(state)
+    for index, item in enumerate(pending):
+        if item.get("id") == pending_id:
+            pending[index] = {**item, **changes}
+            break
+    save_wechat_claw_pending_messages(db, pending)
+
+
+def remove_wechat_claw_pending_message(db: Session, pending_id: str) -> None:
+    state = get_wechat_claw_ilink_state(db)
+    pending = [item for item in get_wechat_claw_pending_messages(state) if item.get("id") != pending_id]
+    save_wechat_claw_pending_messages(db, pending)
+
+
+def wechat_claw_retry_after_seconds(pending: list[dict[str, Any]]) -> float | None:
+    now = datetime.utcnow().timestamp()
+    retry_times = [float(item.get("next_retry_at") or 0) for item in pending if item.get("next_retry_at")]
+    if not retry_times:
+        return None
+    return max(0.0, min(retry_times) - now)
+
+
+def retry_wechat_claw_pending_message(db: Session, pending: dict[str, Any], error: str) -> float:
+    attempts = int(pending.get("attempts") or 0) + 1
+    delay_seconds = min(60, 2 ** min(attempts, 6))
+    update_wechat_claw_pending_message(
+        db,
+        str(pending["id"]),
+        attempts=attempts,
+        last_error=trim_wechat_claw_text(error, 240),
+        next_retry_at=int(datetime.utcnow().timestamp()) + delay_seconds,
+    )
+    return float(delay_seconds)
+
+
+def process_wechat_claw_pending_messages(db: Session, adapter: WechatClawAdapter) -> dict[str, Any]:
+    state = get_wechat_claw_ilink_state(db)
+    pending = get_wechat_claw_pending_messages(state)
+    now = datetime.utcnow().timestamp()
+    handled: list[dict[str, Any]] = []
+    reply_sent_count = 0
+
+    for item in pending:
+        next_retry_at = float(item.get("next_retry_at") or 0)
+        if next_retry_at > now:
+            continue
+        pending_id = str(item["id"])
+        try:
+            reply = str(item.get("reply") or "").strip()
+            if not reply:
+                response = handle_wechat_claw_text(
+                    db,
+                    WechatClawMessageRequest(
+                        message=str(item.get("message") or ""),
+                        user_id=str(item.get("user_id") or ""),
+                        conversation_id=str(item.get("conversation_id") or ""),
+                        context_token=str(item.get("context_token") or ""),
+                    ),
+                )
+                reply = str(response.get("reply") or "").strip()
+                if not reply:
+                    raise RuntimeError("empty AI reply")
+                # Persist the generated reply before delivery. A transient send failure
+                # must retry the same answer rather than execute the user intent twice.
+                update_wechat_claw_pending_message(db, pending_id, reply=reply, handled_at=datetime.utcnow().isoformat())
+            delivery = adapter.send_text(str(item.get("user_id") or ""), reply, str(item.get("context_token") or ""))
+            if not delivery.get("sent"):
+                reason = str(delivery.get("message") or delivery.get("reason") or "send rejected")
+                retry_wechat_claw_pending_message(db, item, reason)
+                handled.append({"user_id": item.get("user_id"), "message_id": item.get("conversation_id"), "reply_sent": False, "error": reason})
+                continue
+        except HTTPException as exc:
+            retry_wechat_claw_pending_message(db, item, str(exc.detail))
+            handled.append({"user_id": item.get("user_id"), "message_id": item.get("conversation_id"), "reply_sent": False, "error": str(exc.detail)})
+            continue
+        except Exception as exc:
+            logger.exception("WeChat claw message handling failed: user_id=%s", item.get("user_id"))
+            error = str(exc)[:240]
+            retry_wechat_claw_pending_message(db, item, error)
+            handled.append({"user_id": item.get("user_id"), "message_id": item.get("conversation_id"), "reply_sent": False, "error": error})
+            continue
+
+        remove_wechat_claw_pending_message(db, pending_id)
+        reply_sent_count += 1
+        handled.append({"user_id": item.get("user_id"), "message_id": item.get("conversation_id"), "reply_sent": True})
+
+    current_pending = get_wechat_claw_pending_messages(get_wechat_claw_ilink_state(db))
+    return {
+        "handled": handled,
+        "reply_sent_count": reply_sent_count,
+        "pending_count": len(current_pending),
+        "retry_after_seconds": wechat_claw_retry_after_seconds(current_pending),
+    }
 
 
 def wechat_claw_config_with_state(config: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
@@ -1007,6 +1294,7 @@ def build_wechat_claw_setup(db: Session) -> dict[str, Any]:
         "mobile_sections": WECHAT_CLAW_MOBILE_SECTIONS,
         "capabilities": WECHAT_CLAW_CAPABILITIES,
         "recent_interactions": get_wechat_claw_recent_interactions(db),
+        "last_poll": get_wechat_claw_last_poll(db),
     }
 
 
@@ -1044,12 +1332,26 @@ def record_wechat_claw_interaction(
         known_targets[item["user_id"]] = {
             "username": item["user_id"],
             "last_active": int(datetime.utcnow().timestamp()),
+            "context_token": request.context_token,
         }
         update_wechat_claw_ilink_state(db, known_targets=known_targets)
     return item
 
 
 def push_wechat_claw_notification(db: Session, notification: Notification, action: str) -> dict[str, Any]:
+    # App-originated download events have no active chat scope. Fan them out to
+    # every independently bound member instead of the legacy administrator bot.
+    if _WECHAT_CLAW_ACTIVE_USER_ID.get() is None:
+        user_ids = [item for item in list_wechat_claw_binding_user_ids(db) if item is not None]
+        if user_ids:
+            deliveries: dict[str, dict[str, Any]] = {}
+            for user_id in user_ids:
+                scope = _WECHAT_CLAW_ACTIVE_USER_ID.set(user_id)
+                try:
+                    deliveries[str(user_id)] = push_wechat_claw_notification(db, notification, action)
+                finally:
+                    _WECHAT_CLAW_ACTIVE_USER_ID.reset(scope)
+            return {"sent": any(item.get("sent") for item in deliveries.values()), "deliveries": deliveries}
     preferences = get_notification_preferences(db)
     if not preferences.get("wechat_claw_push", True):
         return {"sent": False, "reason": "disabled_by_preferences"}
@@ -1535,6 +1837,24 @@ def login(request: LoginRequest, db: Session = Depends(get_db)) -> dict[str, Any
 @router.get("/auth/me")
 def me(user: User = Depends(get_current_user)) -> dict[str, Any]:
     return {"id": user.id, "username": user.username, "role": user.role}
+
+
+@router.get("/admin/users")
+def list_users(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    users = db.query(User).order_by(User.created_at.asc(), User.id.asc()).all()
+    return {"items": [{"id": item.id, "username": item.username, "role": item.role, "is_active": item.is_active} for item in users]}
+
+
+@router.post("/admin/users")
+def create_user(request: CreateUserRequest, _: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    username = request.username.strip()
+    if db.query(User).filter(User.username == username).one_or_none():
+        raise HTTPException(status_code=409, detail="用户名已存在")
+    user = User(username=username, password_hash=hash_password(request.password), role="user")
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return {"id": user.id, "username": user.username, "role": user.role, "is_active": user.is_active}
 
 
 @router.post("/auth/admin-verify")
@@ -2381,31 +2701,7 @@ def admin_wechat_claw_setup(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     if refresh_remote:
-        config = get_decrypted_config(db, "wechat_claw") or {}
-        state = get_wechat_claw_ilink_state(db)
-        qrcode = state.get("qrcode") if isinstance(state.get("qrcode"), dict) else {}
-        if qrcode.get("qrcode") and not state.get("bot_token"):
-            try:
-                adapter = WechatClawAdapter(wechat_claw_config_with_state(config, state))
-                result = adapter.get_qrcode_status(str(qrcode.get("qrcode")))
-                updated_qrcode = dict(qrcode)
-                updated_qrcode["status"] = result.get("status") or updated_qrcode.get("status") or "waiting"
-                updated_qrcode["updated_at"] = int(datetime.utcnow().timestamp())
-                if result.get("qrcode_url"):
-                    updated_qrcode["qrcode_url"] = result.get("qrcode_url")
-                update_payload: dict[str, Any] = {"qrcode": updated_qrcode}
-                if result.get("token"):
-                    update_payload.update(
-                        {
-                            "bot_token": result.get("token"),
-                            "account_id": result.get("account_id"),
-                            "sync_buf": "",
-                            "base_url": (result.get("base_url") or adapter.base_url).rstrip("/"),
-                        }
-                    )
-                update_wechat_claw_ilink_state(db, **update_payload)
-            except Exception as exc:
-                logger.warning("刷新 WeChat claw iLink 扫码状态失败：%s", exc)
+        refresh_wechat_claw_login_state(db)
     return build_wechat_claw_setup(db)
 
 
@@ -2422,7 +2718,17 @@ def admin_wechat_claw_refresh(_: User = Depends(require_admin), db: Session = De
         "status": result.get("status") or "waiting",
         "updated_at": int(datetime.utcnow().timestamp()),
     }
-    update_wechat_claw_ilink_state(db, qrcode=qrcode, base_url=adapter.base_url)
+    # A fresh QR code starts a new iLink session. Retaining the old token here
+    # would prevent the background worker from polling the new QR status.
+    update_wechat_claw_ilink_state(
+        db,
+        qrcode=qrcode,
+        base_url=adapter.base_url,
+        bot_token="",
+        account_id="",
+        sync_buf="",
+        known_targets={},
+    )
     return build_wechat_claw_setup(db)
 
 
@@ -2441,6 +2747,11 @@ def require_wechat_claw_token(db: Session, header_token: str | None, query_token
 
 
 def assistant_actor_for_wechat_claw(db: Session) -> User:
+    binding_user_id = _WECHAT_CLAW_ACTIVE_USER_ID.get()
+    if binding_user_id is not None:
+        bound_user = db.get(User, binding_user_id)
+        if bound_user and bound_user.is_active:
+            return bound_user
     user = db.query(User).filter(User.role == "admin", User.is_active.is_(True)).order_by(User.id.asc()).first()
     if user is None:
         user = db.query(User).filter(User.is_active.is_(True)).order_by(User.id.asc()).first()
@@ -2473,6 +2784,98 @@ def handle_wechat_claw_text(db: Session, request: WechatClawMessageRequest) -> d
     }
 
 
+def poll_wechat_claw_messages(db: Session, user_id: int | None = None) -> dict[str, Any]:
+    # iLink advances one shared get_updates_buf cursor. Never allow the admin
+    # diagnostic button to race the background long-poll in this process.
+    scope = _WECHAT_CLAW_ACTIVE_USER_ID.set(user_id)
+    lock = wechat_claw_poll_lock(user_id)
+    if not lock.acquire(blocking=False):
+        pending_count = len(get_wechat_claw_pending_messages(get_wechat_claw_ilink_state(db)))
+        _WECHAT_CLAW_ACTIVE_USER_ID.reset(scope)
+        return {
+            "success": False,
+            "stage": "busy",
+            "raw_count": 0,
+            "parsed_count": 0,
+            "handled_count": 0,
+            "reply_sent_count": 0,
+            "pending_count": pending_count,
+            "message": "WeChat claw 正在由后台接收消息，请勿并发轮询。",
+        }
+    try:
+        return _poll_wechat_claw_messages_locked(db)
+    finally:
+        lock.release()
+        _WECHAT_CLAW_ACTIVE_USER_ID.reset(scope)
+
+
+def _poll_wechat_claw_messages_locked(db: Session) -> dict[str, Any]:
+    refresh_wechat_claw_login_state(db)
+    row = get_config(db, "wechat_claw")
+    if not row or not row.enabled or not row.encrypted_payload:
+        return save_wechat_claw_last_poll(db, {"success": False, "stage": "disabled", "message": "WeChat claw 未启用"})
+    config = get_decrypted_config(db, "wechat_claw") or {}
+    state = get_wechat_claw_ilink_state(db)
+    adapter = WechatClawAdapter(wechat_claw_config_with_state(config, state))
+    if not adapter.bot_token:
+        return save_wechat_claw_last_poll(db, {"success": False, "stage": "login", "message": "iLink 登录 token 尚未保存，请刷新设置状态后重试"})
+
+    # A reply that failed after iLink had delivered its update is durable here.
+    # Retry it before starting another long-poll so failures recover promptly.
+    previous = process_wechat_claw_pending_messages(db, adapter)
+    if previous["pending_count"]:
+        status = save_wechat_claw_last_poll(
+            db,
+            {
+                "success": False,
+                "stage": "retry_wait",
+                "handled_count": len(previous["handled"]),
+                "reply_sent_count": previous["reply_sent_count"],
+                "pending_count": previous["pending_count"],
+                "message": "消息已保留，正在等待下一次自动重试。",
+            },
+        )
+        return {**status, "handled": previous["handled"], "retry_after_seconds": previous["retry_after_seconds"] or 1.0}
+    try:
+        poll_result = adapter.poll_updates(timeout_seconds=int(config.get("poll_timeout") or 25))
+    except WechatClawApiError as exc:
+        return save_wechat_claw_last_poll(
+            db,
+            {"success": False, "stage": "getupdates", "message": str(exc), "raw_count": 0, "parsed_count": 0},
+        )
+    if not poll_result.get("success") and is_wechat_claw_session_timeout(poll_result.get("message")):
+        state = get_wechat_claw_ilink_state(db)
+        current_qrcode = state.get("qrcode") if isinstance(state.get("qrcode"), dict) else {}
+        # Keep a newly generated waiting QR code so the worker can finish the new login.
+        clear_wechat_claw_session(db, None if current_qrcode.get("status") == "waiting" else "expired")
+        return save_wechat_claw_last_poll(
+            db,
+            {
+                "success": False,
+                "stage": "session_expired",
+                "raw_count": poll_result.get("raw_count", 0),
+                "parsed_count": poll_result.get("parsed_count", 0),
+                "message": "iLink 登录会话已失效，已清除旧 token 并等待新的二维码登录。",
+            },
+        )
+    queue_wechat_claw_messages(db, poll_result.get("messages") or [], poll_result.get("sync_buf"))
+    processed = process_wechat_claw_pending_messages(db, adapter)
+    status = save_wechat_claw_last_poll(
+        db,
+        {
+            "success": bool(poll_result.get("success")),
+            "stage": "handled" if processed["handled"] else "getupdates",
+            "raw_count": poll_result.get("raw_count", 0),
+            "parsed_count": poll_result.get("parsed_count", 0),
+            "handled_count": len(processed["handled"]),
+            "reply_sent_count": processed["reply_sent_count"],
+            "pending_count": processed["pending_count"],
+            "message": poll_result.get("message"),
+        },
+    )
+    return {**status, "handled": processed["handled"], "retry_after_seconds": processed["retry_after_seconds"]}
+
+
 @router.post("/wechat-claw/message")
 def wechat_claw_message(
     request: WechatClawMessageRequest,
@@ -2487,34 +2890,43 @@ def wechat_claw_message(
 
 @router.post("/admin/wechat-claw/poll")
 def admin_wechat_claw_poll(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
-    row = get_config(db, "wechat_claw")
-    if not row or not row.enabled:
-        raise HTTPException(status_code=409, detail="WeChat claw 未启用")
-    config = get_decrypted_config(db, "wechat_claw") or {}
-    state = get_wechat_claw_ilink_state(db)
-    adapter = WechatClawAdapter(wechat_claw_config_with_state(config, state))
-    poll_result = adapter.poll_updates(timeout_seconds=int(config.get("poll_timeout") or 25))
-    if poll_result.get("sync_buf") is not None:
-        update_wechat_claw_ilink_state(db, sync_buf=poll_result.get("sync_buf"))
-    handled = []
-    for item in poll_result.get("messages") or []:
-        message = WechatClawMessageRequest(
-            message=str(item.get("text") or ""),
-            user_id=str(item.get("user_id") or ""),
-            conversation_id=str(item.get("message_id") or ""),
-        )
-        if not message.message.strip() or not message.user_id.strip():
-            continue
-        response = handle_wechat_claw_text(db, message)
-        sent = adapter.send_text(message.user_id, response["reply"])
-        handled.append({"user_id": message.user_id, "message_id": message.conversation_id, "reply_sent": sent, "reply": response["reply"]})
-    return {
-        "success": bool(poll_result.get("success")),
-        "raw_count": poll_result.get("raw_count", 0),
-        "handled_count": len(handled),
-        "handled": handled,
-        "message": poll_result.get("message"),
-    }
+    return poll_wechat_claw_messages(db)
+
+
+@router.get("/me/wechat-claw/setup")
+def my_wechat_claw_setup(
+    refresh_remote: bool = Query(default=True),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    scope = _WECHAT_CLAW_ACTIVE_USER_ID.set(user.id)
+    try:
+        return admin_wechat_claw_setup(refresh_remote, user, db)
+    finally:
+        _WECHAT_CLAW_ACTIVE_USER_ID.reset(scope)
+
+
+@router.post("/me/wechat-claw/refresh")
+def my_wechat_claw_refresh(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    scope = _WECHAT_CLAW_ACTIVE_USER_ID.set(user.id)
+    try:
+        return admin_wechat_claw_refresh(user, db)
+    finally:
+        _WECHAT_CLAW_ACTIVE_USER_ID.reset(scope)
+
+
+@router.post("/me/wechat-claw/logout")
+def my_wechat_claw_logout(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    scope = _WECHAT_CLAW_ACTIVE_USER_ID.set(user.id)
+    try:
+        return admin_wechat_claw_logout(user, db)
+    finally:
+        _WECHAT_CLAW_ACTIVE_USER_ID.reset(scope)
+
+
+@router.post("/me/wechat-claw/poll")
+def my_wechat_claw_poll(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    return poll_wechat_claw_messages(db, user.id)
 
 
 @router.get("/wechat-claw/capabilities")
