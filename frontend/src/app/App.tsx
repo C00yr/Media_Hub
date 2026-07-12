@@ -17,6 +17,7 @@ import {
   Lock,
   LogOut,
   MessageSquare,
+  Plus,
   Percent,
   Radar,
   RefreshCw,
@@ -25,6 +26,7 @@ import {
   ShieldCheck,
   SlidersHorizontal,
   Star,
+  Trash2,
   Upload,
   UserRound,
   Users,
@@ -115,12 +117,10 @@ type MTeamForm = {
 };
 
 type QbForm = {
-  name: string;
   base_url: string;
   username: string;
   password: string;
   timeout: string;
-  default_save_path: string;
 };
 
 type AiForm = {
@@ -156,8 +156,66 @@ type WechatClawInteraction = {
   reply?: string;
   action?: string;
   target?: string;
+  status?: string;
+  trace_id?: string;
+  duration_ms?: number;
+  error?: string;
+  stages?: Array<{ stage?: string; status?: string; duration_ms?: number; error?: string }>;
   created_at?: string;
 };
+
+function wechatClawStageLabel(stage?: string): string {
+  const labels: Record<string, string> = {
+    progress_ack: "即时回应",
+    ai_adapter: "AI 配置检查",
+    ai_recommendation: "AI 推荐说明",
+    ai_intent: "AI 意图识别",
+    ai_general_answer: "AI 生成回复",
+    tmdb_lookup: "TMDB 查询",
+    mteam_search: "M-Team 搜索",
+    dashboard_query: "仪表盘查询",
+    download_selection: "资源选择",
+    download_selected: "下载提交",
+    reply_render: "回复整理",
+    final_reply_send: "微信最终发送",
+  };
+  return labels[String(stage || "")] || String(stage || "未知阶段");
+}
+
+function renderReplyInline(text: string): ReactNode {
+  return text.split(/(\*\*[^*]+\*\*)/g).map((part, index) => {
+    if (part.startsWith("**") && part.endsWith("**")) return <strong key={index}>{part.slice(2, -2)}</strong>;
+    return part;
+  });
+}
+
+function parseMarkdownTableRow(line: string): string[] {
+  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
+}
+
+function AssistantReply({ reply }: { reply: string }) {
+  const lines = String(reply || "").split("\n");
+  const headerIndex = lines.findIndex((line, index) => line.trim().startsWith("|") && /^\s*\|?\s*:?-{3,}/.test(lines[index + 1] || ""));
+  if (headerIndex < 0) return <span className="assistant-reply-text">{lines.map((line, index) => <span key={index}>{renderReplyInline(line)}{index < lines.length - 1 && <br />}</span>)}</span>;
+  const rows: string[][] = [];
+  let afterIndex = headerIndex + 2;
+  while (afterIndex < lines.length && lines[afterIndex].trim().startsWith("|")) {
+    rows.push(parseMarkdownTableRow(lines[afterIndex]));
+    afterIndex += 1;
+  }
+  return (
+    <div className="assistant-markdown-reply">
+      {lines.slice(0, headerIndex).map((line, index) => <div className="assistant-reply-line" key={`before-${index}`}>{renderReplyInline(line)}</div>)}
+      <div className="assistant-markdown-table-wrap">
+        <table className="assistant-markdown-table">
+          <thead><tr>{parseMarkdownTableRow(lines[headerIndex]).map((cell, index) => <th key={index}>{renderReplyInline(cell)}</th>)}</tr></thead>
+          <tbody>{rows.map((row, rowIndex) => <tr key={rowIndex}>{row.map((cell, cellIndex) => <td key={cellIndex}>{renderReplyInline(cell)}</td>)}</tr>)}</tbody>
+        </table>
+      </div>
+      {lines.slice(afterIndex).map((line, index) => <div className="assistant-reply-line" key={`after-${index}`}>{renderReplyInline(line)}</div>)}
+    </div>
+  );
+}
 
 type NotificationPreferenceKey = "download_started" | "download_completed" | "resource_search" | "status_query" | "wechat_claw_push";
 
@@ -375,6 +433,7 @@ export function App() {
           user={user}
           resetToken={active === "discover" ? discoverResetToken : 0}
           selectedDownloader={selectedDownloader}
+          onNavigate={openNav}
           onOpenDownloader={(downloaderId) => {
             setSelectedDownloader(downloaderId);
             setActive("downloads");
@@ -435,13 +494,13 @@ function storageDisplay(source: any) {
   if (free > 0) {
     return {
       percent: 0,
-      helper: "请在部署 YAML 中配置 NAS 文件夹挂载以显示总空间",
+      helper: "请先配置 NAS 存储空间",
       value: formatBytesFixed(free, 2),
     };
   }
   return {
     percent: 0,
-    helper: "请在部署 YAML 中配置 NAS 文件夹挂载",
+    helper: "请先配置 NAS 存储空间",
     value: "-",
   };
 }
@@ -1858,7 +1917,7 @@ function NotificationsPage() {
   return <Panel title="通知中心"><div className="table-list">{(data?.items ?? []).map((item: any) => <div className="row" key={`${item.title}-${item.created_at}`}><strong>{item.title}</strong><span>{item.message}</span><small>{item.level} / {item.source}</small></div>)}</div></Panel>;
 }
 
-function NotificationsAssistantPage() {
+function NotificationsAssistantPage({ onNavigate }: { onNavigate?: (key: NavKey) => void }) {
   const { data, reload } = useLoad<any>(() => api("/api/notifications"), []);
   const [mode, setMode] = useState<"chat" | "json">("chat");
   const [message, setMessage] = useState("帮我查一下 qB 下载器状态");
@@ -1886,7 +1945,7 @@ function NotificationsAssistantPage() {
 
   return (
     <div className="grid-page notifications-page">
-      <NotificationPreferencesCard />
+      <MemberManagementCard onNavigate={onNavigate} />
       <Panel title="AI 通知助手">
         <form className="assistant-box" onSubmit={submit}>
           <div className="notice info">
@@ -1914,7 +1973,7 @@ function NotificationsAssistantPage() {
             <div className="assistant-result">
               <div className="result-card success">
                 <strong>回复</strong>
-                <span>{result.reply}</span>
+                <AssistantReply reply={result.reply} />
               </div>
               <details>
                 <summary>查看结构化意图与后端结果</summary>
@@ -1985,6 +2044,293 @@ function NotificationPreferencesCard() {
   );
 }
 
+const MEMBER_AVATARS: Record<string, { emoji: string; label: string }> = {
+  mint: { emoji: "🌿", label: "薄荷" },
+  violet: { emoji: "🪻", label: "紫罗兰" },
+  coral: { emoji: "🪸", label: "珊瑚" },
+  sky: { emoji: "☁️", label: "天空" },
+  amber: { emoji: "🍯", label: "琥珀" },
+  rose: { emoji: "🌹", label: "玫瑰" },
+  indigo: { emoji: "🌌", label: "靛蓝" },
+  lime: { emoji: "🍋", label: "青柠" },
+};
+
+function MemberAvatar({ member, size = "normal" }: { member: any; size?: "normal" | "small" }) {
+  const avatar = MEMBER_AVATARS[String(member?.avatar_key)] ?? MEMBER_AVATARS.mint;
+  return <span className={`member-avatar-face ${size} ${String(member?.avatar_key || "mint")}`} title={`${avatar.label}头像`}>{avatar.emoji}</span>;
+}
+
+function MemberManagementCard({ onNavigate }: { onNavigate?: (key: NavKey) => void }) {
+  const bindings = useLoad<any>(() => api("/api/admin/wechat-claw/bindings"), []);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [draftPreferences, setDraftPreferences] = useState<Record<string, any>>({});
+  const [deleteConfirm, setDeleteConfirm] = useState<{ member: any; stage: 1 | 2 } | null>(null);
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+  const items = Array.isArray(bindings.data?.items) ? bindings.data.items : [];
+  const selected = items.find((item: any) => item.id === selectedId) ?? null;
+  const selectedInteractions: WechatClawInteraction[] = Array.isArray(selected?.recent_interactions) ? selected.recent_interactions.slice(0, 5) : [];
+
+  useEffect(() => {
+    if (!items.length) {
+      setSelectedId(null);
+      return;
+    }
+    if (!items.some((item: any) => item.id === selectedId)) setSelectedId(items[0].id);
+  }, [bindings.data, selectedId]);
+
+  useEffect(() => {
+    setDraftPreferences(selected?.notification_preferences ?? {});
+  }, [selectedId, selected?.updated_at]);
+
+  async function update(member: any, changes: Record<string, any>): Promise<boolean> {
+    setBusy(String(member.id));
+    setError("");
+    try {
+      await api(`/api/admin/wechat-claw/bindings/${member.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          display_name: changes.display_name ?? member.display_name,
+          role_name: member.role_name,
+          enabled: changes.enabled ?? member.enabled,
+          notification_preferences: changes.notification_preferences ?? member.notification_preferences,
+        }),
+      });
+      await bindings.reload();
+      return true;
+    } catch (err) {
+      setError((err as Error).message);
+      return false;
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function addMember() {
+    setBusy("add");
+    setError("");
+    try {
+      const member = await api<any>("/api/admin/wechat-claw/bindings", { method: "POST", body: JSON.stringify({}) });
+      await bindings.reload();
+      setSelectedId(member.id);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function editMember(member: any) {
+    const name = window.prompt("成员名称", member.display_name)?.trim();
+    if (!name || name === member.display_name) return;
+    await update(member, { display_name: name });
+  }
+
+  async function deleteMember(member: any) {
+    setBusy(`delete-${member.id}`);
+    setError("");
+    try {
+      await api(`/api/admin/wechat-claw/bindings/${member.id}`, { method: "DELETE" });
+      await bindings.reload();
+      setSelectedId(null);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  function openConfiguration(member: any) {
+    window.sessionStorage.setItem("ptmh.wechat.selectedMember", String(member.id));
+    window.sessionStorage.setItem("ptmh.settings.activeStep", "wechat_claw");
+    onNavigate?.("settings");
+  }
+
+  function requestDelete(member: any) {
+    setDeleteConfirm({ member, stage: 1 });
+  }
+
+  const exceptionOptions = [
+    ["mteam_exception", "站点模块异常"],
+    ["qb_exception", "qB 下载器异常"],
+    ["ai_exception", "AI 模块异常"],
+    ["tmdb_exception", "TMDB 模块异常"],
+    ["wechat_claw_exception", "WeChat claw 模块异常"],
+  ] as const;
+  const hasExceptionPreference = exceptionOptions.some(([key]) => Boolean(draftPreferences[key]));
+
+  async function applyPreferences() {
+    if (!selected) return;
+    const saved = await update(selected, { notification_preferences: draftPreferences });
+    if (saved) setSelectedId(null);
+  }
+
+  return (
+    <Panel title="成员管理">
+      <div className="member-management">
+        <div className="member-management-head">
+          <p className="muted">点击成员卡片即可展开设置；通知偏好按成员独立保存。</p>
+          <button type="button" className="primary" onClick={addMember} disabled={busy !== ""}><Plus size={16} /> 新增成员</button>
+        </div>
+        <div className="member-card-grid">
+          {items.map((member: any) => {
+            const configured = Boolean(member.connected);
+            return (
+              <article
+                className={selectedId === member.id ? "member-card selected" : "member-card"}
+                key={member.id}
+                onClick={() => setSelectedId(member.id)}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  setSelectedId(member.id);
+                }}
+              >
+                <span className="member-avatar-button" aria-hidden="true">
+                  <MemberAvatar member={member} />
+                </span>
+                <div className="member-card-copy">
+                  <strong>{member.display_name}</strong>
+                  <span className={configured ? "member-status configured" : "member-status pending"}>{configured ? "已配置" : "尚未配置"}</span>
+                  <small>{configured ? "微信已连接" : "扫码绑定后即可接收主动通知"}</small>
+                </div>
+                {!configured && <button type="button" onClick={(event) => { event.stopPropagation(); openConfiguration(member); }}>前去配置</button>}
+              </article>
+            );
+          })}
+          {!items.length && <div className="member-empty">还没有成员。点击“新增成员”即可创建成员1并分配一个默认头像。</div>}
+        </div>
+        {selected && (
+          <div className="member-notification-settings">
+            <div className="member-settings-heading"><div><h3>{selected.display_name}的成员设置</h3><p className="muted">模块异常按小时采集结果计算：连续多个小时没有拉取到数据，才会推送。</p></div></div>
+            <div className="member-notification-options">
+              {([
+                ["download_started", "下载开始"],
+                ["download_completed", "下载完成"],
+              ] as const).map(([key, label]) => (
+                <label className="member-notification-option" key={key}>
+                  <input type="checkbox" checked={Boolean(draftPreferences[key])} disabled={busy === String(selected.id)} onChange={() => setDraftPreferences((current) => ({ ...current, [key]: !current[key] }))} />
+                  <span>{label}</span>
+                </label>
+              ))}
+              {exceptionOptions.map(([key, label]) => <label className="member-notification-option" key={key}>
+                <input type="checkbox" checked={Boolean(draftPreferences[key])} disabled={busy === String(selected.id)} onChange={() => setDraftPreferences((current) => ({ ...current, [key]: !current[key] }))} />
+                <span>{label}</span>
+              </label>)}
+              {hasExceptionPreference && <label className="exception-duration">异常持续
+                <select value={String(draftPreferences.exception_after_hours ?? 5)} disabled={busy === String(selected.id)} onChange={(event) => setDraftPreferences((current) => ({ ...current, exception_after_hours: Number(event.target.value) }))}>
+                  <option value="3">3小时</option><option value="5">5小时</option><option value="24">24小时</option>
+                </select>
+                <span>后通知</span>
+              </label>}
+            </div>
+            <div className="wechat-interactions member-interaction-diagnostics">
+              <div className="wechat-interactions-head">
+                <strong>最近手机端交互诊断</strong>
+                <small>{selectedInteractions.length ? `${selectedInteractions.length} 条` : "暂无记录"}</small>
+              </div>
+              {selectedInteractions.map((item, index) => (
+                <div className={`wechat-interaction-item ${item.status === "completed" ? "success" : "failed"}`} key={item.trace_id || `${item.created_at || index}-${index}`}>
+                  <strong>
+                    <span>{item.status === "completed" ? "已完成" : item.status === "failed" ? "查询失败（已通知）" : "未完成"}</span>
+                    <span>{item.duration_ms ?? 0} ms</span>
+                    {item.trace_id && <span>{item.trace_id}</span>}
+                  </strong>
+                  <p>{item.message || "（已脱敏消息）"}</p>
+                  <small>{(item.stages ?? []).map((stage, stageIndex) => `${wechatClawStageLabel(stage.stage)} ${stage.duration_ms ?? 0}ms${stage.status === "failed" ? `（失败：${stage.error || "请求失败"}）` : ""}`).join(" · ") || "尚未采集阶段数据"}</small>
+                  {item.error && <small className="error">失败原因：{item.error}</small>}
+                  <small>{item.created_at ? new Date(item.created_at).toLocaleString() : ""}</small>
+                </div>
+              ))}
+              {!selectedInteractions.length && <p className="muted">手机端发起交互后，这里会保留最近 5 条的耗时与失败阶段。</p>}
+            </div>
+            <div className="member-settings-actions"><button type="button" onClick={() => void editMember(selected)} disabled={busy !== ""}>修改成员名称</button><button type="button" className="danger" onClick={() => requestDelete(selected)} disabled={busy !== ""}>删除成员</button><button type="button" className="primary" onClick={() => void applyPreferences()} disabled={busy !== ""}>{busy === String(selected.id) ? "应用中..." : "应用"}</button></div>
+          </div>
+        )}
+        {error && <p className="error">{error}</p>}
+        {deleteConfirm && <div className="app-dialog-backdrop" role="presentation" onMouseDown={() => setDeleteConfirm(null)}>
+          <div className="app-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-member-title" onMouseDown={(event) => event.stopPropagation()}>
+            <span className="app-dialog-icon"><Trash2 size={20} /></span>
+            <h3 id="delete-member-title">{deleteConfirm.stage === 1 ? `删除“${deleteConfirm.member.display_name}”？` : "请再次确认删除"}</h3>
+            <p>{deleteConfirm.stage === 1 ? "该成员将不再接收通知。下一步会清除其扫码登录状态和互动记录。" : "此操作不可恢复，成员的 WeChat claw 登录状态、最近轮询与互动记录都会被永久删除。"}</p>
+            <div className="app-dialog-actions">
+              <button type="button" onClick={() => setDeleteConfirm(null)}>取消</button>
+              {deleteConfirm.stage === 1 ? <button type="button" className="primary" onClick={() => setDeleteConfirm((current) => current ? { ...current, stage: 2 } : null)}>继续</button> : <button type="button" className="danger primary" onClick={() => { const member = deleteConfirm.member; setDeleteConfirm(null); void deleteMember(member); }} disabled={busy !== ""}>确认删除</button>}
+            </div>
+          </div>
+        </div>}
+      </div>
+    </Panel>
+  );
+}
+
+function WechatClawNotificationBindingsCard() {
+  const bindings = useLoad<any>(() => api("/api/admin/wechat-claw/bindings"), []);
+  const [savingId, setSavingId] = useState<number | null>(null);
+  const [error, setError] = useState("");
+  const labels: Record<string, string> = {
+    download_started: "下载开始",
+    download_completed: "下载完成",
+    resource_search: "资源查询结果",
+    status_query: "状态查询结果",
+  };
+
+  async function save(binding: any, changes: Record<string, any>) {
+    setSavingId(binding.id);
+    setError("");
+    try {
+      await api(`/api/admin/wechat-claw/bindings/${binding.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          display_name: changes.display_name ?? binding.display_name,
+          role_name: changes.role_name ?? binding.role_name,
+          enabled: changes.enabled ?? binding.enabled,
+          notification_preferences: changes.notification_preferences ?? binding.notification_preferences,
+        }),
+      });
+      await bindings.reload();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSavingId(null);
+    }
+  }
+
+  const items = Array.isArray(bindings.data?.items) ? bindings.data.items : [];
+  return (
+    <Panel title="微信成员通知">
+      <div className="integration">
+        <p className="muted">角色名会显示在对应微信成员的推送标题中；通知内容按成员独立生效。</p>
+        {items.length === 0 && <p className="muted">请先在设置中添加一个 WeChat claw 实例。</p>}
+        {items.map((binding: any) => {
+          const preferences = binding.notification_preferences ?? {};
+          const busy = savingId === binding.id;
+          return (
+            <div className="wechat-binding-notification" key={binding.id}>
+              <div className="settings-grid">
+                <label>成员名称<input defaultValue={binding.display_name} onBlur={(event) => event.target.value.trim() !== binding.display_name && save(binding, { display_name: event.target.value.trim() })} /></label>
+                <label>角色名<input defaultValue={binding.role_name} onBlur={(event) => event.target.value.trim() !== binding.role_name && save(binding, { role_name: event.target.value.trim() })} placeholder="例如：家庭影院管家" /></label>
+              </div>
+              <div className="preference-list compact-preferences">
+                {Object.entries(labels).map(([key, label]) => (
+                  <label className="preference-row" key={key}>
+                    <input type="checkbox" checked={Boolean(preferences[key])} disabled={busy} onChange={() => save(binding, { notification_preferences: { ...preferences, [key]: !preferences[key] } })} />
+                    <span><strong>{label}</strong></span>
+                  </label>
+                ))}
+                <label className="preference-row">
+                  <input type="checkbox" checked={Boolean(binding.enabled)} disabled={busy} onChange={() => save(binding, { enabled: !binding.enabled })} />
+                  <span><strong>启用该微信成员</strong></span>
+                </label>
+              </div>
+            </div>
+          );
+        })}
+        {error && <p className="error">{error}</p>}
+      </div>
+    </Panel>
+  );
+}
+
 function PersonalWechatClawCard() {
   const setup = useLoad<any>(() => api("/api/me/wechat-claw/setup"), []);
   const [busy, setBusy] = useState("");
@@ -2036,7 +2382,7 @@ function PersonalWechatClawCard() {
   );
 }
 
-function MemberManagementCard() {
+function AdminUserManagementCard() {
   const members = useLoad<any>(() => api("/api/admin/users"), []);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -2064,19 +2410,58 @@ function MemberManagementCard() {
 function SettingsPage({ user }: { user: User }) {
   const { data, reload } = useLoad<any>(() => user.role === "admin" ? api("/api/admin/integrations") : Promise.resolve(null), [user.role]);
   const storage = useLoad<any>(() => user.role === "admin" ? api("/api/admin/storage/status") : Promise.resolve(null), [user.role]);
+  const [activeStep, setActiveStep] = useState(() => {
+    const saved = window.sessionStorage.getItem("ptmh.settings.activeStep") || "storage";
+    return ["qb1", "qb2", "qb3"].includes(saved) ? "downloaders" : saved;
+  });
   if (user.role !== "admin") return <div className="grid-page"><PersonalWechatClawCard /></div>;
   if (!data) return <Panel title="设置"><p>正在加载...</p></Panel>;
 
+  const providers = data.providers.filter((provider: any) => ["mteam", "qb1", "qb2", "qb3", "tmdb", "ai", "wechat_claw"].includes(provider.provider));
+  const providerById = Object.fromEntries(providers.map((provider: any) => [provider.provider, provider]));
+  const steps = [
+    { id: "storage", label: "NAS 存储", ready: Boolean(storage.data?.nas_storage_readable) },
+    { id: "mteam", label: "M-Team", ready: providerStepReady(providerById.mteam) },
+    { id: "downloaders", label: "下载器", ready: ["qb1", "qb2", "qb3"].every((id) => providerStepReady(providerById[id])) },
+    { id: "tmdb", label: "TMDB", ready: providerStepReady(providerById.tmdb) },
+    { id: "ai", label: "AI", ready: providerStepReady(providerById.ai) },
+    { id: "wechat_claw", label: "WeChat claw", ready: providerStepReady(providerById.wechat_claw) },
+  ];
+  const activeProvider = providerById[activeStep];
+
+  function selectStep(id: string) {
+    setActiveStep(id);
+    window.sessionStorage.setItem("ptmh.settings.activeStep", id);
+    window.requestAnimationFrame(() => document.getElementById("settings-active-card")?.scrollIntoView({ behavior: "smooth", block: "start" }));
+  }
+
   return (
-    <div className="grid-page">
-      <MemberManagementCard />
-      <Panel title="运行时凭据中心">
-        <p className="muted">凭据由后端加密保存；保存过的 API、账号、密码和路径会直接回填在输入框里，可显示或复制。</p>
+    <div className="grid-page settings-flow">
+      <Panel title="配置向导">
+        <div className="settings-stepper" aria-label="配置步骤">
+          {steps.map((step, index) => <button type="button" key={step.id} className={activeStep === step.id ? "settings-step active" : "settings-step"} onClick={() => selectStep(step.id)}>
+            <span className={step.ready ? "settings-step-dot ready" : "settings-step-dot pending"}>{index + 1}</span>
+            <span>{step.label}</span>
+          </button>)}
+        </div>
+        <p className="muted">按顺序完成连接测试；绿点表示配置已验证，红点表示尚未配置或测试未通过。点击任一步即可切换到对应配置。</p>
       </Panel>
-      <StorageSettingsCard status={storage.data} loading={storage.loading} error={storage.error} />
-      {data.providers
-        .filter((provider: any) => ["mteam", "qb1", "qb2", "qb3", "tmdb", "ai", "wechat_claw"].includes(provider.provider))
-        .map((provider: any) => <IntegrationEditor provider={provider} onChanged={reload} key={provider.provider} />)}
+      <div className="settings-active-card" id="settings-active-card" key={activeStep}>
+        {activeStep === "storage" ? <StorageSettingsCard status={storage.data} loading={storage.loading} error={storage.error} /> : activeStep === "downloaders" ? <DownloadersSettingsCard providers={[providerById.qb1, providerById.qb2, providerById.qb3]} onChanged={reload} /> : activeProvider ? <IntegrationEditor provider={activeProvider} onChanged={reload} /> : <Panel title="配置"><p className="muted">该配置项不可用。</p></Panel>}
+      </div>
+    </div>
+  );
+}
+
+function providerStepReady(provider: any): boolean {
+  const result = provider?.last_test_result;
+  return Boolean(provider?.enabled && result?.success === true && result?.can_enable !== false);
+}
+
+function DownloadersSettingsCard({ providers, onChanged }: { providers: any[]; onChanged: () => void }) {
+  return (
+    <div className="downloaders-settings-grid">
+      {providers.filter(Boolean).map((provider) => <IntegrationEditor key={provider.provider} provider={provider} onChanged={onChanged} />)}
     </div>
   );
 }
@@ -2089,7 +2474,7 @@ function StorageSettingsCard({ status, loading, error }: { status: any; loading:
       <div className="integration">
         <div className={`notice ${status?.nas_storage_readable ? "success" : "info"}`}>
           <strong>{loading ? "正在检测存储挂载..." : status?.nas_storage_summary_label || "未检测到存储挂载"}</strong>
-          <span>只需要在部署 YAML 左侧填写 NAS 真实文件夹路径；右侧 /mnt/storage1、/mnt/storage2、/mnt/storage3 由 APP 固定识别，不需要在设置里填写。</span>
+          <span>填写 NAS 文件夹路径后，即可在仪表盘查看空间使用情况。</span>
         </div>
         {error && <p className="error">{error}</p>}
         {detectedPaths.length > 0 ? (
@@ -2156,13 +2541,14 @@ function AiIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
     base_url: String(saved.base_url ?? "https://api.deepseek.com"),
     api_key: String(saved.api_key ?? ""),
     model: String(saved.model ?? "deepseek-v4-flash"),
-    timeout: String(saved.timeout ?? "30"),
+    timeout: String(saved.timeout ?? "90"),
     max_tokens: String(saved.max_tokens ?? "1200"),
     temperature: String(saved.temperature ?? "0.1"),
     thinking: saved.thinking === "enabled" ? "enabled" : "disabled",
     reasoning_effort: saved.reasoning_effort === "max" ? "max" : "high",
   });
   const [busy, setBusy] = useState("");
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [localError, setLocalError] = useState("");
   const [localResult, setLocalResult] = useState<IntegrationTestResult | null>(provider.last_test_result);
   const result = localResult ?? provider.last_test_result;
@@ -2177,7 +2563,7 @@ function AiIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
       base_url: form.base_url.trim() || "https://api.deepseek.com",
       api_key: form.api_key.trim(),
       model: form.model.trim() || "deepseek-v4-flash",
-      timeout: Number(form.timeout) || 30,
+      timeout: Math.max(90, Number(form.timeout) || 90),
       max_tokens: Number(form.max_tokens) || 1200,
       temperature: Number(form.temperature) || 0.1,
       thinking: form.thinking,
@@ -2194,9 +2580,9 @@ function AiIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
         success: false,
         provider: "ai",
         mode: "real",
-        message: "AI 草稿已保存。",
-        explanation: "DeepSeek 配置已加密保存到后端。启用前请先保存并测试。",
-        next_step: "确认 API Key、模型和余额可用后，点击保存并测试。",
+        message: "AI 助手设置已保存。",
+        explanation: "请完成连接测试后再启用。",
+        next_step: "点击“保存并测试”。",
       });
       onChanged();
     } catch (err) {
@@ -2234,48 +2620,49 @@ function AiIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
   }
 
   return (
-    <Panel title="AI / DeepSeek 配置">
+    <Panel title="AI 助手">
       <div className="integration tmdb-editor">
         <div className="notice info">
-          <strong>用于通知页和微信 claw 的自然语言入口</strong>
-          <span>DeepSeek 兼容 OpenAI Chat Completions。推荐 base_url 填 https://api.deepseek.com，模型填 deepseek-v4-flash 或 deepseek-v4-pro；deepseek-chat / deepseek-reasoner 将在 2026-07-24 15:59 UTC 弃用。</span>
+          <strong>影视中枢助手</strong>
+          <span>配置后，可在通知页和微信中用自然语言查询影视、资源与下载状态。</span>
         </div>
         <div className="settings-grid">
-          <label>DeepSeek base_url
-            <CopyableInput value={form.base_url} onChange={(value) => updateField("base_url", value)} placeholder="https://api.deepseek.com" inputMode="url" />
-          </label>
           <label>API Key
             <SecretInput value={form.api_key} onChange={(value) => updateField("api_key", value)} placeholder="从 platform.deepseek.com 创建并复制" autoComplete="off" />
+          </label>
+        </div>
+        <button className="inline-tool" type="button" onClick={() => setShowAdvanced((value) => !value)}>
+          <SlidersHorizontal size={16} /> {showAdvanced ? "隐藏高级设置" : "高级设置"}
+        </button>
+        {showAdvanced && <div className="settings-grid advanced-settings">
+          <label>服务地址
+            <CopyableInput value={form.base_url} onChange={(value) => updateField("base_url", value)} placeholder="https://api.deepseek.com" inputMode="url" />
           </label>
           <label>模型名称
             <CopyableInput value={form.model} onChange={(value) => updateField("model", value)} placeholder="deepseek-v4-flash" />
           </label>
-          <label>超时秒数
-            <CopyableInput value={form.timeout} onChange={(value) => updateField("timeout", value)} inputMode="numeric" placeholder="30" />
+          <label>响应等待时间（秒）
+            <CopyableInput value={form.timeout} onChange={(value) => updateField("timeout", value)} inputMode="numeric" placeholder="90" />
           </label>
-          <label>max_tokens
+          <label>最大回复长度
             <CopyableInput value={form.max_tokens} onChange={(value) => updateField("max_tokens", value)} inputMode="numeric" placeholder="1200" />
           </label>
-          <label>temperature
+          <label>回复随机度
             <CopyableInput value={form.temperature} onChange={(value) => updateField("temperature", value)} inputMode="decimal" placeholder="0.1" />
           </label>
-          <label>Thinking 模式
+          <label>深度思考
             <select value={form.thinking} onChange={(event) => updateField("thinking", event.target.value as AiForm["thinking"])}>
-              <option value="disabled">disabled：稳定 JSON 解析推荐</option>
-              <option value="enabled">enabled：需要复杂推理时使用</option>
+              <option value="disabled">关闭</option>
+              <option value="enabled">开启</option>
             </select>
           </label>
-          <label>Reasoning effort
+          <label>思考强度
             <select value={form.reasoning_effort} onChange={(event) => updateField("reasoning_effort", event.target.value as AiForm["reasoning_effort"])}>
-              <option value="high">high</option>
-              <option value="max">max</option>
+              <option value="high">标准</option>
+              <option value="max">更高</option>
             </select>
           </label>
-        </div>
-        <div className="field-help">
-          <strong>提示词与结构化输出</strong>
-          <span>后端会用 JSON Output 调用 DeepSeek，先把自然语言转换为 action/query/downloader_id/target 等字段，再执行查询或写入通知，最后再调用模型把结果整理成中文回复。</span>
-        </div>
+        </div>}
         <div className="actions">
           <button onClick={saveDraft} disabled={busy !== ""}>{busy === "draft" ? "正在保存..." : "保存草稿"}</button>
           <button className="primary" onClick={saveAndTest} disabled={busy !== ""}>{busy === "test" ? "正在测试..." : "保存并测试"}</button>
@@ -2283,7 +2670,7 @@ function AiIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
         </div>
         {!provider.enabled && !canEnable && <p className="muted">请先保存并测试，测试成功后再启用 AI 模块。</p>}
         {localError && <p className="error">{localError}</p>}
-        <TestResultCard result={result} emptyProvider="AI / DeepSeek" />
+        <TestResultCard result={result} emptyProvider="AI 助手" />
       </div>
     </Panel>
   );
@@ -2319,9 +2706,9 @@ function WechatClawQrCode({ value }: { value: string }) {
   }, [value]);
 
   if (value.trim().toLowerCase().startsWith("data:image/")) {
-    return <img className="wechat-qr-image" src={value} alt="WeChat claw iLink 登录二维码" />;
+    return <img className="wechat-qr-image" src={value} alt="微信登录二维码" />;
   }
-  if (src) return <img className="wechat-qr-image" src={src} alt="WeChat claw 配置二维码" />;
+  if (src) return <img className="wechat-qr-image" src={src} alt="微信绑定二维码" />;
   return (
     <div className="wechat-qr-placeholder">
       <RefreshCw size={24} />
@@ -2346,10 +2733,20 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
     default_downloader_id: ["qb1", "qb2", "qb3", "all"].includes(saved.default_downloader_id) ? saved.default_downloader_id : "all",
     timeout: String(saved.timeout ?? "10"),
   });
-  const setup = useLoad<any>(() => api("/api/admin/wechat-claw/setup"), [provider.config_version, provider.enabled], null, false);
+  const bindings = useLoad<any>(() => api("/api/admin/wechat-claw/bindings"), [provider.config_version], null, false);
+  const [selectedBindingId, setSelectedBindingId] = useState<number | null>(() => {
+    const savedBinding = Number(window.sessionStorage.getItem("ptmh.wechat.selectedMember"));
+    return Number.isFinite(savedBinding) && savedBinding > 0 ? savedBinding : null;
+  });
+  const setup = useLoad<any>(
+    () => selectedBindingId ? api(`/api/admin/wechat-claw/bindings/${selectedBindingId}/setup`) : Promise.resolve(null),
+    [provider.config_version, provider.enabled, selectedBindingId],
+    null,
+    false,
+  );
   const [busy, setBusy] = useState("");
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [localError, setLocalError] = useState("");
-  const [pollResult, setPollResult] = useState<any | null>(null);
   const [localResult, setLocalResult] = useState<IntegrationTestResult | null>(provider.last_test_result);
   const result = localResult ?? provider.last_test_result;
   const canEnable = result?.provider === "wechat_claw" && result?.success === true && result?.can_enable === true;
@@ -2372,6 +2769,15 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
     });
     setLocalResult(provider.last_test_result);
   }, [provider.config_version, provider.last_test_result]);
+
+  useEffect(() => {
+    const items = Array.isArray(bindings.data?.items) ? bindings.data.items : [];
+    if (!items.length) {
+      setSelectedBindingId(null);
+      return;
+    }
+    if (!items.some((item: any) => item.id === selectedBindingId)) setSelectedBindingId(items[0].id);
+  }, [bindings.data, selectedBindingId]);
 
   function updateField<K extends keyof WechatClawForm>(key: K, value: WechatClawForm[K]) {
     setForm((current) => ({ ...current, [key]: value }));
@@ -2403,9 +2809,9 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
         success: false,
         provider: "wechat_claw",
         mode: "real",
-        message: "WeChat claw iLink 草稿已保存。",
-        explanation: "iLink 地址、默认目标、管理员白名单和轮询超时已保存。启用前请先测试。",
-        next_step: "测试并启用后点击刷新二维码，用微信扫码绑定。",
+        message: "微信连接设置已保存。",
+        explanation: "请完成连接测试后再启用。",
+        next_step: "测试并启用后，刷新二维码并用微信扫码绑定。",
       });
       onChanged();
       await setup.reload();
@@ -2456,15 +2862,15 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
   const qrText = String(setup.data?.qr_text || "");
   const qrcode = setup.data?.qrcode ?? {};
   const qrReady = Boolean(qrcode.qrcode_url || setupPayload.qrcode_url);
-  const interactions: WechatClawInteraction[] = Array.isArray(setup.data?.recent_interactions) ? setup.data.recent_interactions : [];
-  const lastPoll = pollResult ?? setup.data?.last_poll ?? {};
   const loginStatus = setup.data?.connected ? "已登录" : provider.enabled ? "等待扫码" : "未启用";
+  const selectedBinding = (bindings.data?.items ?? []).find((item: any) => item.id === selectedBindingId);
 
   async function refreshQrcode() {
     setBusy("refresh");
     setLocalError("");
     try {
-      await api("/api/admin/wechat-claw/refresh", { method: "POST" });
+      if (!selectedBindingId) return;
+      await api(`/api/admin/wechat-claw/bindings/${selectedBindingId}/refresh`, { method: "POST" });
       await setup.reload();
     } catch (err) {
       setLocalError((err as Error).message);
@@ -2477,7 +2883,8 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
     setBusy("logout");
     setLocalError("");
     try {
-      await api("/api/admin/wechat-claw/logout", { method: "POST" });
+      if (!selectedBindingId) return;
+      await api(`/api/admin/wechat-claw/bindings/${selectedBindingId}/logout`, { method: "POST" });
       await setup.reload();
     } catch (err) {
       setLocalError((err as Error).message);
@@ -2486,13 +2893,31 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
     }
   }
 
-  async function pollOnce() {
-    setBusy("poll");
+  async function addBinding() {
+    setBusy("add");
     setLocalError("");
     try {
-      const response = await api<any>("/api/admin/wechat-claw/poll", { method: "POST" });
-      setPollResult(response);
-      await setup.reload();
+      const binding = await api<any>("/api/admin/wechat-claw/bindings", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      await bindings.reload();
+      setSelectedBindingId(binding.id);
+    } catch (err) {
+      setLocalError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function removeBinding() {
+    if (!selectedBindingId || !window.confirm("删除这个微信绑定吗？它的登录态和互动记录也会删除。")) return;
+    setBusy("remove");
+    setLocalError("");
+    try {
+      await api(`/api/admin/wechat-claw/bindings/${selectedBindingId}`, { method: "DELETE" });
+      setSelectedBindingId(null);
+      await bindings.reload();
     } catch (err) {
       setLocalError((err as Error).message);
     } finally {
@@ -2501,40 +2926,49 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
   }
 
   return (
-    <Panel title="WeChat claw 配置">
+    <Panel title="微信连接">
       <div className="integration wechat-config">
         <div className={`notice ${setup.data?.connected ? "success" : "info"}`}>
-          <strong>iLink 扫码登录</strong>
-          <span>和 MoviePilot 一样，NAS 主动长轮询 iLink 服务收微信消息，不需要公网 IP。扫码绑定后可从微信发起资源查询、下载通知记录和各板块状态查询。</span>
+          <strong>{setup.data?.connected ? "配置可用" : "扫码绑定微信"}</strong>
+          <span>{setup.data?.connected ? `${selectedBinding?.display_name || "当前成员"} 已完成扫码绑定，可以接收主动通知。` : "绑定后，可在手机上查询影视、搜索资源、发起下载并接收通知。"}</span>
         </div>
 
+        <div className="wechat-binding-tabs" aria-label="WeChat claw 成员">
+          <label>当前成员
+            <select value={selectedBindingId ?? ""} onChange={(event) => setSelectedBindingId(Number(event.target.value) || null)} disabled={!bindings.data?.items?.length}>
+              {(bindings.data?.items ?? []).map((binding: any) => <option key={binding.id} value={binding.id}>{binding.display_name}</option>)}
+            </select>
+          </label>
+          <button type="button" className="primary" onClick={addBinding} disabled={busy !== ""}><Plus size={16} /> 添加成员</button>
+        </div>
+        {!selectedBindingId && <p className="muted">先添加一个微信成员，再生成二维码完成绑定。</p>}
+
         <div className="settings-grid">
-          <label>名称
-            <CopyableInput value={form.name} onChange={(value) => updateField("name", value)} placeholder="通知1" />
-          </label>
-          <label>iLink 地址
-            <CopyableInput value={form.base_url} onChange={(value) => updateField("base_url", value)} placeholder="https://ilinkai.weixin.qq.com" inputMode="url" />
-          </label>
-          <label>默认通知目标
-            <CopyableInput value={form.default_target} onChange={(value) => updateField("default_target", value)} placeholder="可填用户 userid；留空发给最近互动用户" />
-          </label>
-          <label>管理员白名单
-            <CopyableInput value={form.admin_user_ids} onChange={(value) => updateField("admin_user_ids", value)} placeholder="多个 userid 用英文逗号分隔" />
-          </label>
           <label>默认下载器
             <select value={form.default_downloader_id} onChange={(event) => updateField("default_downloader_id", event.target.value as WechatClawForm["default_downloader_id"])}>
-              <option value="all">自动 / 全部</option>
+              <option value="all">自动选择</option>
               <option value="qb1">qB1</option>
               <option value="qb2">qB2</option>
               <option value="qb3">qB3</option>
             </select>
           </label>
+        </div>
+        <button className="inline-tool" type="button" onClick={() => setShowAdvanced((value) => !value)}>
+          <SlidersHorizontal size={16} /> {showAdvanced ? "隐藏高级设置" : "高级设置"}
+        </button>
+        {showAdvanced && <div className="settings-grid advanced-settings">
+          <label>微信服务地址
+            <CopyableInput value={form.base_url} onChange={(value) => updateField("base_url", value)} placeholder="https://ilinkai.weixin.qq.com" inputMode="url" />
+          </label>
+          <label>默认通知对象
+            <CopyableInput value={form.default_target} onChange={(value) => updateField("default_target", value)} placeholder="留空时发送给最近互动的成员" />
+          </label>
           <label>轮询超时（秒）
             <CopyableInput value={form.poll_timeout} onChange={(value) => updateField("poll_timeout", value)} inputMode="numeric" placeholder="25" />
           </label>
-        </div>
+        </div>}
 
-        <div className="wechat-setup-card">
+        {selectedBindingId && <div className="wechat-setup-card">
           <div className="wechat-setup-main">
             <div className="wechat-status-line">
               <span>配置状态</span>
@@ -2548,52 +2982,27 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
             )}
             <div className="actions compact-actions">
               <button type="button" onClick={refreshQrcode} disabled={busy !== "" || !provider.enabled}>{busy === "refresh" ? "刷新中..." : "刷新二维码"}</button>
-              <button type="button" onClick={pollOnce} disabled={busy !== "" || !setup.data?.connected}>{busy === "poll" ? "轮询中..." : "轮询一次"}</button>
               <button type="button" onClick={logoutWechat} disabled={busy !== "" || !setup.data?.connected}>{busy === "logout" ? "退出中..." : "退出登录"}</button>
             </div>
           </div>
 
           <div className="wechat-setup-side">
             <div className="field-help compact-help">
-              <strong>iLink 状态</strong>
-              <span>服务：<code>{setup.data?.base_url || form.base_url}</code></span>
-              <span>账号：<code>{setup.data?.account_id || "-"}</code></span>
-              <span>二维码状态：<code>{qrcode.status || "waiting"}</code></span>
-            </div>
-            <div className={lastPoll.success ? "field-help compact-help wechat-poll-status success" : "field-help compact-help wechat-poll-status"}>
-              <strong>最近轮询</strong>
-              <span>{lastPoll.updated_at ? new Date(lastPoll.updated_at).toLocaleString() : "尚未轮询"}</span>
-              {lastPoll.updated_at && <span>原始消息 {lastPoll.raw_count ?? 0} / 成功解析 {lastPoll.parsed_count ?? 0} / 已处理 {lastPoll.handled_count ?? 0} / 已回发 {lastPoll.reply_sent_count ?? 0} / 待重试 {lastPoll.pending_count ?? 0}</span>}
-              {lastPoll.message && <span>{lastPoll.message}</span>}
-              {Array.isArray(lastPoll.handled) && lastPoll.handled.filter((item: any) => item.error || item.delivery_reason).slice(0, 3).map((item: any, index: number) => (
-                <span key={`${item.message_id || item.user_id || index}-${index}`}>消息 {item.message_id || item.user_id || index + 1}：{item.error || item.delivery_reason}</span>
-              ))}
-            </div>
-            <div className="wechat-interactions">
-              <div className="wechat-interactions-head">
-                <strong>最近互动用户</strong>
-                <small>{interactions.length ? `${interactions.length} 条` : "暂无记录"}</small>
-              </div>
-              {interactions.length > 0 ? interactions.map((item, index) => (
-                <div className="wechat-interaction-item" key={`${item.created_at || index}-${item.user_id || "user"}`}>
-                  <strong>{item.user_id || "unknown"} <span>{item.action || "message"}{item.target ? ` / ${item.target}` : ""}</span></strong>
-                  <p>{item.message}</p>
-                  <small>{item.created_at ? new Date(item.created_at).toLocaleString() : ""}</small>
-                </div>
-              )) : <p className="muted">扫码后，手机端首次发消息会出现在这里。</p>}
+              <strong>微信连接状态</strong>
+              <span>账号：{setup.data?.account_id || "等待扫码"}</span>
+              <span>二维码：{qrcode.status === "confirmed" ? "已确认" : qrcode.status === "expired" ? "已过期" : "等待扫码"}</span>
             </div>
           </div>
-        </div>
+        </div>}
 
         <div className="actions">
           <button onClick={saveDraft} disabled={busy !== ""}>{busy === "draft" ? "正在保存..." : "保存草稿"}</button>
           <button className="primary" onClick={saveAndTest} disabled={busy !== ""}>{busy === "test" ? "正在测试..." : "保存并测试"}</button>
           <button onClick={toggleEnabled} disabled={busy !== "" || (!provider.enabled && !canEnable)}>{provider.enabled ? "停用" : "启用"}</button>
         </div>
-        {!provider.enabled && !canEnable && <p className="muted">请先保存并测试，测试成功后再启用 WeChat claw。</p>}
+        {!provider.enabled && !canEnable && <p className="muted">请先保存并测试，测试成功后再启用微信连接。</p>}
         {setup.error && <p className="error">{setup.error}</p>}
         {localError && <p className="error">{localError}</p>}
-        <TestResultCard result={result} emptyProvider="WeChat claw" />
       </div>
     </Panel>
   );
@@ -2743,13 +3152,12 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
   const label = downloaderShortLabel(provider.provider);
   const saved = provider.saved_payload ?? {};
   const [form, setForm] = useState<QbForm>({
-    name: String(saved.name ?? label),
     base_url: String(saved.base_url ?? ""),
     username: String(saved.username ?? ""),
     password: String(saved.password ?? ""),
     timeout: String(saved.timeout ?? "10"),
-    default_save_path: String(saved.default_save_path ?? "")
   });
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [busy, setBusy] = useState("");
   const [localError, setLocalError] = useState("");
   const [localResult, setLocalResult] = useState<IntegrationTestResult | null>(provider.last_test_result);
@@ -2762,12 +3170,10 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
 
   function payload() {
     return {
-      name: form.name.trim() || label,
       base_url: form.base_url.trim(),
       username: form.username.trim(),
       password: form.password,
       timeout: Number(form.timeout) || 10,
-      default_save_path: form.default_save_path.trim(),
     };
   }
 
@@ -2781,8 +3187,8 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
         provider: provider.provider,
         mode: "real",
         message: "草稿已保存。",
-        explanation: "qB 凭据已经加密保存到后端。实时读取任务前，请点击“保存并测试”。",
-        next_step: "确认 qB WebUI 地址、账号和密码可用后再启用。"
+        explanation: "连接信息已保存。",
+        next_step: "点击“保存并测试”确认连接。"
       });
       onChanged();
     } catch (err) {
@@ -2823,13 +3229,10 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
     <Panel title={`${label} 配置`}>
       <div className="integration tmdb-editor">
         <div className="notice info">
-          <strong>用于实时读取 qBittorrent WebUI 中的下载器状态和任务列表</strong>
-          <span>必填：WebUI 地址、用户名、密码。存储空间由部署 YAML 的固定挂载自动检测，qB 设置里不需要填写容器路径。</span>
+          <strong>连接下载器</strong>
+          <span>连接后可查看下载任务与状态，并作为默认下载器使用。</span>
         </div>
         <div className="settings-grid">
-          <label>显示名称
-            <CopyableInput value={form.name} onChange={(value) => updateField("name", value)} placeholder="例如 主下载器 / 动漫下载器" />
-          </label>
           <label>qB WebUI 地址（必填）
             <CopyableInput value={form.base_url} onChange={(value) => updateField("base_url", value)} placeholder="例如 http://192.168.1.20:8080" />
           </label>
@@ -2839,17 +3242,15 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
           <label>密码（必填）
             <SecretInput value={form.password} onChange={(value) => updateField("password", value)} placeholder="qB WebUI 密码" autoComplete="new-password" />
           </label>
+        </div>
+        <button className="inline-tool" type="button" onClick={() => setShowAdvanced((value) => !value)}>
+          <SlidersHorizontal size={16} /> {showAdvanced ? "隐藏高级设置" : "高级设置"}
+        </button>
+        {showAdvanced && <div className="settings-grid advanced-settings">
           <label>超时时间（秒）
             <CopyableInput value={form.timeout} onChange={(value) => updateField("timeout", value)} inputMode="numeric" placeholder="10" />
           </label>
-          <label>默认保存路径（可选）
-            <CopyableInput value={form.default_save_path} onChange={(value) => updateField("default_save_path", value)} placeholder="例如 /downloads/media 或 D:\\Downloads" />
-          </label>
-        </div>
-        <div className="field-help">
-          <strong>实际需要你提供：</strong>
-          <span>局域网地址就是 qB WebUI 地址；账号密码用于登录 Web API；默认保存路径用于添加新任务时指定位置。NAS 总空间请在部署 YAML 左侧填写真实 NAS 文件夹路径，APP 会自动读取 /mnt/storage1~3 并按存储池去重。</span>
-        </div>
+        </div>}
         <div className="actions">
           <button onClick={saveDraft} disabled={busy !== ""}>{busy === "draft" ? "正在保存..." : "保存草稿"}</button>
           <button className="primary" onClick={saveAndTest} disabled={busy !== ""}>{busy === "test" ? "正在测试..." : "保存并测试"}</button>
@@ -2910,8 +3311,8 @@ function MTeamIntegrationEditor({ provider, onChanged }: { provider: any; onChan
         provider: "mteam",
         mode: "mock",
         message: "草稿已保存。",
-        explanation: "M-Team 凭据已经加密保存到后端，并会回填到当前输入框。",
-        next_step: "点击“保存并测试”确认站点链接状态。"
+        explanation: "连接信息已保存。",
+        next_step: "点击“保存并测试”确认连接。"
       });
       onChanged();
     } catch (err) {
@@ -2952,15 +3353,20 @@ function MTeamIntegrationEditor({ provider, onChanged }: { provider: any; onChan
     <Panel title="M-Team 配置">
       <div className="integration tmdb-editor">
         <div className="notice info">
-          <strong>用来读取 M-Team 站点的用户数据与资源查询</strong>
-          <span>真实 API 需要 M-Team API Key；Cookie 和 Passkey 只作为兼容字段保存。敏感字段默认用星号遮住，可点眼睛查看。</span>
+          <strong>连接 M-Team</strong>
+          <span>配置后可查询站内资源、查看账号状态并从手机端发起下载。</span>
         </div>
         <div className="settings-grid">
-          <label>站点地址
-            <CopyableInput value={form.base_url} onChange={(value) => updateField("base_url", value)} placeholder="https://kp.m-team.cc" />
-          </label>
           <label>API Key
             <SecretInput value={form.api_key} onChange={(value) => updateField("api_key", value)} placeholder="从 M-Team 个人资料复制 API Key" autoComplete="off" />
+          </label>
+        </div>
+        <button className="inline-tool" type="button" onClick={() => setShowAdvanced((value) => !value)}>
+          <SlidersHorizontal size={16} /> {showAdvanced ? "隐藏高级设置" : "高级设置"}
+        </button>
+        {showAdvanced && <div className="settings-grid advanced-settings">
+          <label>站点地址
+            <CopyableInput value={form.base_url} onChange={(value) => updateField("base_url", value)} placeholder="https://kp.m-team.cc" />
           </label>
           <label>User-Agent
             <CopyableInput value={form.user_agent} onChange={(value) => updateField("user_agent", value)} placeholder="浏览器或 PT-Media-Hub" />
@@ -2974,15 +3380,10 @@ function MTeamIntegrationEditor({ provider, onChanged }: { provider: any; onChan
           <label>超时时间（秒）
             <CopyableInput value={form.timeout} onChange={(value) => updateField("timeout", value)} inputMode="numeric" placeholder="10" />
           </label>
-        </div>
-        <button className="inline-tool" type="button" onClick={() => setShowAdvanced((value) => !value)}>
-          <SlidersHorizontal size={16} /> {showAdvanced ? "隐藏高级设置" : "显示高级设置"}
-        </button>
-        {showAdvanced && (
           <label>Authorization
             <SecretInput value={form.authorization} onChange={(value) => updateField("authorization", value)} placeholder="可选，例如 Bearer token" autoComplete="off" />
           </label>
-        )}
+        </div>}
         <div className="actions">
           <button onClick={saveDraft} disabled={busy !== ""}>{busy === "draft" ? "正在保存..." : "保存草稿"}</button>
           <button className="primary" onClick={saveAndTest} disabled={busy !== ""}>{busy === "test" ? "正在测试..." : "保存并测试"}</button>
@@ -3044,9 +3445,8 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
         mode: "real",
         can_enable: false,
         message: "草稿已保存。",
-        explanation: "密钥已经加密保存到后端，并会回填到当前输入框。",
-        next_step: "如果你还没有测试，请点击“保存并测试”。测试成功后再启用 TMDB。",
-        detail: tmdbNetworkDetail(form)
+        explanation: "密钥已保存。",
+        next_step: "点击“保存并测试”，确认连接后再启用 TMDB。",
       });
       onChanged();
     } catch (err) {
@@ -3086,89 +3486,55 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
   }
 
   const isProxyMode = form.mode === "proxy";
-  const networkDetail = result?.detail ?? tmdbNetworkDetail(form);
 
   return (
     <Panel title="TMDB 配置">
       <div className="integration tmdb-editor">
         <div className="notice info">
-          <strong>TMDB 只支持两种网络模式</strong>
-          <span>默认使用直连 + DoH。只有选择 mihomo VPN 代理时，TMDB 请求才会交给 mihomo；qB、M-Team 和 NAS 功能始终直连。</span>
+          <strong>影视资料库</strong>
+          <span>配置后，可在发现页和 AI 助手中查询电影、剧集和演员信息。</span>
         </div>
+        <div className="settings-grid">
+          <label>TMDB Bearer Token
+            <SecretInput value={form.bearer_token} onChange={(value) => updateField("bearer_token", value)} placeholder="从 TMDB 账号设置中复制" autoComplete="off" />
+          </label>
+        </div>
+        <button className="inline-tool" type="button" onClick={() => setShowAdvanced((value) => !value)}>
+          <SlidersHorizontal size={16} /> {showAdvanced ? "隐藏高级设置" : "高级设置"}
+        </button>
+        {showAdvanced && <div className="integration advanced-settings">
         <div className="tmdb-mode-row">
           <span>连接方式</span>
           <div className="segmented compact">
             <button type="button" className={!isProxyMode ? "active" : ""} onClick={() => updateField("mode", "direct")}>
-              <Radar size={16} /> 直连 TMDB + DoH
+              <Radar size={16} /> 默认
             </button>
             <button type="button" className={isProxyMode ? "active" : ""} onClick={() => updateField("mode", "proxy")}>
-              <ShieldCheck size={16} /> mihomo VPN 代理
+              <ShieldCheck size={16} /> 使用代理
             </button>
           </div>
         </div>
-        <div className="field-help compact-help">
-          <strong>网络边界</strong>
-          <span>{networkDetail.route_label || "TMDB：直连 + DoH"}</span>
-          <span>qB 下载器：强制直连</span>
-          <span>M-Team：强制直连</span>
-          {networkDetail.proxy_enabled && <span>TMDB 请求路径：{networkDetail.proxy_url || form.proxy_url || "mihomo:7890"}</span>}
+        <div className="settings-grid">
+          {isProxyMode && <label>代理地址
+            <CopyableInput value={form.proxy_url} onChange={(value) => updateField("proxy_url", value)} placeholder="http://mihomo:7890" inputMode="url" />
+          </label>}
+          <label>语言
+            <CopyableInput value={form.language} onChange={(value) => updateField("language", value)} placeholder="zh-CN" />
+          </label>
+          <label>地区
+            <CopyableInput value={form.region} onChange={(value) => updateField("region", value)} placeholder="CN" />
+          </label>
+          <label>API Key
+            <SecretInput value={form.api_key} onChange={(value) => updateField("api_key", value)} placeholder="仅在无法使用 Bearer Token 时填写" autoComplete="off" />
+          </label>
+          <label>服务地址
+            <CopyableInput value={form.endpoint} onChange={(value) => updateField("endpoint", value)} placeholder="通常无需修改" />
+          </label>
+          <label>超时时间（秒）
+            <CopyableInput value={form.timeout} onChange={(value) => updateField("timeout", value)} inputMode="numeric" placeholder="12" />
+          </label>
         </div>
-        {isProxyMode ? (
-          <>
-            <div className="settings-grid">
-              <label>mihomo 代理地址
-                <CopyableInput value={form.proxy_url} onChange={(value) => updateField("proxy_url", value)} placeholder="http://mihomo:7890" inputMode="url" />
-                <small className="field-note">Docker Compose 默认服务名是 mihomo，端口是 7890。这个地址只用于 TMDB。</small>
-              </label>
-              <label>TMDB Bearer Token
-                <SecretInput value={form.bearer_token} onChange={(value) => updateField("bearer_token", value)} placeholder="从 TMDB 账号后台复制，通常以 eyJ 开头" autoComplete="off" />
-                <small className="field-note">推荐只填 Bearer Token。代理只改变网络路径，不改变 TMDB 鉴权方式。</small>
-              </label>
-              <label>语言 / 地区
-                <div className="split-inputs">
-                  <CopyableInput value={form.language} onChange={(value) => updateField("language", value)} placeholder="zh-CN" />
-                  <CopyableInput value={form.region} onChange={(value) => updateField("region", value)} placeholder="CN" />
-                </div>
-              </label>
-            </div>
-            <div className="field-help compact-help">
-              <strong>mihomo 配置要求</strong>
-              <span>请把 Clash Verge 导出的节点放到 nas-mihomo/config.yaml，并保留规则：TMDB 域名走代理，MATCH 走 DIRECT。</span>
-            </div>
-          </>
-        ) : (
-          <>
-            <div className="settings-grid">
-              <label>TMDB v4 Bearer Token
-                <SecretInput value={form.bearer_token} onChange={(value) => updateField("bearer_token", value)} placeholder="以 eyJ 开头的一长串访问令牌" autoComplete="off" />
-                <small className="field-note">推荐只填这个。APP 会通过 doh.pub 解析 TMDB，并使用 IPv4 访问。</small>
-              </label>
-              <label>语言
-                <CopyableInput value={form.language} onChange={(value) => updateField("language", value)} placeholder="zh-CN" />
-              </label>
-              <label>地区
-                <CopyableInput value={form.region} onChange={(value) => updateField("region", value)} placeholder="CN" />
-              </label>
-            </div>
-            {form.api_key.trim() && form.bearer_token.trim() && <p className="muted">已同时填写 API Key 和 Bearer Token，测试和发现页会优先使用 Bearer Token。</p>}
-            <button className="inline-tool" type="button" onClick={() => setShowAdvanced((value) => !value)}>
-              <SlidersHorizontal size={16} /> {showAdvanced ? "隐藏直连高级设置" : "显示直连高级设置"}
-            </button>
-            {showAdvanced && (
-              <div className="settings-grid">
-                <label>API Key
-                  <SecretInput value={form.api_key} onChange={(value) => updateField("api_key", value)} placeholder="可选，通常不需要；Bearer Token 优先" autoComplete="off" />
-                </label>
-                <label>TMDB 接口地址
-                  <CopyableInput value={form.endpoint} onChange={(value) => updateField("endpoint", value)} placeholder="默认 https://api.themoviedb.org/3，通常不用修改" />
-                </label>
-              </div>
-            )}
-          </>
-        )}
-        <label className="compact-field">超时时间（秒）
-          <CopyableInput value={form.timeout} onChange={(value) => updateField("timeout", value)} inputMode="numeric" placeholder="12" />
-        </label>
+        </div>}
         <div className="actions">
           <button onClick={saveDraft} disabled={busy !== ""}>{busy === "draft" ? "正在保存..." : "保存草稿"}</button>
           <button className="primary" onClick={saveAndTest} disabled={busy !== ""}>{busy === "test" ? "正在测试..." : "保存并测试"}</button>
@@ -3180,27 +3546,6 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
       </div>
     </Panel>
   );
-}
-
-function tmdbNetworkDetail(form: TmdbForm): IntegrationTestResult["detail"] {
-  const proxyUrl = form.proxy_url.trim() || "http://mihomo:7890";
-  const proxyHost = displayProxyHost(proxyUrl);
-  return {
-    network_mode: form.mode === "proxy" ? "proxy" : "direct",
-    route_label: form.mode === "proxy" ? "TMDB：mihomo VPN 代理" : "TMDB：直连 + DoH",
-    proxy_enabled: form.mode === "proxy",
-    proxy_url: form.mode === "proxy" ? proxyHost : "",
-    non_tmdb_policy: "direct_only",
-  };
-}
-
-function displayProxyHost(value: string): string {
-  try {
-    const url = new URL(value.includes("://") ? value : `http://${value}`);
-    return url.host || value;
-  } catch {
-    return value;
-  }
 }
 
 function TestResultCard({ result, emptyProvider }: { result?: IntegrationTestResult | null; emptyProvider: string }) {
@@ -3218,11 +3563,6 @@ function TestResultCard({ result, emptyProvider }: { result?: IntegrationTestRes
       <strong>{result.message ?? (result.success ? "测试成功" : "测试失败")}</strong>
       {result.explanation && <span>{result.explanation}</span>}
       {result.next_step && <span>下一步：{result.next_step}</span>}
-      {result.detail?.route_label && <small>TMDB 请求路径：{result.detail.route_label}</small>}
-      {result.detail?.proxy_enabled && result.detail?.proxy_url && <small>代理地址：{result.detail.proxy_url}</small>}
-      {result.detail?.image_probe?.checked && <small>图片域：{result.detail.image_probe.ok ? "image.tmdb.org 可访问" : `image.tmdb.org 失败：${result.detail.image_probe.error || result.detail.image_probe.reason || "未知错误"}`}</small>}
-      {result.detail?.non_tmdb_policy === "direct_only" && <small>qB / M-Team / NAS：强制直连</small>}
-      {result.http_status && <small>HTTP 状态码：{result.http_status}</small>}
       {result.trace_id && <small>诊断编号：{result.trace_id}</small>}
     </div>
   );
@@ -3323,6 +3663,7 @@ function diagnosticModuleName(module: string): string {
     qb2: "qB下载器2",
     qb3: "qB下载器3",
     tmdb: "TMDB",
+    ai: "AI 模块",
     nas_disk: "NAS 存储",
     stats_engine: "数据统计",
   };
@@ -3346,6 +3687,7 @@ function DiagnosticsPage() {
   const health = useLoad<any>(() => api("/api/diagnostics/health"), []);
   const [exportPayload, setExportPayload] = useState<any | null>(null);
   const modules = health.data?.modules ?? [];
+  const members = health.data?.wechat_members ?? [];
 
   return (
     <div className="grid-page">
@@ -3365,6 +3707,26 @@ function DiagnosticsPage() {
             );
           })}
           {!modules.length && <p className="muted">暂无健康检测数据。</p>}
+        </div>
+      </Panel>
+      <Panel title="WeChat claw 成员状态">
+        <div className="diagnostics-member-list">
+          {members.map((member: any) => {
+            const connected = Boolean(member.connected);
+            const tone = connected ? "success" : member.configured ? "failed" : "neutral";
+            const lastPoll = member.last_poll ?? {};
+            return (
+              <article className={`diagnostic-card diagnostic-member-card ${tone}`} key={member.id}>
+                <div>
+                  <span className="diagnostic-member-title"><MemberAvatar member={member} size="small" /><strong>{member.display_name}</strong></span>
+                  <span className="diagnostic-status-pill">{connected ? "已连接" : member.configured ? "等待扫码" : "未配置"}</span>
+                </div>
+                <small>微信：{member.account_id || member.qrcode_status || "尚未绑定"}</small>
+                <small>最近同步：{lastPoll.updated_at ? new Date(lastPoll.updated_at).toLocaleString() : "尚未同步"}{lastPoll.message ? ` · ${lastPoll.message}` : ""}</small>
+              </article>
+            );
+          })}
+          {!members.length && <p className="muted">尚未创建 WeChat claw 成员。</p>}
         </div>
       </Panel>
       <Panel title="诊断导出">
@@ -4419,7 +4781,7 @@ function mteamResourceDetailUrl(item: any): string {
   return String(item?.detail_url || item?.detailUrl || item?.page_url || item?.pageUrl || "").trim();
 }
 
-const pages: Record<NavKey, (props: { user: User; resetToken?: number; selectedDownloader?: string; onOpenDownloader?: (downloaderId: string) => void }) => ReactNode> = {
+const pages: Record<NavKey, (props: { user: User; resetToken?: number; selectedDownloader?: string; onNavigate?: (key: NavKey) => void; onOpenDownloader?: (downloaderId: string) => void }) => ReactNode> = {
   discover: DiscoverPage,
   dashboard: DashboardPage,
   downloads: DownloadsPage,

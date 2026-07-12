@@ -71,8 +71,10 @@ def normalize_payload(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
             normalized["thinking"] = "disabled"
         if normalized.get("reasoning_effort") not in {"high", "max"}:
             normalized["reasoning_effort"] = "high"
-        if not normalized.get("timeout"):
-            normalized["timeout"] = 30
+        try:
+            normalized["timeout"] = max(90, min(300, int(normalized.get("timeout") or 90)))
+        except (TypeError, ValueError):
+            normalized["timeout"] = 90
         if not normalized.get("max_tokens"):
             normalized["max_tokens"] = 1200
         if not normalized.get("temperature"):

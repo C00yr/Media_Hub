@@ -7,6 +7,8 @@ from sqlalchemy.orm import Session
 
 from app.adapters.qbittorrent import QbittorrentWebAdapter
 from app.adapters.mteam import MTeamAdapter
+from app.adapters.ai import DeepSeekChatAdapter
+from app.adapters.tmdb import TmdbAdapter
 from app.db.session import SessionLocal
 from app.models.entities import MTeamSnapshot, QbSnapshot
 from app.services.integrations import get_config, get_decrypted_config
@@ -38,8 +40,11 @@ def capture_snapshots() -> None:
                         source="real",
                     )
                 )
-            except Exception:
-                pass
+                from app.api.routes import record_module_collection_result
+                record_module_collection_result(db, "mteam", True)
+            except Exception as exc:
+                from app.api.routes import record_module_collection_result
+                record_module_collection_result(db, "mteam", False, str(exc))
         for downloader_id in ["qb1", "qb2", "qb3"]:
             row = get_config(db, downloader_id)
             if not row or not row.enabled or not row.encrypted_payload:
@@ -58,9 +63,31 @@ def capture_snapshots() -> None:
                         source="real",
                     )
                 )
-            except Exception:
-                pass
+                from app.api.routes import record_module_collection_result
+                record_module_collection_result(db, downloader_id, True)
+            except Exception as exc:
+                from app.api.routes import record_module_collection_result
+                record_module_collection_result(db, downloader_id, False, str(exc))
         db.commit()
+    finally:
+        db.close()
+
+
+def check_external_module_health() -> None:
+    """Run the non-snapshot integrations once per hour for sustained outage alerts."""
+    db: Session = SessionLocal()
+    try:
+        from app.api.routes import record_module_collection_result
+
+        for provider, factory in (("ai", DeepSeekChatAdapter), ("tmdb", TmdbAdapter)):
+            row = get_config(db, provider)
+            if not row or not row.enabled or not row.encrypted_payload:
+                continue
+            try:
+                factory(get_decrypted_config(db, provider) or {}).test_connection()
+                record_module_collection_result(db, provider, True)
+            except Exception as exc:
+                record_module_collection_result(db, provider, False, str(exc))
     finally:
         db.close()
 
@@ -95,6 +122,9 @@ def _wechat_claw_poll_loop() -> None:
             binding_user_ids = list_wechat_claw_binding_user_ids(db)
             db.close()
             db = None
+            if not binding_user_ids:
+                delay_seconds = 5.0
+                continue
 
             def poll_binding(user_id: int | None) -> dict:
                 binding_db = SessionLocal()
@@ -106,6 +136,12 @@ def _wechat_claw_poll_loop() -> None:
             with ThreadPoolExecutor(max_workers=min(max(len(binding_user_ids), 1), 8), thread_name_prefix="wechat-claw-binding") as executor:
                 results = list(executor.map(poll_binding, binding_user_ids))
             result = next((item for item in results if item.get("success")), results[0])
+            from app.api.routes import record_module_collection_result
+            monitor_db = SessionLocal()
+            try:
+                record_module_collection_result(monitor_db, "wechat_claw", bool(result.get("success")), str(result.get("message") or "WeChat claw polling failed"))
+            finally:
+                monitor_db.close()
             if result.get("retry_after_seconds") is not None:
                 delay_seconds = max(0.2, min(float(result["retry_after_seconds"]), 5.0))
             elif result.get("success"):
@@ -148,5 +184,6 @@ def stop_wechat_claw_polling() -> None:
 def build_scheduler(interval_minutes: int) -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(capture_snapshots, "interval", minutes=interval_minutes, id="app_snapshots", replace_existing=True)
+    scheduler.add_job(check_external_module_health, "interval", hours=1, id="external_module_health", replace_existing=True, next_run_time=datetime.utcnow())
     scheduler.add_job(refresh_preload_caches, "interval", hours=1, id="preload_caches", replace_existing=True, next_run_time=datetime.utcnow())
     return scheduler

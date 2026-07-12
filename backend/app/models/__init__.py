@@ -14,6 +14,7 @@ from app.models.entities import (
     StatRule,
     User,
     UserSession,
+    WechatClawBinding,
 )
 
 __all__ = [
@@ -32,5 +33,5 @@ __all__ = [
     "StatRule",
     "User",
     "UserSession",
+    "WechatClawBinding",
 ]
-

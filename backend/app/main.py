@@ -20,14 +20,19 @@ def ensure_schema_compatibility() -> None:
     if not settings.database_url.startswith("sqlite"):
         return
     inspector = inspect(engine)
-    if "mteam_snapshots" not in inspector.get_table_names():
-        return
-    columns = {column["name"] for column in inspector.get_columns("mteam_snapshots")}
+    tables = set(inspector.get_table_names())
     with engine.begin() as connection:
-        if "user_level" not in columns:
-            connection.execute(text("ALTER TABLE mteam_snapshots ADD COLUMN user_level VARCHAR(64) DEFAULT ''"))
-        if "seed_size" not in columns:
-            connection.execute(text("ALTER TABLE mteam_snapshots ADD COLUMN seed_size FLOAT DEFAULT 0"))
+        if "mteam_snapshots" in tables:
+            columns = {column["name"] for column in inspector.get_columns("mteam_snapshots")}
+            if "user_level" not in columns:
+                connection.execute(text("ALTER TABLE mteam_snapshots ADD COLUMN user_level VARCHAR(64) DEFAULT ''"))
+            if "seed_size" not in columns:
+                connection.execute(text("ALTER TABLE mteam_snapshots ADD COLUMN seed_size FLOAT DEFAULT 0"))
+        binding_columns = set()
+        if "wechat_claw_bindings" in tables:
+            binding_columns = {column["name"] for column in inspector.get_columns("wechat_claw_bindings")}
+        if binding_columns and "avatar_key" not in binding_columns:
+            connection.execute(text("ALTER TABLE wechat_claw_bindings ADD COLUMN avatar_key VARCHAR(32) DEFAULT 'mint'"))
 
 
 def create_app() -> FastAPI:

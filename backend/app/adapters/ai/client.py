@@ -11,28 +11,51 @@ DEFAULT_MODEL = "deepseek-v4-flash"
 
 INTENT_SYSTEM_PROMPT = """
 You are the intent parser for PT Media Hub. Output strict JSON only.
-Convert the user's Chinese or English message into one executable command.
+Convert the user's Chinese or English message into exactly one normalized intent.
 
 Allowed JSON shape:
 {
-  "action": "resource_search" | "download_started" | "download_completed" | "status_query",
-  "query": "movie or torrent keywords, empty when not needed",
-  "downloader_id": "qb1" | "qb2" | "qb3" | "all",
-  "target": "dashboard" | "mteam" | "qb" | "notifications" | "downloads" | "stats" | "diagnostics" | "discover",
-  "torrent_id": "optional torrent id",
-  "torrent_hash": "optional qB hash",
+  "intent_type": "tmdb_lookup" | "mteam_search" | "dashboard_query" | "download_selected" | "general_chat",
+  "query": "search keywords, empty when not needed",
+  "tmdb_filters": {"media_type":"movie"|"tv"|"all", "region":"ISO country code or empty", "language":"ISO language code or empty", "genre":"Chinese genre name or empty", "year":"year/decade or empty", "min_rating":0, "sort_by":"vote_average.desc"|"popularity.desc"|"release_date.desc"|""},
+  "mteam_filters": {"resolution":"2160p"|"1080p"|"" , "min_size_gb":0, "max_size_gb":0, "promotion":"free"|"discount"|"any", "recommend":true|false},
+  "dashboard_sections":["overview"|"mteam"|"nas"|"qb1"|"qb2"|"qb3"|"downloads"|"stats"|"diagnostics"],
+  "selection_index": 0,
+  "selection_reference": "first|recommended|empty",
+  "download_confirmation": true|false,
   "limit": 5,
-  "message": "short notification message when action is download_started/download_completed"
+  "message": "optional short clarification"
 }
 
 Rules:
-- For resource lookup, use action "resource_search" and put searchable terms in query.
-- For "started downloading", "start notification", or similar, use "download_started".
-- For "download finished", "completed", or similar, use "download_completed".
-- For status questions about qB, M-Team, NAS, dashboard, notifications, or downloads, use "status_query".
-- downloader_id defaults to "all" unless the user says qB1/qB2/qB3.
-- target defaults to "dashboard" for general status, "qb" for qB status, "mteam" for M-Team status, "stats" for statistics, "diagnostics" for health checks, and "discover" for TMDB/discovery status.
+- Use tmdb_lookup for movie/TV information, recommendations, title lookup, or condition discovery. For vague "high score", set min_rating=8.0. Convert Korea to KR and Korean to ko when relevant. Treat 动画、动漫、番剧、动画剧集、季、集 as media_type="tv"; treat 电影、影片 as media_type="movie". For a title lookup with no format cue, use media_type="all" rather than guessing movie.
+- Use mteam_search only for private-tracker resource lookup. Set recommend=true when the user asks for a recommendation or gives no precise release constraints.
+- Use dashboard_query for dashboard, M-Team, NAS, qB, download task, stats, or diagnostic requests. A generic dashboard request uses ["overview"].
+- Use download_selected only when the user refers to a recent M-Team candidate and expresses an affirmative intent. Resolve "1", "the first", and "the recommended one" into selection_index/selection_reference when possible. Set download_confirmation=true only for clear confirmation.
+- Use general_chat for every other request. Never turn a general movie discussion into a tool call.
 - limit must be between 1 and 10.
+""".strip()
+
+
+GENERAL_AGENT_SYSTEM_PROMPT = """
+你是 PT Media Hub 的影视中枢 Agent：专业、友好、克制，擅长影视发现、观影建议、片单与家庭媒体管理。
+请自然地延续用户的对话语境。不要声称查询过 M-Team、TMDB、qB 或 NAS，除非当前消息已经提供了对应工具结果。
+不要泄露或猜测 API Key、Cookie、Token、密码、内部路径、下载器私密任务信息。回答使用简洁中文，不使用 Markdown 表格。
+""".strip()
+
+
+MTEAM_RECOMMENDATION_SYSTEM_PROMPT = """
+You are the final presentation editor for ranked M-Team search results.
+The backend has already ranked candidates and selected the recommended index; never change ranking, indexes, sizes, seeders, or promotions.
+Return strict JSON only:
+{"recommendation":"...","rows":[{"index":1,"title":"","chinese_info":"","quality":"","size":"","seeders":"","promotion":""}]}
+Every row must contain exactly these six display fields. Keep every field compact, clean, and complete:
+- title must contain the work title and a four-digit year.
+- chinese_info must contain useful Chinese/alias information and explicitly say either "含中字" or "未标注中字".
+- quality must combine resolution, video codec, HDR/DV when present, and release group when present, using " · ".
+- size, seeders, and promotion must copy the supplied values exactly.
+Use only supplied candidate data. Do not include cast, director, raw long release names, IDs, or extra fields. Never invent availability, quality, episode count, or technical claims.
+The recommendation must mention the selected number and 2-4 supplied facts.
 """.strip()
 
 
@@ -77,7 +100,9 @@ class DeepSeekChatAdapter:
         self.api_key = str(config.get("api_key") or config.get("deepseek_api_key") or "").strip()
         self.base_url = str(config.get("base_url") or DEEPSEEK_BASE_URL).strip().rstrip("/")
         self.model = str(config.get("model") or DEFAULT_MODEL).strip()
-        self.timeout = int(config.get("timeout") or 30)
+        # Mobile conversations send an immediate acknowledgement, so preserve the
+        # complete answer instead of cutting a slow model off at the old 30s limit.
+        self.timeout = max(90, int(config.get("timeout") or 90))
         self.max_tokens = int(config.get("max_tokens") or 1200)
         self.temperature = float(config.get("temperature") or 0.1)
         self.thinking = str(config.get("thinking") or "disabled").strip().lower()
@@ -106,6 +131,51 @@ class DeepSeekChatAdapter:
         if not isinstance(payload, dict):
             raise AIServiceError("AI did not return a JSON object")
         return normalize_assistant_intent(payload)
+
+    def answer_general(self, user_text: str, history: list[dict[str, str]] | None = None) -> str:
+        messages = [{"role": "system", "content": GENERAL_AGENT_SYSTEM_PROMPT}]
+        for item in (history or [])[-10:]:
+            role = "assistant" if item.get("role") == "assistant" else "user"
+            content = str(item.get("content") or "").strip()
+            if content:
+                messages.append({"role": role, "content": content[:800]})
+        messages.append({"role": "user", "content": user_text})
+        return self._chat(messages, json_mode=False, max_tokens=min(self.max_tokens, 900))
+
+    def describe_mteam_presentation(self, query: str, items: list[dict[str, Any]], recommended_index: int | None) -> dict[str, Any]:
+        if not recommended_index or recommended_index < 1 or recommended_index > len(items):
+            return {"recommendation": "", "metadata": []}
+        candidates = [
+            {
+                "index": index,
+                "raw_title": str(item.get("title") or ""),
+                "raw_subtitle": str(item.get("subtitle") or ""),
+                "resolution": item.get("resolution"),
+                "size": item.get("size"),
+                "seeders": item.get("seeders"),
+                "promotion": item.get("promotion_label") or "普通",
+                "codec": item.get("codec") or "-",
+                "hdr": item.get("hdr") or "",
+                "group": item.get("group") or "",
+                "labels": item.get("labels") or [],
+                "has_chinese_subtitles": bool(item.get("has_chinese_subtitles")),
+            }
+            for index, item in enumerate(items[:10], 1)
+        ]
+        content = self._chat(
+            [
+                {"role": "system", "content": MTEAM_RECOMMENDATION_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps({"query": query, "recommended_index": recommended_index, "candidates": candidates}, ensure_ascii=False)},
+            ],
+            json_mode=True,
+            max_tokens=min(self.max_tokens, 1400),
+        )
+        payload = _json_loads(content)
+        recommendation = str(payload.get("recommendation") or "").strip() if isinstance(payload, dict) else ""
+        if not recommendation or len(recommendation) > 220:
+            raise AIServiceError("AI recommendation output was invalid")
+        rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+        return {"recommendation": recommendation, "rows": [item for item in rows if isinstance(item, dict)][:len(candidates)]}
 
     def summarize_result(self, user_text: str, intent: dict[str, Any], result: dict[str, Any]) -> str:
         content = self._chat(
@@ -191,26 +261,63 @@ class DeepSeekChatAdapter:
 
 
 def normalize_assistant_intent(payload: dict[str, Any]) -> dict[str, Any]:
-    action = str(payload.get("action") or "status_query").strip()
-    if action not in {"resource_search", "download_started", "download_completed", "status_query"}:
-        action = "status_query"
-    downloader_id = str(payload.get("downloader_id") or "all").strip().lower()
-    if downloader_id not in {"qb1", "qb2", "qb3", "all"}:
-        downloader_id = "all"
-    target = str(payload.get("target") or "").strip().lower()
-    if target not in {"dashboard", "mteam", "qb", "notifications", "downloads", "stats", "diagnostics", "discover"}:
-        target = "qb" if downloader_id != "all" else "dashboard"
+    legacy_action = str(payload.get("action") or "").strip()
+    intent_type = str(payload.get("intent_type") or "").strip().lower()
+    legacy_map = {"resource_search": "mteam_search", "status_query": "dashboard_query", "mobile_download": "download_selected"}
+    intent_type = legacy_map.get(intent_type or legacy_action, intent_type or legacy_action)
+    if intent_type not in {"tmdb_lookup", "mteam_search", "dashboard_query", "download_selected", "general_chat"}:
+        intent_type = "general_chat"
     try:
         limit = int(payload.get("limit") or 5)
     except (TypeError, ValueError):
         limit = 5
+    tmdb_source = payload.get("tmdb_filters") if isinstance(payload.get("tmdb_filters"), dict) else {}
+    mteam_source = payload.get("mteam_filters") if isinstance(payload.get("mteam_filters"), dict) else {}
+    sections = payload.get("dashboard_sections") if isinstance(payload.get("dashboard_sections"), list) else []
+    valid_sections = {"overview", "mteam", "nas", "qb1", "qb2", "qb3", "downloads", "stats", "diagnostics"}
+    normalized_sections = [str(item).lower() for item in sections if str(item).lower() in valid_sections]
+    if intent_type == "dashboard_query" and not normalized_sections:
+        normalized_sections = ["overview"]
+    try:
+        min_rating = float(tmdb_source.get("min_rating") or 0)
+    except (TypeError, ValueError):
+        min_rating = 0
+    try:
+        selection_index = int(payload.get("selection_index") or 0)
+    except (TypeError, ValueError):
+        selection_index = 0
+    try:
+        min_size_gb = float(mteam_source.get("min_size_gb") or 0)
+    except (TypeError, ValueError):
+        min_size_gb = 0
+    try:
+        max_size_gb = float(mteam_source.get("max_size_gb") or 0)
+    except (TypeError, ValueError):
+        max_size_gb = 0
     return {
-        "action": action,
+        "intent_type": intent_type,
+        "action": intent_type,
         "query": str(payload.get("query") or "").strip(),
-        "downloader_id": downloader_id,
-        "target": target,
-        "torrent_id": str(payload.get("torrent_id") or "").strip(),
-        "torrent_hash": str(payload.get("torrent_hash") or "").strip(),
+        "tmdb_filters": {
+            "media_type": str(tmdb_source.get("media_type") or "all").lower() if str(tmdb_source.get("media_type") or "all").lower() in {"movie", "tv", "all"} else "all",
+            "region": str(tmdb_source.get("region") or "").upper()[:2],
+            "language": str(tmdb_source.get("language") or "").lower()[:8],
+            "genre": str(tmdb_source.get("genre") or "").strip()[:40],
+            "year": str(tmdb_source.get("year") or "").strip()[:12],
+            "min_rating": max(0, min(10, min_rating)),
+            "sort_by": str(tmdb_source.get("sort_by") or "").strip(),
+        },
+        "mteam_filters": {
+            "resolution": str(mteam_source.get("resolution") or "").lower(),
+            "min_size_gb": max(0, min_size_gb),
+            "max_size_gb": max(0, max_size_gb),
+            "promotion": str(mteam_source.get("promotion") or "any").lower(),
+            "recommend": bool(mteam_source.get("recommend")),
+        },
+        "dashboard_sections": normalized_sections,
+        "selection_index": max(0, min(10, selection_index)),
+        "selection_reference": str(payload.get("selection_reference") or "").lower(),
+        "download_confirmation": bool(payload.get("download_confirmation")),
         "limit": max(1, min(10, limit)),
         "message": str(payload.get("message") or "").strip(),
     }

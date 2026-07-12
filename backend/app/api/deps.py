@@ -21,7 +21,7 @@ def get_current_user(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token") from exc
     user = db.get(User, int(payload["sub"]))
     session = db.query(UserSession).filter(UserSession.token_id == payload["jti"]).one_or_none()
-    if not user or not user.is_active or not session:
+    if not user or user.role != "admin" or not user.is_active or not session:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Inactive session")
     session.last_seen_at = datetime.utcnow()
     db.commit()
@@ -43,4 +43,3 @@ def has_qb2_grant(db: Session, authorization: str | None) -> bool:
         return False
     session = db.query(UserSession).filter(UserSession.token_id == payload["jti"]).one_or_none()
     return bool(session and session.qb2_grant_expires_at and session.qb2_grant_expires_at > datetime.utcnow())
-

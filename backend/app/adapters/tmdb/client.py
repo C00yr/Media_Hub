@@ -113,13 +113,68 @@ class TmdbAdapter(MetadataAdapter):
         payload = self._get("/search/multi", {"query": query, "include_adult": "false"})
         results = [item for item in payload.get("results", []) if item.get("media_type") in ("movie", "tv")]
         items = [self._normalize_item(item) for item in results[:8]]
-        detailed = []
+        detailed: list[dict[str, Any]] = []
+        detail_errors: list[str] = []
         for item in items:
             try:
                 detailed.append(self.get_media_details(str(item["tmdb_id"]), str(item["media_type"])))
-            except Exception:
-                detailed.append(item)
+            except Exception as exc:
+                detail_errors.append(str(exc))
+        if items and not detailed:
+            detail = detail_errors[-1] if detail_errors else "unknown detail request error"
+            raise RuntimeError(f"TMDB 找到了候选作品，但详情查询全部失败（{len(items)} 项）：{detail}")
         return detailed
+
+    def lookup_media(self, query: str, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """Search by title when available, otherwise use TMDB Discover with natural-language filters."""
+        filters = dict(filters or {})
+        media_type = str(filters.get("media_type") or "all").lower()
+        if query.strip():
+            items = self.search_media(query)
+        else:
+            media_types = [media_type] if media_type in {"movie", "tv"} else ["movie", "tv"]
+            items = []
+            for current_type in media_types:
+                discover_filters = {**filters, "media_type": current_type, "include_options": False, "pages": 1}
+                genre = str(filters.get("genre") or "").strip()
+                if genre:
+                    genre_id = next((item["id"] for item in self._genres(current_type) if genre.lower() in str(item.get("name") or "").lower()), "")
+                    discover_filters["genre"] = str(genre_id or "")
+                items.extend(self.discover_media(discover_filters).get("items") or [])
+        filtered = [item for item in items if self._matches_lookup_filters(item, filters)]
+        sort_by = str(filters.get("sort_by") or "").lower()
+        if sort_by == "vote_average.desc":
+            filtered.sort(key=lambda item: (float(item.get("rating") or 0), int(item.get("vote_count") or 0)), reverse=True)
+        elif sort_by == "release_date.desc":
+            filtered.sort(key=lambda item: str(item.get("release_date") or ""), reverse=True)
+        else:
+            filtered.sort(key=lambda item: float(item.get("popularity") or 0), reverse=True)
+        return filtered[:10]
+
+    @staticmethod
+    def _matches_lookup_filters(item: dict[str, Any], filters: dict[str, Any]) -> bool:
+        media_type = str(filters.get("media_type") or "all").lower()
+        if media_type in {"movie", "tv"} and item.get("media_type") != media_type:
+            return False
+        if float(item.get("rating") or 0) < float(filters.get("min_rating") or 0):
+            return False
+        language = str(filters.get("language") or "").lower()
+        if language and str(item.get("original_language") or "").lower() != language:
+            return False
+        year = str(filters.get("year") or "").strip()
+        item_year = str(item.get("year") or "")
+        if year.endswith("s") and year[:-1].isdigit() and not (int(year[:-1]) <= int(item_year or 0) <= int(year[:-1]) + 9):
+            return False
+        if year and not year.endswith("s") and item_year != year:
+            return False
+        genre = str(filters.get("genre") or "").strip().lower()
+        if genre and not any(genre in str(value).lower() for value in item.get("genres") or []):
+            return False
+        region = str(filters.get("region") or "").upper()
+        region_names = {"KR": ("korea", "韩国"), "CN": ("china", "中国"), "US": ("united states", "美国"), "JP": ("japan", "日本"), "GB": ("united kingdom", "英国")}
+        if region and not any(token in " ".join(item.get("production_countries") or []).lower() for token in region_names.get(region, (region.lower(),))):
+            return False
+        return True
 
     def get_media_details(self, media_id: str, media_type: str) -> dict[str, Any]:
         payload = self._get(f"/{media_type}/{media_id}", {"append_to_response": "credits,external_ids,recommendations,similar"})

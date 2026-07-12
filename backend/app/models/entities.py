@@ -36,6 +36,19 @@ class UserSession(Base):
     user: Mapped[User] = relationship()
 
 
+class WechatClawBinding(Base):
+    __tablename__ = "wechat_claw_bindings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(120), default="微信成员")
+    role_name: Mapped[str] = mapped_column(String(120), default="微信助手")
+    avatar_key: Mapped[str] = mapped_column(String(32), default="mint")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    notification_preferences: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class IntegrationConfig(Base):
     __tablename__ = "integration_configs"
 

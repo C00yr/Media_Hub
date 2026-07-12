@@ -138,7 +138,7 @@ class WechatClawAdapter:
             detail = exc.read().decode("utf-8", "replace")
             raise WechatClawApiError(detail or exc.reason, exc.code) from exc
         except (URLError, TimeoutError) as exc:
-            raise WechatClawApiError(f"WeChat claw iLink request failed: {exc}") from exc
+            raise WechatClawApiError("微信服务请求失败") from exc
 
     def test_connection(self) -> dict[str, Any]:
         if self.mode == "ilink":
@@ -148,7 +148,7 @@ class WechatClawAdapter:
                     "mode": "ilink",
                     "connected": False,
                     "base_url": self.base_url,
-                    "message": "iLink 配置可用，等待扫码登录。",
+                    "message": "微信连接已就绪，等待扫码。",
                     "checked_at": datetime.utcnow().isoformat(),
                 }
             payload = self._json_request("POST", f"{self.base_url}/ilink/bot/getconfig", {}, timeout=max(self.timeout, 20))
@@ -158,7 +158,7 @@ class WechatClawAdapter:
                 "mode": "ilink",
                 "connected": ok,
                 "base_url": self.base_url,
-                "message": "iLink 登录态可用。" if ok else str(payload.get("message") or payload.get("errmsg") or "iLink 登录态不可用"),
+                "message": "微信已连接。" if ok else "微信登录状态暂不可用。",
                 "checked_at": datetime.utcnow().isoformat(),
             }
         return {
