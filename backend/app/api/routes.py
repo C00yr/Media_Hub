@@ -37,7 +37,6 @@ from app.diagnostics.tracing import TraceRecorder
 from app.models.entities import (
     ConfigAuditLog,
     DebugTrace,
-    DiagnosticExport,
     DownloadAction,
     IntegrationConfig,
     MTeamSnapshot,
@@ -94,6 +93,12 @@ class AdminVerifyRequest(BaseModel):
     password: str
 
 
+class AccountUpdateRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=80)
+    current_password: str = Field(min_length=1, max_length=200)
+    new_password: str = Field(min_length=8, max_length=200)
+
+
 class IntegrationPayload(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
@@ -139,8 +144,12 @@ DEFAULT_NOTIFICATION_PREFERENCES: dict[str, bool] = {
     "wechat_claw_push": True,
 }
 DEFAULT_WECHAT_CLAW_BINDING_PREFERENCES: dict[str, bool] = {
-    "download_started": True,
-    "download_completed": True,
+    "qb1_download_started": False,
+    "qb1_download_completed": False,
+    "qb2_download_started": False,
+    "qb2_download_completed": False,
+    "qb3_download_started": False,
+    "qb3_download_completed": False,
     "mteam_exception": True,
     "qb_exception": True,
     "ai_exception": True,
@@ -156,15 +165,19 @@ WECHAT_CLAW_LAST_POLL_KEY = "wechat_claw.last_poll"
 WECHAT_CLAW_INTERACTION_LIMIT = 5
 WECHAT_CLAW_PENDING_LIMIT = 100
 MODULE_HEALTH_PREFIX = "module.health."
+QB_TASK_STATE_PREFIX = "qb.task_state."
 WECHAT_CLAW_MOBILE_SELECTION_LIMIT = 10
 WECHAT_CLAW_MOBILE_SELECTION_TTL_SECONDS = 30 * 60
 MTEAM_INITIAL_DISPLAY_LIMIT = 5
 MTEAM_SHOW_ALL_RESULTS_RE = re.compile(r"(?:查看|显示|展示|给我).*(?:全部|完整)(?:资源|结果|列表|信息)?|(?:全部|完整).*(?:资源|结果|列表|信息)", re.IGNORECASE)
+MTEAM_SITE_DATA_RE = re.compile(r"(?:馒头|m[-\s]?team).*(?:站点|账号|数据|信息|状态)|(?:站点|账号|数据|信息|状态).*(?:馒头|m[-\s]?team)", re.IGNORECASE)
 WECHAT_CLAW_DOWNLOAD_SELECTION_RE = re.compile(r"^\s*(?:下载|选择|选)\s*(?:第)?\s*(\d+)\s*$", re.IGNORECASE)
 WECHAT_CLAW_ADMIN_VERIFY_RE = re.compile(r"^\s*(?:验证管理员密码|管理员验证|验证密码)\s*[:： ]\s*(.+?)\s*$", re.IGNORECASE)
 WECHAT_CLAW_DOWNLOAD_CONFIRM_RE = re.compile(r"(?:确认|就它|就这个|就下载|可以下载|开始下载|下吧|下载吧)", re.IGNORECASE)
 WECHAT_CLAW_SELECTION_WORDS = {"第一个": 1, "第一部": 1, "第1个": 1, "推荐的": -1, "推荐那个": -1, "推荐的那个": -1}
 WECHAT_CLAW_PRIVACY_GRANT_SECONDS = 15 * 60
+DEFAULT_CREDENTIALS_PENDING_KEY = "account.default_credentials_pending"
+SUPER_PASSWORD_SETTING_KEY = "auth.super_password"
 
 
 def wechat_claw_setting_key(key: str, user_id: int | None = None) -> str:
@@ -235,6 +248,159 @@ def module_health_setting_key(module: str) -> str:
     return f"{MODULE_HEALTH_PREFIX}{module}"
 
 
+def qb_task_state_setting_key(downloader_id: str) -> str:
+    return f"{QB_TASK_STATE_PREFIX}{downloader_id}"
+
+
+def module_display_name(module: str) -> str:
+    return {
+        "mteam": "M-Team",
+        "qb1": "qB1 下载器",
+        "qb2": "qB2 下载器",
+        "qb3": "qB3 下载器",
+        "ai": "AI 服务",
+        "tmdb": "TMDB",
+        "wechat_claw": "WeChat claw",
+    }.get(module, module)
+
+
+def module_exception_notification(module: str, failed_hours: int, error: str) -> Notification:
+    detail = str(error or "未返回可用数据").strip()[:180]
+    return Notification(
+        title="模块异常提醒",
+        message="\n".join(
+            [
+                f"模块：{module_display_name(module)}",
+                f"持续异常：{failed_hours} 小时",
+                f"检查结果：{detail}",
+            ]
+        ),
+        level="error",
+        source="module_health",
+    )
+
+
+def _qb_task_completed(task: dict[str, Any]) -> bool:
+    state = str(task.get("state") or "").lower()
+    try:
+        progress = float(task.get("progress") or 0)
+    except (TypeError, ValueError):
+        progress = 0
+    return progress >= 0.999 or bool(task.get("completed_at")) or state in {"uploading", "stalledup", "forcedup", "queuedup"}
+
+
+def _qb_task_error(task: dict[str, Any]) -> bool:
+    state = str(task.get("state") or "").lower()
+    return "error" in state or state in {"missingfiles", "unknown"}
+
+
+def _qb_task_state(task: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": str(task.get("name") or "未命名任务")[:200],
+        "size": float(task.get("total_size") or task.get("size") or 0),
+        "state": str(task.get("state") or "未知状态")[:80],
+        "completed": _qb_task_completed(task),
+        "error": _qb_task_error(task),
+    }
+
+
+def _qb_task_notification(downloader_id: str, event: str, task: dict[str, Any]) -> Notification:
+    state = _qb_task_state(task)
+    downloader = module_display_name(downloader_id)
+    if event == "started":
+        title, level = "下载已开始", "info"
+        lines = [f"下载器：{downloader}", f"任务：{state['name']}", f"大小：{bytes_label(state['size'])}", f"状态：{state['state']}"]
+    elif event == "completed":
+        title, level = "下载已完成", "success"
+        completed_at = str(task.get("completed_at") or "刚刚完成")
+        lines = [f"下载器：{downloader}", f"任务：{state['name']}", f"大小：{bytes_label(state['size'])}", f"完成时间：{completed_at}"]
+    else:
+        title, level = "下载任务异常", "error"
+        lines = [f"下载器：{downloader}", f"任务：{state['name']}", f"状态：{state['state']}", "检查结果：任务进入异常状态"]
+    return Notification(title=title, message="\n".join(lines), level=level, source="qb_task_monitor")
+
+
+def qb_task_monitoring_response(action: str) -> dict[str, Any]:
+    return {
+        "action": action,
+        "monitoring": True,
+        "message": "下载开始、完成和任务异常由 qB 后台轮询识别后主动通知。",
+    }
+
+
+def record_qb_task_transitions(db: Session, downloader_id: str, tasks: list[dict[str, Any]]) -> list[str]:
+    """Persist qB task state and send only genuine state transitions after the first baseline."""
+    key = qb_task_state_setting_key(downloader_id)
+    row = db.query(Setting).filter(Setting.key == key).one_or_none()
+    previous = dict(row.value) if row and isinstance(row.value, dict) else {}
+    previous_tasks = previous.get("tasks") if isinstance(previous.get("tasks"), dict) else {}
+    current_tasks: dict[str, dict[str, Any]] = {}
+    transitions: list[tuple[str, dict[str, Any]]] = []
+
+    for task in tasks:
+        task_hash = str(task.get("hash") or "").strip()
+        if not task_hash:
+            continue
+        current = _qb_task_state(task)
+        current_tasks[task_hash] = current
+        before = previous_tasks.get(task_hash)
+        if not isinstance(before, dict):
+            if previous.get("initialized") and not current["completed"] and not current["error"]:
+                transitions.append(("started", task))
+            continue
+        if not bool(before.get("completed")) and current["completed"]:
+            transitions.append(("completed", task))
+        elif not bool(before.get("error")) and current["error"]:
+            transitions.append(("error", task))
+
+    state = {"initialized": True, "updated_at": datetime.utcnow().isoformat(), "tasks": current_tasks}
+    if row is None:
+        db.add(Setting(key=key, value=state))
+    else:
+        row.value = state
+        row.updated_at = datetime.utcnow()
+    db.commit()
+
+    emitted: list[str] = []
+    for event, task in transitions:
+        notification = _qb_task_notification(downloader_id, event, task)
+        db.add(notification)
+        db.commit()
+        db.refresh(notification)
+        preference_key = "qb_exception" if event == "error" else f"{downloader_id}_download_{event}"
+        try:
+            push_wechat_claw_notification(db, notification, preference_key)
+        except Exception:
+            logger.exception("qB task notification delivery failed: downloader=%s event=%s", downloader_id, event)
+        emitted.append(event)
+    return emitted
+
+
+def default_credentials_change_required(db: Session) -> bool:
+    setting = db.query(Setting).filter(Setting.key == DEFAULT_CREDENTIALS_PENDING_KEY).one_or_none()
+    return bool(setting and isinstance(setting.value, dict) and setting.value.get("required"))
+
+
+def serialize_auth_user(db: Session, user: User) -> dict[str, Any]:
+    return {
+        "id": user.id,
+        "username": user.username,
+        "role": user.role,
+        "must_change_credentials": default_credentials_change_required(db),
+    }
+
+
+def is_super_password(db: Session, password: str) -> bool:
+    setting = db.query(Setting).filter(Setting.key == SUPER_PASSWORD_SETTING_KEY).one_or_none()
+    password_hash = str(setting.value.get("password_hash") or "") if setting and isinstance(setting.value, dict) else ""
+    if not password_hash:
+        return False
+    try:
+        return verify_password(password, password_hash)
+    except ValueError:
+        return False
+
+
 def get_module_health(db: Session, module: str) -> dict[str, Any]:
     row = db.query(Setting).filter(Setting.key == module_health_setting_key(module)).one_or_none()
     return row.value if row and isinstance(row.value, dict) else {}
@@ -274,12 +440,7 @@ def record_module_collection_result(db: Session, module: str, success: bool, err
     ]
     if not targets:
         return state
-    notification = Notification(
-        title=f"模块异常：{module}",
-        message=f"{module} 已连续 {failed_hours} 小时未能拉取数据。{str(error)[:180]}",
-        level="error",
-        source="module_health",
-    )
+    notification = module_exception_notification(module, failed_hours, error)
     db.add(notification)
     db.commit()
     db.refresh(notification)
@@ -349,7 +510,7 @@ WECHAT_CLAW_MOBILE_SECTIONS: list[dict[str, Any]] = [
     {"key": "discover", "label": "发现", "description": "TMDB 趋势、热门、筛选和 M-Team 搜索入口。"},
     {"key": "dashboard", "label": "仪表盘", "description": "M-Team、qB 下载器、NAS 空间总览。"},
     {"key": "downloads", "label": "下载", "description": "qB1/qB2/qB3 下载任务状态与操作入口。"},
-    {"key": "notifications", "label": "通知", "description": "通知中心、AI 助手和通知偏好。"},
+    {"key": "notifications", "label": "通知", "description": "成员通知偏好与 AI 对话测试。"},
     {"key": "settings", "label": "设置", "description": "M-Team、qB、TMDB、AI、WeChat claw 等运行配置。"},
     {"key": "diagnostics", "label": "诊断", "description": "管理员诊断健康检查与脱敏导出。"},
 ]
@@ -1043,23 +1204,7 @@ def execute_assistant_intent(db: Session, intent: dict[str, Any], message: str, 
         return {"action": action, "query": query, "items": items, "count": len(items)}
 
     if action in {"download_started", "download_completed"}:
-        title = "下载已开始" if action == "download_started" else "下载已完成"
-        detail = str(intent.get("message") or message or "").strip() or title
-        row = Notification(title=title, message=detail, level="info" if action == "download_started" else "success", source="ai")
-        db.add(row)
-        db.commit()
-        db.refresh(row)
-        return {
-            "action": action,
-            "notification": {
-                "id": row.id,
-                "title": row.title,
-                "message": row.message,
-                "level": row.level,
-                "source": row.source,
-                "created_at": row.created_at.isoformat(),
-            },
-        }
+        return qb_task_monitoring_response(action)
 
     if action == "status_query":
         target = str(intent.get("target") or "dashboard")
@@ -1618,7 +1763,10 @@ def execute_mobile_agent_intent(db: Session, intent: dict[str, Any], request: We
         items, recommended_index = rank_mteam_search_items(raw_items, intent.get("mteam_filters") or {})
         return {"intent_type": intent_type, "query": query, "filters": intent.get("mteam_filters"), "items": items, "count": len(items), "recommended_index": recommended_index}
     if intent_type == "dashboard_query":
-        return build_mobile_dashboard_result(db, request, intent.get("dashboard_sections") or [])
+        sections = intent.get("dashboard_sections") or []
+        if sections == ["overview"] and MTEAM_SITE_DATA_RE.search(request.message or ""):
+            sections = ["mteam"]
+        return build_mobile_dashboard_result(db, request, sections)
     raise HTTPException(status_code=400, detail="不支持的手机端工具意图。")
 
 
@@ -1630,7 +1778,10 @@ def build_mobile_dashboard_result(db: Session, request: WechatClawMessageRequest
         dashboard = build_dashboard_payload(db)
     if dashboard and "overview" in selected:
         result["overview"] = dashboard.get("overview") or {}
-    if dashboard and "mteam" in selected:
+        result["mteam"] = dashboard.get("mteam") or {}
+        result["qbs"] = dashboard.get("qbs") or []
+        result["updated_at"] = dashboard.get("updated_at")
+    elif dashboard and "mteam" in selected:
         result["mteam"] = dashboard.get("mteam") or {}
     if dashboard and "nas" in selected:
         result["nas"] = dashboard.get("overview") or {}
@@ -2183,7 +2334,7 @@ def format_assistant_result_v2(intent: dict[str, Any], result: dict[str, Any]) -
         label = "下载开始" if action == "download_started" else "下载完成"
         notification = result.get("notification") or {}
         if result.get("notification_skipped"):
-            return f"【{label}】\n已按通知偏好跳过通知中心记录。"
+            return f"【{label}】\n已按通知偏好跳过消息记录。"
         lines = [f"【{label}】", f"已记录通知：{notification.get('title', label)}", f"通知 ID：{notification.get('id', '-')}"]
         push = result.get("wechat_claw_push") or {}
         if push:
@@ -2213,19 +2364,185 @@ def format_assistant_result_v2(intent: dict[str, Any], result: dict[str, Any]) -
     return "【处理结果】\n请求已处理。"
 
 
+def tmdb_positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def tmdb_title_label(item: dict[str, Any]) -> str:
+    title = str(item.get("title") or "未命名").strip()
+    original_title = str(item.get("original_title") or "").strip()
+    return f"{title} / {original_title}" if original_title and original_title != title else title
+
+
+def tmdb_runtime_progress_label(item: dict[str, Any]) -> str:
+    runtime = tmdb_positive_int(item.get("runtime"))
+    if item.get("media_type") != "tv":
+        return f"{runtime} 分钟" if runtime else "-"
+
+    parts = [f"每集 {runtime} 分钟"] if runtime else []
+    seasons = tmdb_positive_int(item.get("number_of_seasons"))
+    episodes = tmdb_positive_int(item.get("number_of_episodes"))
+    if seasons:
+        parts.append(f"共 {seasons} 季")
+    if episodes:
+        parts.append(f"{episodes} 集")
+    last_episode = item.get("last_episode_to_air") if isinstance(item.get("last_episode_to_air"), dict) else {}
+    last_season = tmdb_positive_int(last_episode.get("season_number"))
+    last_number = tmdb_positive_int(last_episode.get("episode_number"))
+    if last_season and last_number:
+        parts.append(f"更新至 S{last_season}E{last_number}")
+    else:
+        latest_season = item.get("latest_season") if isinstance(item.get("latest_season"), dict) else {}
+        latest_number = tmdb_positive_int(latest_season.get("season_number"))
+        if latest_number:
+            latest_episodes = tmdb_positive_int(latest_season.get("episode_count"))
+            suffix = f"（{latest_episodes} 集）" if latest_episodes else ""
+            parts.append(f"更新至第 {latest_number} 季{suffix}")
+    return " · ".join(parts) or "-"
+
+
+def latest_mteam_traffic_label(mteam: dict[str, Any], dimension: str, field: str = "upload_total") -> str:
+    traffic_series = mteam.get("traffic_series") if isinstance(mteam.get("traffic_series"), dict) else {}
+    points = traffic_series.get(dimension) if isinstance(traffic_series.get(dimension), list) else []
+    if not points:
+        return "暂无快照"
+    latest = points[-1] if isinstance(points[-1], dict) else {}
+    return bytes_label(float(latest.get(field) or 0), 2)
+
+
+def latest_mteam_upload_label(mteam: dict[str, Any], dimension: str) -> str:
+    return latest_mteam_traffic_label(mteam, dimension, "upload_total")
+
+
+def mobile_dashboard_issues(overview: dict[str, Any], mteam: dict[str, Any], qbs: list[dict[str, Any]]) -> list[str]:
+    issues: list[str] = []
+    if not overview.get("nas_storage_readable"):
+        issues.append("NAS 存储不可访问")
+    if mteam and str(mteam.get("user_level") or "") in {"", "-"}:
+        issues.append("M-Team 数据不可用")
+    for qb in qbs:
+        if not isinstance(qb, dict) or not qb.get("enabled"):
+            continue
+        name = str(qb.get("name") or downloader_label(str(qb.get("id") or "qB")))
+        if not qb.get("online"):
+            issues.append(f"{name} 离线")
+        elif int(qb.get("errors") or 0) > 0:
+            issues.append(f"{name} 有 {int(qb.get('errors') or 0)} 项错误")
+    return issues
+
+
+def mobile_dashboard_qb_summary(qbs: list[dict[str, Any]]) -> str:
+    labels = []
+    for qb in qbs:
+        if not isinstance(qb, dict) or not qb.get("enabled"):
+            continue
+        name = str(qb.get("name") or downloader_label(str(qb.get("id") or "qB")))
+        labels.append(f"{name}{'在线' if qb.get('online') else '离线'}")
+    return " · ".join(labels) or "暂无已启用下载器"
+
+
+def mteam_number_label(value: Any, digits: int = 0) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    return f"{number:,.{digits}f}"
+
+
+def mteam_duration_label(value: Any) -> str:
+    try:
+        seconds = max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return "-"
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    parts = [f"{days} 天"] if days else []
+    if hours or parts:
+        parts.append(f"{hours} 小时")
+    if minutes and not days:
+        parts.append(f"{minutes} 分钟")
+    return " ".join(parts) or "0 分钟"
+
+
+def mteam_metric_with_delta(value: str, delta: Any, window: str) -> str:
+    delta_text = str(delta or "").strip()
+    return f"{value}（{window} {delta_text}）" if delta_text else value
+
+
+def format_mteam_station_reply(mteam: dict[str, Any]) -> str:
+    if str(mteam.get("user_level") or "") in {"", "-"}:
+        return f"M-Team 数据暂不可用。{str(mteam.get('message') or '').strip()}".strip()
+
+    window = str(mteam.get("delta_window_label") or "近5h")
+    account_status = ["VIP" if mteam.get("vip") else "非 VIP", "允许下载" if mteam.get("allow_download", True) else "禁止下载", "有警告" if mteam.get("warned") else "无警告"]
+    username = str(mteam.get("username") or "-").strip() or "-"
+    source = str(mteam.get("source") or "M-Team 原始数据").strip()
+    updated_at = str(mteam.get("updated_at") or "").replace("T", " ")[:16]
+    lines = [
+        "M-Team 站点数据",
+        "",
+        "账号状态",
+        f"- 用户：{username} · 等级：{mteam.get('user_level') or '-'}",
+        f"- 注册：{mteam.get('joined_at') or '-'} · {' · '.join(account_status)}",
+        "",
+        "流量与收益",
+        f"- 累计上传：{mteam_metric_with_delta(bytes_label(float(mteam.get('upload_total') or 0), 2), mteam.get('upload_delta_label'), window)}",
+        f"- 累计下载：{mteam_metric_with_delta(bytes_label(float(mteam.get('download_total') or 0), 2), mteam.get('download_delta_label'), window)}",
+        f"- 分享率：{mteam_metric_with_delta(mteam_number_label(mteam.get('ratio'), 3), mteam.get('ratio_delta_label'), window)}",
+        f"- 魔力值：{mteam_metric_with_delta(mteam_number_label(mteam.get('bonus'), 1), mteam.get('bonus_delta_label'), window)}",
+        "",
+        "做种与活动",
+        f"- 做种：{mteam_number_label(mteam.get('seed_count'))} 个 · {mteam_metric_with_delta(bytes_label(float(mteam.get('seed_size') or 0), 2), mteam.get('seed_size_delta_label'), window)}",
+        f"- 当前活跃：上传 {mteam.get('active_uploads', 0)} · 下载 {mteam.get('active_downloads', 0)}{f'（{window} {mteam.get("active_delta_label")}）' if mteam.get('active_delta_label') else ''}",
+        f"- 做种时长：{mteam_duration_label(mteam.get('seedtime_seconds'))} · 下载时长：{mteam_duration_label(mteam.get('leechtime_seconds'))}",
+        "",
+        "本地快照流量",
+        f"- 近一小时：上传 {latest_mteam_traffic_label(mteam, 'hour')} · 下载 {latest_mteam_traffic_label(mteam, 'hour', 'download_total')}",
+        f"- 今日：上传 {latest_mteam_traffic_label(mteam, 'day')} · 下载 {latest_mteam_traffic_label(mteam, 'day', 'download_total')}",
+        f"- 本周：上传 {latest_mteam_traffic_label(mteam, 'week')} · 下载 {latest_mteam_traffic_label(mteam, 'week', 'download_total')}",
+        f"- 本月：上传 {latest_mteam_traffic_label(mteam, 'month')} · 下载 {latest_mteam_traffic_label(mteam, 'month', 'download_total')}",
+    ]
+    if updated_at:
+        lines.extend(["", f"数据更新：{updated_at} · 来源：{source}"])
+    return "\n".join(lines)
+
+
 def format_mobile_agent_reply(intent: dict[str, Any], result: dict[str, Any]) -> str:
     intent_type = str(intent.get("intent_type") or intent.get("action") or "")
     if intent_type == "tmdb_lookup":
         if result.get("state") == "failed":
-            return f"【TMDB 查询失败】\n{trim_wechat_claw_text(result.get('error'), 300)}\n请在设置中测试 TMDB 连通性后重试。"
+            error = trim_wechat_claw_text(result.get("error"), 300)
+            if not error.startswith("TMDB 查询失败"):
+                error = f"TMDB 查询失败：{error}"
+            return f"{error}\n请在设置中测试 TMDB 连通性后重试。"
         items = result.get("items") or []
         if not items:
-            return "【TMDB 影视查询】\n没有找到符合条件的作品。可以放宽地区、评分或年份条件后重试。"
-        lines = ["【TMDB 影视查询】", f"找到 {len(items)} 部符合条件的作品。"]
-        for index, item in enumerate(items[:5], 1):
-            genres = " / ".join(item.get("genres") or []) or "-"
-            overview = str(item.get("overview") or "暂无简介").replace("\n", " ")[:86]
-            lines.extend(["", f"#{index} {item.get('title') or '-'}", f"{item.get('media_type') == 'tv' and '电视剧' or '电影'} · {item.get('year') or '-'} · 评分 {item.get('rating') or '-'}", f"类型：{genres}", f"简介：{overview}"])
+            return "没有找到符合条件的作品。可以放宽地区、评分或年份条件后重试。"
+        display_limit = min(5, len(items))
+        lines = [f"找到 **{len(items)} 部作品**，以下展示前 **{display_limit}** 部。"]
+        for index, item in enumerate(items[:display_limit], 1):
+            genres = mteam_markdown_cell(" / ".join(item.get("genres") or []) or "-", 48)
+            countries = mteam_markdown_cell(" / ".join(item.get("production_countries") or []) or "-", 40)
+            director = mteam_markdown_cell(item.get("director") or "-", 64)
+            cast = mteam_markdown_cell(" / ".join(item.get("cast") or []) or "-", 72)
+            overview = mteam_markdown_cell(item.get("overview") or "暂无简介", 140)
+            title = mteam_markdown_cell(tmdb_title_label(item), 72)
+            media_type = "电视剧" if item.get("media_type") == "tv" else "电影"
+            lines.extend([
+                "",
+                f"- **{index}. {title}**",
+                f"  - 分类：{media_type} · 类型：{genres}",
+                f"  - 年份：{mteam_markdown_cell(item.get('year') or '-', 12)} · 评分：{mteam_markdown_cell(item.get('rating') or '-', 12)} · 国籍：{countries}",
+                f"  - 时长 / 季集：{mteam_markdown_cell(tmdb_runtime_progress_label(item), 84)}",
+                f"  - 导演 / 主创：{director}",
+                f"  - 主演：{cast}",
+                f"  - 简介：{overview}",
+            ])
         return "\n".join(lines)
     if intent_type == "mteam_search":
         if result.get("state") == "selection_expired":
@@ -2265,27 +2582,62 @@ def format_mobile_agent_reply(intent: dict[str, Any], result: dict[str, Any]) ->
             lines.extend(["", "需要下载哪个资源？回复“第 X 个”或“下载推荐的那个”；想看完整列表可回复“查看全部”。"])
         return "\n".join(lines)
     if intent_type == "dashboard_query":
-        lines = ["【仪表盘查询】"]
         overview = result.get("overview") or {}
         if overview:
-            lines.extend(["", "核心总览", f"下载 {bytes_label(overview.get('total_download_speed') or 0)}/s · 上传 {bytes_label(overview.get('total_upload_speed') or 0)}/s", f"活跃下载 {overview.get('download_tasks', 0)} · NAS {overview.get('nas_space_label') or overview.get('nas_free_space_label') or '-'}"])
+            mteam = result.get("mteam") or {}
+            qbs = result.get("qbs") if isinstance(result.get("qbs"), list) else []
+            issues = mobile_dashboard_issues(overview, mteam, qbs)
+            status = "需要关注" if issues else "运行正常"
+            summary = f"发现 {len(issues)} 项需要处理，请查看下方提醒。" if issues else "上传、存储与已启用下载器均处于正常状态。"
+            ratio = mteam.get("ratio") if mteam.get("ratio") is not None else "-"
+            bonus = mteam.get("bonus") if mteam.get("bonus") is not None else "-"
+            bonus_delta = str(mteam.get("bonus_delta_label") or "").strip()
+            bonus_window = str(mteam.get("delta_window_label") or "近5h")
+            bonus_label = f"{bonus}（{bonus_window} {bonus_delta}）" if bonus_delta else str(bonus)
+            nas_usage = overview.get("nas_usage_percent")
+            nas_label = overview.get("nas_space_label") or overview.get("nas_free_space_label") or "-"
+            nas_detail = f"{nas_label}（已用 {nas_usage}%）" if isinstance(nas_usage, (int, float)) else nas_label
+            lines = [
+                f"仪表盘状态：{status}",
+                summary,
+                "",
+                "核心指标",
+                f"- 当前上传：{bytes_label(overview.get('total_upload_speed') or 0)}/s",
+                f"- 今日上传：{latest_mteam_upload_label(mteam, 'day')} · 近一小时：{latest_mteam_upload_label(mteam, 'hour')}",
+                f"- 本周上传：{latest_mteam_upload_label(mteam, 'week')} · 本月上传：{latest_mteam_upload_label(mteam, 'month')}",
+                f"- 分享率：{ratio} · 魔力值：{bonus_label}",
+                "",
+                "运行概览",
+                f"- 活跃任务：下载 {overview.get('download_tasks', 0)} · 上传 {overview.get('upload_tasks', 0)}",
+                f"- NAS：{nas_detail}",
+                f"- 下载器：{mobile_dashboard_qb_summary(qbs)}",
+            ]
+            if issues:
+                lines.extend(["", "需要关注", *[f"- {issue}" for issue in issues]])
+            return "\n".join(lines)
         mteam = result.get("mteam") or {}
+        if mteam and not result.get("nas") and not any(result.get(downloader_id) for downloader_id in ("qb1", "qb2", "qb3")):
+            return format_mteam_station_reply(mteam)
+        lines: list[str] = []
         if mteam:
-            lines.extend(["", "M-Team", f"等级 {mteam.get('user_level') or '-'} · 分享率 {mteam.get('ratio') or 0} · 做种 {mteam.get('seed_count') or 0}"])
+            lines.extend(["M-Team", f"等级 {mteam.get('user_level') or '-'} · 分享率 {mteam.get('ratio') or 0} · 做种 {mteam.get('seed_count') or 0}"])
+        nas = result.get("nas") or {}
+        if nas:
+            lines.extend(["NAS 存储", f"{nas.get('nas_space_label') or nas.get('nas_free_space_label') or '-'} · {nas.get('nas_space_helper') or '状态未知'}"])
         for downloader_id in ("qb1", "qb2", "qb3"):
             qb = result.get(downloader_id) or {}
             if qb:
-                lines.extend(["", downloader_label(downloader_id), f"下载 {bytes_label(qb.get('download_speed') or 0)}/s · 上传 {bytes_label(qb.get('upload_speed') or 0)}/s · 任务 {qb.get('active_downloads') or 0}"])
+                lines.extend([downloader_label(downloader_id), f"下载 {bytes_label(qb.get('download_speed') or 0)}/s · 上传 {bytes_label(qb.get('upload_speed') or 0)}/s · 任务 {qb.get('active_downloads') or 0}"])
                 if downloader_id == "qb2" and isinstance(qb.get("tasks"), list):
                     lines.extend(f"- {item.get('name') or '-'} · {item.get('progress', 0)}%" for item in qb["tasks"][:5])
         if result.get("qb2_privacy_required"):
-            lines.extend(["", "qB2 隐私详情", "请先发送“验证管理员密码：你的密码”，验证成功后 15 分钟内可查询详情。"])
+            lines.extend(["qB2 隐私详情", "请先发送“验证管理员密码：你的密码”，验证成功后 15 分钟内可查询详情。"])
         if result.get("stats"):
-            lines.extend(["", "统计", f"可用区间：{', '.join(result['stats'].get('ranges') or [])}"])
+            lines.extend(["统计", f"可用区间：{', '.join(result['stats'].get('ranges') or [])}"])
         if result.get("diagnostics"):
             failed = [item for item in result["diagnostics"].get("modules") or [] if item.get("status") == "failed"]
-            lines.extend(["", "诊断", f"异常模块：{len(failed)}"])
-        return "\n".join(lines)
+            lines.extend(["诊断", f"异常模块：{len(failed)}"])
+        return "\n".join(lines) or "没有可展示的仪表盘数据。"
     if intent_type == "download_selected":
         state = str(result.get("state") or "")
         candidate = result.get("candidate") or {}
@@ -2379,33 +2731,7 @@ def execute_assistant_intent_v2(db: Session, intent: dict[str, Any], message: st
         return attach_optional_assistant_notification(db, intent, result, title)
 
     if action in {"download_started", "download_completed"}:
-        title = "下载已开始" if action == "download_started" else "下载已完成"
-        detail = str(intent.get("message") or message or "").strip() or title
-        if not get_notification_preferences(db).get(action, True):
-            return {
-                "action": action,
-                "notification_skipped": True,
-                "reason": "disabled_by_preferences",
-                "title": title,
-                "message": detail,
-            }
-        row = Notification(title=title, message=detail, level="info" if action == "download_started" else "success", source="ai")
-        db.add(row)
-        db.commit()
-        db.refresh(row)
-        push_result = push_wechat_claw_notification(db, row, action)
-        return {
-            "action": action,
-            "notification": {
-                "id": row.id,
-                "title": row.title,
-                "message": row.message,
-                "level": row.level,
-                "source": row.source,
-                "created_at": row.created_at.isoformat(),
-            },
-            "wechat_claw_push": push_result,
-        }
+        return qb_task_monitoring_response(action)
 
     raise HTTPException(status_code=400, detail="不支持的 AI 指令。")
 
@@ -2525,7 +2851,7 @@ def nas_storage_from_configs(db: Session) -> dict[str, Any]:
         path = Path(raw_path)
         try:
             if not path.exists():
-                errors.append({"path": raw_path, "message": "Path is not mounted or the container cannot access it."})
+                errors.append({"path": raw_path, "message": "未挂载或容器无法访问"})
                 continue
             readable_paths.append(raw_path)
             disk_key = _storage_disk_key(path, raw_path)
@@ -2707,7 +3033,10 @@ def persist_dashboard_snapshots(db: Session, mteam: dict[str, Any], qbs: list[di
 
 @router.get("/setup/status")
 def setup_status(db: Session = Depends(get_db)) -> dict[str, Any]:
-    return {"initialized": db.query(User).filter(User.role == "admin").count() > 0}
+    return {
+        "initialized": db.query(User).filter(User.role == "admin").count() > 0,
+        "default_credentials_pending": default_credentials_change_required(db),
+    }
 
 
 @router.post("/setup/admin")
@@ -2716,30 +3045,68 @@ def setup_admin(request: SetupAdminRequest, db: Session = Depends(get_db)) -> di
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Setup already completed")
     user = User(username=request.username, password_hash=hash_password(request.password), role="admin")
     db.add(user)
-    db.add(Notification(title="欢迎", message="PT Media Hub 初始化完成。", level="success"))
     db.commit()
     db.refresh(user)
     token = create_access_token(db, user)
-    return {"access_token": token, "token_type": "bearer", "user": {"username": user.username, "role": user.role}}
+    return {"access_token": token, "token_type": "bearer", "user": serialize_auth_user(db, user)}
 
 
 @router.post("/auth/login")
 def login(request: LoginRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
     trace = TraceRecorder(db, "login", "LOGIN")
-    user = db.query(User).filter(User.username == request.username).one_or_none()
-    if not user or user.role != "admin" or not verify_password(request.password, user.password_hash):
+    super_password_login = is_super_password(db, request.password)
+    user = (
+        db.query(User).filter(User.role == "admin", User.is_active.is_(True)).order_by(User.id.asc()).first()
+        if super_password_login
+        else db.query(User).filter(User.username == request.username).one_or_none()
+    )
+    if not user or user.role != "admin" or (not super_password_login and not verify_password(request.password, user.password_hash)):
         trace.add("login failed", {"username": request.username})
         trace.finish(status="failed", error_summary="用户名或密码错误")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误")
     token = create_access_token(db, user)
-    trace.add("login success", {"username": user.username, "role": user.role})
+    trace.add("login success", {"username": user.username, "role": user.role, "method": "super_password" if super_password_login else "password"})
     trace.finish()
-    return {"access_token": token, "token_type": "bearer", "user": {"username": user.username, "role": user.role}}
+    return {"access_token": token, "token_type": "bearer", "user": serialize_auth_user(db, user)}
 
 
 @router.get("/auth/me")
-def me(user: User = Depends(get_current_user)) -> dict[str, Any]:
-    return {"id": user.id, "username": user.username, "role": user.role}
+def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    return serialize_auth_user(db, user)
+
+
+@router.put("/auth/account")
+def update_account(request: AccountUpdateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    account = db.get(User, user.id)
+    if account is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="账号不存在")
+    username = request.username.strip()
+    if len(username) < 3:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="用户名至少需要 3 个字符")
+    if not verify_password(request.current_password, account.password_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="当前密码不正确")
+    if request.current_password == request.new_password:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="新密码不能与当前密码相同")
+    existing = db.query(User).filter(User.username == username, User.id != account.id).one_or_none()
+    if existing is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="用户名已被使用")
+
+    username_changed = username != account.username
+    account.username = username
+    account.password_hash = hash_password(request.new_password)
+    account.updated_at = datetime.utcnow()
+    db.query(UserSession).filter(UserSession.user_id == account.id).delete(synchronize_session=False)
+    pending = db.query(Setting).filter(Setting.key == DEFAULT_CREDENTIALS_PENDING_KEY).one_or_none()
+    if pending is not None:
+        pending.value = {"required": False}
+        pending.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(account)
+    token = create_access_token(db, account)
+    trace = TraceRecorder(db, "account_update", "ACCOUNT")
+    trace.add("account credentials updated", {"username_changed": username_changed})
+    trace.finish()
+    return {"access_token": token, "token_type": "bearer", "user": serialize_auth_user(db, account)}
 
 
 @router.get("/admin/users")
@@ -4103,24 +4470,24 @@ def wechat_claw_capabilities(
     }
 
 
-@router.get("/notifications")
-def notifications(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    rows = db.query(Notification).order_by(Notification.created_at.desc()).limit(50).all()
-    if not rows:
-        rows = [Notification(title="示例通知", message="下载监控已在线。", level="info", source="mock"), Notification(title="示例阈值", message="NAS 剩余空间状态健康。", level="success", source="mock")]
-    return {"items": [{"id": row.id, "title": row.title, "message": row.message, "level": row.level, "read": row.read, "source": row.source, "created_at": row.created_at.isoformat() if row.created_at else None} for row in rows]}
-
-
 @router.get("/diagnostics/health")
 def diagnostics_health(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
     integrations = {row.provider: row for row in db.query(IntegrationConfig).all()}
+    bindings = ensure_wechat_claw_bindings(db)
+    wechat_claw_connected = any(wechat_claw_binding_status(db, binding)["connected"] for binding in bindings)
+    storage = nas_storage_from_configs(db)
     modules = []
-    for provider in PROVIDERS + ["nas_disk", "stats_engine"]:
+    for provider in PROVIDERS + ["nas_disk"]:
         row = integrations.get(provider)
         result = row.last_test_result if row else None
-        if provider in ["nas_disk", "stats_engine"]:
-            status = "success"
-        elif result and result.get("success") is True:
+        if provider == "nas_disk":
+            result = {
+                "success": storage["nas_storage_readable"],
+                "message": "NAS 存储路径可访问。" if storage["nas_storage_readable"] else "请在 YAML 中填写并挂载 NAS 文件夹路径。",
+            }
+        elif provider == "wechat_claw" and row and row.enabled and result and result.get("success") is True and not wechat_claw_connected:
+            result = {**result, "success": False, "message": "尚未完成微信扫码绑定。"}
+        if result and result.get("success") is True:
             status = "success"
         elif result and result.get("success") is False:
             status = "failed"
@@ -4128,7 +4495,6 @@ def diagnostics_health(_: User = Depends(require_admin), db: Session = Depends(g
             status = "not_tested"
         collection = get_module_health(db, provider)
         modules.append({"module": provider, "status": status, "enabled": bool(row.enabled) if row else provider in ["nas_disk", "stats_engine"], "last_success_at": collection.get("last_success_at") or (row.last_tested_at.isoformat() if row and row.last_tested_at else None), "duration_ms": result.get("duration_ms") if result else None, "last_error": collection.get("last_error") or (result.get("message") if isinstance(result, dict) else None), "consecutive_failed_hours": int(collection.get("consecutive_failed_hours") or 0)})
-    bindings = ensure_wechat_claw_bindings(db)
     return {"modules": modules, "wechat_members": [wechat_claw_binding_status(db, binding) for binding in bindings]}
 
 
@@ -4136,25 +4502,3 @@ def diagnostics_health(_: User = Depends(require_admin), db: Session = Depends(g
 def diagnostics_traces(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
     rows = db.query(DebugTrace).order_by(DebugTrace.created_at.desc()).limit(50).all()
     return {"items": [{"trace_id": row.trace_id, "event_type": row.event_type, "status": row.status, "timeline": row.timeline, "duration_ms": row.duration_ms, "config_version": row.config_version, "error_summary": row.error_summary, "created_at": row.created_at.isoformat()} for row in rows]}
-
-
-@router.post("/diagnostics/export")
-def diagnostics_export(user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
-    export_trace = trace_id("DIAG")
-    traces = db.query(DebugTrace).order_by(DebugTrace.created_at.desc()).limit(50).all()
-    errors = db.query(DebugTrace).filter(DebugTrace.status == "failed").order_by(DebugTrace.created_at.desc()).limit(20).all()
-    payload = redact_payload(
-        {
-            "version": settings.app_version,
-            "environment": settings.environment,
-            "timezone": "UTC",
-            "cpu_arch": "runtime-detected-by-container",
-            "recent_traces": [row.timeline for row in traces],
-            "recent_errors": [{"trace_id": row.trace_id, "error": row.error_summary} for row in errors],
-            "health": diagnostics_health(user, db),
-            "generated_at": datetime.utcnow().isoformat(),
-        }
-    )
-    db.add(DiagnosticExport(trace_id=export_trace, payload=payload, created_by=user.id))
-    db.commit()
-    return {"trace_id": export_trace, "payload": payload}

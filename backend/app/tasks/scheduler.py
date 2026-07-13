@@ -50,7 +50,9 @@ def capture_snapshots() -> None:
             if not row or not row.enabled or not row.encrypted_payload:
                 continue
             try:
-                state = QbittorrentWebAdapter(get_decrypted_config(db, downloader_id) or {}).get_server_state(downloader_id)
+                adapter = QbittorrentWebAdapter(get_decrypted_config(db, downloader_id) or {})
+                state = adapter.get_server_state(downloader_id)
+                tasks = adapter.get_torrents(downloader_id)
                 db.add(
                     QbSnapshot(
                         downloader_id=downloader_id,
@@ -63,8 +65,9 @@ def capture_snapshots() -> None:
                         source="real",
                     )
                 )
-                from app.api.routes import record_module_collection_result
+                from app.api.routes import record_module_collection_result, record_qb_task_transitions
                 record_module_collection_result(db, downloader_id, True)
+                record_qb_task_transitions(db, downloader_id, tasks)
             except Exception as exc:
                 from app.api.routes import record_module_collection_result
                 record_module_collection_result(db, downloader_id, False, str(exc))

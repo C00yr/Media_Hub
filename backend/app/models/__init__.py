@@ -1,7 +1,6 @@
 from app.models.entities import (
     ConfigAuditLog,
     DebugTrace,
-    DiagnosticExport,
     DownloadAction,
     IntegrationConfig,
     MTeamSnapshot,
@@ -20,7 +19,6 @@ from app.models.entities import (
 __all__ = [
     "ConfigAuditLog",
     "DebugTrace",
-    "DiagnosticExport",
     "DownloadAction",
     "IntegrationConfig",
     "MTeamSnapshot",

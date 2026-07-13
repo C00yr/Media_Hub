@@ -19,6 +19,8 @@ import {
   MessageSquare,
   Plus,
   Percent,
+  PanelLeftClose,
+  PanelLeftOpen,
   Radar,
   RefreshCw,
   Search,
@@ -36,7 +38,8 @@ import QRCode from "qrcode";
 import { FormEvent, KeyboardEvent, MouseEvent, PointerEvent, ReactNode, RefObject, SyntheticEvent, useEffect, useMemo, useRef, useState } from "react";
 import { api, formatBytes, formatSpeed, getToken, normalizeApiErrorMessage, setToken } from "../api/client";
 
-type User = { username: string; role: string };
+type User = { id?: number; username: string; role: string; must_change_credentials?: boolean };
+type SetupStatus = { initialized: boolean; default_credentials_pending?: boolean };
 type NavKey = "discover" | "dashboard" | "downloads" | "notifications" | "settings" | "diagnostics";
 type TrafficDimension = "year" | "month" | "week" | "day" | "hour";
 type DiscoverMode = "home" | "dual" | "mteam";
@@ -61,8 +64,27 @@ const DEFAULT_DISCOVER_FILTERS: DiscoverFilters = {
   min_rating: "0",
 };
 
+const TMDB_LANGUAGE_OPTIONS = [
+  { value: "zh-CN", label: "简体中文" },
+  { value: "zh-TW", label: "繁体中文" },
+  { value: "en-US", label: "English" },
+  { value: "ja-JP", label: "日本語" },
+  { value: "ko-KR", label: "한국어" },
+];
+
+const TMDB_REGION_OPTIONS = [
+  { value: "CN", label: "中国大陆" },
+  { value: "HK", label: "中国香港" },
+  { value: "TW", label: "中国台湾" },
+  { value: "US", label: "美国" },
+  { value: "GB", label: "英国" },
+  { value: "JP", label: "日本" },
+  { value: "KR", label: "韩国" },
+];
+
 type IntegrationTestResult = {
   success?: boolean;
+  state?: "draft";
   provider?: string;
   mode?: string;
   message?: string;
@@ -96,7 +118,6 @@ type TmdbForm = {
   language: string;
   region: string;
   timeout: string;
-  endpoint: string;
 };
 
 type PushNoticeState = {
@@ -111,8 +132,6 @@ type MTeamForm = {
   api_key: string;
   cookie: string;
   user_agent: string;
-  authorization: string;
-  passkey: string;
   timeout: string;
 };
 
@@ -278,6 +297,7 @@ function useLoad<T>(loader: () => Promise<T>, deps: unknown[], initialData: T | 
 }
 
 const SEARCH_HISTORY_STORAGE_KEY = "ptmh_search_history";
+const SIDEBAR_COLLAPSED_STORAGE_KEY = "ptmh_sidebar_collapsed";
 const LOCAL_SNAPSHOT_PREFIX = "ptmh_snapshot:v2:";
 const LOCAL_SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024;
 const REVALIDATE_DELAY_MS = 3000;
@@ -369,21 +389,31 @@ function clearSearchHistory(): string[] {
 }
 
 export function App() {
-  const [initialized, setInitialized] = useState<boolean | null>(null);
+  const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
   const [user, setUser] = useState<User | null>(null);
   const [active, setActive] = useState<NavKey>("dashboard");
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === "true");
   const [discoverResetToken, setDiscoverResetToken] = useState(0);
   const [selectedDownloader, setSelectedDownloader] = useState("qb1");
+  const [accountDialogOpen, setAccountDialogOpen] = useState(false);
 
   useEffect(() => {
-    api<{ initialized: boolean }>("/api/setup/status").then((data) => setInitialized(data.initialized));
+    api<SetupStatus>("/api/setup/status").then(setSetupStatus);
     if (getToken()) {
       api<User>("/api/auth/me").then(setUser).catch(() => setToken(null));
     }
   }, []);
 
-  if (initialized === null) return <Splash />;
-  if (!initialized) return <SetupPage onDone={(nextUser) => { setInitialized(true); setUser(nextUser); }} />;
+  useEffect(() => {
+    if (user?.must_change_credentials) setAccountDialogOpen(true);
+  }, [user?.must_change_credentials]);
+
+  useEffect(() => {
+    window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, String(sidebarCollapsed));
+  }, [sidebarCollapsed]);
+
+  if (setupStatus === null) return <Splash />;
+  if (!setupStatus.initialized) return <SetupPage onDone={(nextUser) => { setSetupStatus({ initialized: true }); setUser(nextUser); }} />;
   if (!user) return <LoginPage onLogin={setUser} />;
 
   const visibleNav = navItems.filter((item) => !item.admin || user.role === "admin");
@@ -397,22 +427,31 @@ export function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className={sidebarCollapsed ? "app-shell sidebar-collapsed" : "app-shell"}>
       <aside className="sidebar">
         <BrandLogo subtitle="媒体中枢" />
+        <button
+          type="button"
+          className="sidebar-toggle"
+          onClick={() => setSidebarCollapsed((collapsed) => !collapsed)}
+          aria-label={sidebarCollapsed ? "展开侧边栏" : "收起侧边栏"}
+          title={sidebarCollapsed ? "展开侧边栏" : "收起侧边栏"}
+        >
+          {sidebarCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
+        </button>
         <nav>
           {visibleNav.map((item) => {
             const Icon = item.icon;
             return (
-              <button className={active === item.key ? "nav-item active" : "nav-item"} onClick={() => openNav(item.key)} key={item.key}>
-                <Icon size={18} />
+              <button className={active === item.key ? "nav-item active" : "nav-item"} onClick={() => openNav(item.key)} key={item.key} title={item.label}>
+                <Icon size={20} />
                 <span>{item.label}</span>
               </button>
             );
           })}
         </nav>
-        <button className="nav-item logout" onClick={() => { setToken(null); setUser(null); }}>
-          <LogOut size={18} />
+        <button className="nav-item logout" onClick={() => { setAccountDialogOpen(false); setToken(null); setUser(null); }} title="退出登录">
+          <LogOut size={20} />
           <span>退出登录</span>
         </button>
       </aside>
@@ -424,10 +463,15 @@ export function App() {
               <p>{pageDescriptions[active]}</p>
             </div>
           )}
-          <div className="user-pill">
+          <button
+            type="button"
+            className={user.must_change_credentials ? "user-pill needs-credential-update" : "user-pill"}
+            onClick={() => setAccountDialogOpen(true)}
+            title="修改登录账号和密码"
+          >
             <ShieldCheck size={16} />
             {user.username} / {user.role === "admin" ? "管理员" : "用户"}
-          </div>
+          </button>
         </header>
         <ActivePage
           user={user}
@@ -451,6 +495,7 @@ export function App() {
           );
         })}
       </nav>
+      {accountDialogOpen && <AccountCredentialsDialog user={user} onClose={() => setAccountDialogOpen(false)} onUpdated={(nextUser) => setUser(nextUser)} />}
     </div>
   );
 }
@@ -463,12 +508,7 @@ function BrandLogo({ subtitle, large = false }: { subtitle: string; large?: bool
   return (
     <div className={large ? "brand large" : "brand"}>
       <span className="brand-mark" aria-hidden="true">
-        <svg className="brand-popcorn" viewBox="0 0 48 48" role="img">
-          <path className="brand-popcorn-kernel" d="M14.9 14.7c-2.7-1.1-4.1-4.3-2.8-6.9 1.4-2.8 5-3.5 7.2-1.5 1.2-3 5.1-4.1 7.7-2.2 1.8 1.3 2.5 3.5 1.8 5.5 2.8-.5 5.5 1.7 5.6 4.6.1 2.9-2.2 5.3-5.1 5.3H17.4c-2.7 0-4.2-2.4-2.5-4.8Z" />
-          <path className="brand-popcorn-cup" d="M12.5 18.5h23l-3.4 22H16l-3.5-22Z" />
-          <path className="brand-popcorn-fold" d="M20.4 19l1.1 21M27.7 19.1l-1.2 20.8" />
-          <path className="brand-popcorn-smile" d="M20.3 28.4c2.3 1.8 5.2 1.8 7.4 0" />
-        </svg>
+        <img className="brand-popcorn" src="/popcorn-icon.png" alt="" />
       </span>
       <div className="brand-copy">
         <strong>Media Hub</strong>
@@ -551,6 +591,57 @@ function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
   return <AuthForm title="登录" username={username} password={password} error={error} submitLabel="登录" onUsername={setUsername} onPassword={setPassword} onSubmit={submit} />;
 }
 
+function AccountCredentialsDialog({ user, onClose, onUpdated }: { user: User; onClose: () => void; onUpdated: (user: User) => void }) {
+  const [username, setUsername] = useState(user.username);
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setError("");
+    if (newPassword !== confirmPassword) {
+      setError("两次输入的新密码不一致");
+      return;
+    }
+    setSaving(true);
+    try {
+      const result = await api<{ access_token: string; user: User }>("/api/auth/account", {
+        method: "PUT",
+        body: JSON.stringify({ username, current_password: currentPassword, new_password: newPassword })
+      });
+      setToken(result.access_token);
+      onUpdated(result.user);
+      onClose();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return <div className="app-dialog-backdrop" role="presentation" onMouseDown={onClose}>
+    <form className="app-dialog account-dialog" role="dialog" aria-modal="true" aria-labelledby="account-dialog-title" onSubmit={submit} onMouseDown={(event) => event.stopPropagation()}>
+      <span className="app-dialog-icon"><ShieldCheck size={20} /></span>
+      <h3 id="account-dialog-title">修改登录账号</h3>
+      {user.must_change_credentials && <p className="account-dialog-note">当前正在使用初始管理员账号，请及时修改用户名和密码。</p>}
+      <div className="form-grid">
+        <label>登录用户名<input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" /></label>
+        <label>当前密码<input type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" /></label>
+        <label>新密码<input type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" minLength={8} /></label>
+        <label>确认新密码<input type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" minLength={8} /></label>
+      </div>
+      {error && <p className="error">{error}</p>}
+      <div className="app-dialog-actions">
+        <button type="button" onClick={onClose} disabled={saving}>取消</button>
+        <button className="primary" disabled={saving || username.trim().length < 3 || currentPassword.length === 0 || newPassword.length < 8 || confirmPassword.length < 8}>{saving ? "保存中..." : "保存账号"}</button>
+      </div>
+    </form>
+  </div>;
+}
+
 function AuthForm(props: {
   title: string;
   username: string;
@@ -587,7 +678,8 @@ function mergeDashboardQbs(current: any, realtime: any) {
       download_tasks: realtime.overview?.download_tasks ?? current.overview?.download_tasks,
       upload_tasks: realtime.overview?.upload_tasks ?? current.overview?.upload_tasks,
     },
-    updated_at: realtime.updated_at ?? current.updated_at,
+    qbs_updated_at: realtime.updated_at ?? current.qbs_updated_at,
+    updated_at: current.updated_at,
   };
 }
 
@@ -599,7 +691,7 @@ function DashboardPage({ onOpenDownloader }: { onOpenDownloader?: (downloaderId:
   const [testingQbId, setTestingQbId] = useState("");
   const [mteamStatusOverride, setMteamStatusOverride] = useState<{ success: boolean; message: string } | null>(null);
   const [dashboardError, setDashboardError] = useState("");
-  const delayedRefreshKey = useRef("");
+  const entryRefreshStarted = useRef(false);
 
   async function loadDashboard(url: string, silent = false) {
     try {
@@ -619,15 +711,19 @@ function DashboardPage({ onOpenDownloader }: { onOpenDownloader?: (downloaderId:
   }, [data]);
 
   useEffect(() => {
-    if (!shouldRevalidateFromCache(data)) return;
-    const key = String(data?._preload?.cached_at || data?.updated_at || "dashboard");
-    if (delayedRefreshKey.current === key) return;
-    delayedRefreshKey.current = key;
-    const timer = window.setTimeout(() => {
-      if (!document.hidden) loadDashboard("/api/dashboard?refresh=true", true);
-    }, REVALIDATE_DELAY_MS);
-    return () => window.clearTimeout(timer);
-  }, [data?._preload?.cached_at, data?._preload?.preloaded, data?.updated_at]);
+    if (!data || entryRefreshStarted.current) return;
+    const refreshOnEntry = () => {
+      if (document.hidden || entryRefreshStarted.current) return;
+      entryRefreshStarted.current = true;
+      void loadDashboard("/api/dashboard?refresh=true", true);
+    };
+    const timer = window.setTimeout(refreshOnEntry, 150);
+    document.addEventListener("visibilitychange", refreshOnEntry);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", refreshOnEntry);
+    };
+  }, [data]);
 
   useEffect(() => {
     let alive = true;
@@ -758,7 +854,7 @@ function DashboardPage({ onOpenDownloader }: { onOpenDownloader?: (downloaderId:
         onTestConnection={testMTeamConnection}
         testingConnection={testingMTeam}
         statusOverride={mteamStatusOverride}
-        updatedAt={data.updated_at}
+        updatedAt={data._preload?.cached_at || data.updated_at}
       />
       {dashboardError && <p className="error">{dashboardError}</p>}
     </div>
@@ -1048,6 +1144,7 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
   const filterKeyRef = useRef("");
   const filterSentinelRef = useRef<HTMLDivElement | null>(null);
   const filterLoadingPageRef = useRef<number | null>(null);
+  const detailReturnScrollRef = useRef<number | null>(null);
   const lists = data ? [
     { title: "流行趋势", items: data.trending },
     { title: "热门电影", items: data.popular_movies },
@@ -1146,6 +1243,18 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
     };
   }, [filterViewActive, discoverFilters, filterHasMore, filterLoading, filterLoadingMore, filterNextPage]);
 
+  useEffect(() => {
+    if (selectedMedia || selectedPerson || expandedDiscoverTitle || detailReturnScrollRef.current === null) return;
+    const scrollTop = detailReturnScrollRef.current;
+    const firstFrame = window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        window.scrollTo(0, scrollTop);
+        detailReturnScrollRef.current = null;
+      });
+    });
+    return () => window.cancelAnimationFrame(firstFrame);
+  }, [selectedMedia, selectedPerson, expandedDiscoverTitle]);
+
   function resetDiscoverHome() {
     setQuery("");
     setMedia([]);
@@ -1218,6 +1327,7 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
   async function openMediaDetail(item: any) {
     const tmdbId = mediaTmdbId(item);
     if (!tmdbId || !item.media_type) return;
+    detailReturnScrollRef.current = window.scrollY;
     setSelectedPerson(null);
     setSelectedMedia(item);
     setExpandedDiscoverTitle(null);
@@ -1749,6 +1859,8 @@ function QbTorrentTable({ items, downloader, onChanged }: { items: any[]; downlo
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState("");
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; item: any } | null>(null);
+  const [deleteTorrentConfirm, setDeleteTorrentConfirm] = useState<any | null>(null);
+  const [deletingTorrent, setDeletingTorrent] = useState(false);
   const detailRequestId = useRef(0);
   const selectedItem = items.find((item) => item.hash === selectedHash) ?? null;
 
@@ -1800,15 +1912,28 @@ function QbTorrentTable({ items, downloader, onChanged }: { items: any[]; downlo
     if (item.hash === selectedHash) loadDetail(item.hash);
   }
 
-  async function deleteTorrent(item: any) {
-    const confirmResult = await api<{ confirm_token: string }>(`/api/qb/${downloader}/torrents/${encodeURIComponent(item.hash)}/delete-confirm`, { method: "POST" });
-    const confirmed = window.confirm(`确认从 ${downloaderShortLabel(downloader)} 删除这个任务？\n\n${item.name}\n\n默认不会删除本地文件。`);
-    if (!confirmed) return;
-    await api(`/api/qb/${downloader}/torrents/${encodeURIComponent(item.hash)}?confirm_token=${encodeURIComponent(confirmResult.confirm_token)}&delete_files=false`, { method: "DELETE" });
+  function requestDeleteTorrent(item: any) {
     setContextMenu(null);
-    setDetail(null);
-    setSelectedHash("");
-    onChanged();
+    setDeleteTorrentConfirm(item);
+  }
+
+  async function deleteTorrent() {
+    if (!deleteTorrentConfirm) return;
+    const item = deleteTorrentConfirm;
+    setDeletingTorrent(true);
+    setDetailError("");
+    try {
+      const confirmResult = await api<{ confirm_token: string }>(`/api/qb/${downloader}/torrents/${encodeURIComponent(item.hash)}/delete-confirm`, { method: "POST" });
+      await api(`/api/qb/${downloader}/torrents/${encodeURIComponent(item.hash)}?confirm_token=${encodeURIComponent(confirmResult.confirm_token)}&delete_files=false`, { method: "DELETE" });
+      setDeleteTorrentConfirm(null);
+      setDetail(null);
+      setSelectedHash("");
+      onChanged();
+    } catch (err) {
+      setDetailError((err as Error).message);
+    } finally {
+      setDeletingTorrent(false);
+    }
   }
 
   async function changeFilePriority(fileId: number, priority: number) {
@@ -1884,9 +2009,21 @@ function QbTorrentTable({ items, downloader, onChanged }: { items: any[]; downlo
         <div className="qb-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} onClick={(event) => event.stopPropagation()}>
           <button onClick={() => mutateTorrent(contextMenu.item, "resume")}>启动</button>
           <button onClick={() => mutateTorrent(contextMenu.item, "pause")}>暂停</button>
-          <button className="danger" onClick={() => deleteTorrent(contextMenu.item)}>删除</button>
+          <button className="danger" onClick={() => requestDeleteTorrent(contextMenu.item)}>删除</button>
         </div>
       )}
+      {deleteTorrentConfirm && <div className="app-dialog-backdrop" role="presentation" onMouseDown={() => !deletingTorrent && setDeleteTorrentConfirm(null)}>
+        <div className="app-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-torrent-title" onMouseDown={(event) => event.stopPropagation()}>
+          <span className="app-dialog-icon"><Trash2 size={20} /></span>
+          <h3 id="delete-torrent-title">删除下载任务？</h3>
+          <p>将从 {downloaderShortLabel(downloader)} 移除此任务，不会删除本地文件。</p>
+          <div className="field-help compact-help"><strong>{deleteTorrentConfirm.name}</strong></div>
+          <div className="app-dialog-actions">
+            <button type="button" onClick={() => setDeleteTorrentConfirm(null)} disabled={deletingTorrent}>取消</button>
+            <button type="button" className="danger primary" onClick={() => void deleteTorrent()} disabled={deletingTorrent}>{deletingTorrent ? "正在删除..." : "确认删除"}</button>
+          </div>
+        </div>
+      </div>}
       {selectedItem && detailLoading && <QbDetailLoading item={selectedItem} />}
       {(detail || detailError) && !detailLoading && (
         <QbTorrentDetailPanel item={selectedItem} detail={detail} error={detailError} onPriorityChange={changeFilePriority} />
@@ -1912,16 +2049,8 @@ function AdminGrant({ onDone }: { onDone: () => void }) {
   return <Panel title="管理员验证"><div className="form-grid"><input value={username} onChange={(event) => setUsername(event.target.value)} /><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} /><button className="primary" onClick={verify}>授权 15 分钟</button>{error && <p className="error">{error}</p>}</div></Panel>;
 }
 
-function NotificationsPage() {
-  const { data } = useLoad<any>(() => api("/api/notifications"), []);
-  return <Panel title="通知中心"><div className="table-list">{(data?.items ?? []).map((item: any) => <div className="row" key={`${item.title}-${item.created_at}`}><strong>{item.title}</strong><span>{item.message}</span><small>{item.level} / {item.source}</small></div>)}</div></Panel>;
-}
-
 function NotificationsAssistantPage({ onNavigate }: { onNavigate?: (key: NavKey) => void }) {
-  const { data, reload } = useLoad<any>(() => api("/api/notifications"), []);
-  const [mode, setMode] = useState<"chat" | "json">("chat");
   const [message, setMessage] = useState("帮我查一下 qB 下载器状态");
-  const [jsonIntent, setJsonIntent] = useState('{"action":"status_query","target":"dashboard","downloader_id":"all","limit":5}');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState<any | null>(null);
@@ -1931,11 +2060,8 @@ function NotificationsAssistantPage({ onNavigate }: { onNavigate?: (key: NavKey)
     setBusy(true);
     setError("");
     try {
-      const payload = mode === "chat" ? { message } : { message, intent: JSON.parse(jsonIntent) };
-      const endpoint = mode === "chat" ? "/api/assistant/chat" : "/api/assistant/execute";
-      const response = await api<any>(endpoint, { method: "POST", body: JSON.stringify(payload) });
+      const response = await api<any>("/api/assistant/chat", { method: "POST", body: JSON.stringify({ message }) });
       setResult(response);
-      if (["download_started", "download_completed"].includes(response.intent?.action)) reload();
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -1946,45 +2072,28 @@ function NotificationsAssistantPage({ onNavigate }: { onNavigate?: (key: NavKey)
   return (
     <div className="grid-page notifications-page">
       <MemberManagementCard onNavigate={onNavigate} />
-      <Panel title="AI 通知助手">
+      <Panel title="AI 对话测试">
         <form className="assistant-box" onSubmit={submit}>
           <div className="notice info">
-            <strong>通过 DeepSeek 把自然语言转换成后端可执行 JSON</strong>
-            <span>先在设置页填写 DeepSeek API Key、模型名和 base_url。当前支持资源查询、下载开始通知、下载完成通知、各板块状态查询。</span>
+            <strong>验证 AI 回复</strong>
+            <span>在网页端发送一条测试消息，确认 AI 模块能够正常理解请求并返回结果。</span>
           </div>
-          <div className="segmented compact">
-            <button type="button" className={mode === "chat" ? "active" : ""} onClick={() => setMode("chat")}><MessageSquare size={16} />自然语言</button>
-            <button type="button" className={mode === "json" ? "active" : ""} onClick={() => setMode("json")}><Database size={16} />结构化 JSON</button>
-          </div>
-          {mode === "chat" ? (
-            <label>输入请求
-              <textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder="例如：帮我搜一下沙丘 2160p；qB1 现在下载速度多少；记录下载完成通知" />
-            </label>
-          ) : (
-            <label>后端可执行 JSON
-              <textarea value={jsonIntent} onChange={(event) => setJsonIntent(event.target.value)} />
-            </label>
-          )}
+          <label>测试消息
+            <textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder="例如：帮我查一下 qB 下载器状态；查询沙丘的影视信息" />
+          </label>
           <div className="actions">
-            <button className="primary" disabled={busy}>{busy ? "处理中..." : "执行"}</button>
+            <button className="primary" disabled={busy}><MessageSquare size={16} />{busy ? "正在获取回复..." : "发送测试"}</button>
           </div>
           {error && <p className="error">{error}</p>}
           {result && (
             <div className="assistant-result">
               <div className="result-card success">
-                <strong>回复</strong>
+                <strong>AI 回复</strong>
                 <AssistantReply reply={result.reply} />
               </div>
-              <details>
-                <summary>查看结构化意图与后端结果</summary>
-                <pre>{JSON.stringify({ intent: result.intent, result: result.result }, null, 2)}</pre>
-              </details>
             </div>
           )}
         </form>
-      </Panel>
-      <Panel title="通知中心">
-        <div className="table-list">{(data?.items ?? []).map((item: any) => <div className="row" key={`${item.title}-${item.created_at}`}><strong>{item.title}</strong><span>{item.message}</span><small>{item.level} / {item.source}</small></div>)}</div>
       </Panel>
     </div>
   );
@@ -2003,11 +2112,11 @@ function NotificationPreferencesCard() {
     ...(data?.preferences ?? {}),
   };
   const labels: Record<NotificationPreferenceKey, { title: string; help: string }> = {
-    download_started: { title: "下载开始通知", help: "AI 或微信 claw 记录下载开始时写入通知中心。" },
-    download_completed: { title: "下载完成通知", help: "AI 或微信 claw 记录下载完成时写入通知中心。" },
-    resource_search: { title: "资源查询提醒", help: "开启后，AI/微信 claw 的资源查询结果会写入通知中心。" },
-    status_query: { title: "状态查询提醒", help: "开启后，各板块状态查询结果会写入通知中心。" },
-    wechat_claw_push: { title: "推送到 WeChat claw", help: "通知中心写入后，如果配置了 webhook，同步推送到手机端。" },
+    download_started: { title: "下载开始通知", help: "AI 或微信 claw 记录下载开始，并按成员偏好推送。" },
+    download_completed: { title: "下载完成通知", help: "AI 或微信 claw 记录下载完成，并按成员偏好推送。" },
+    resource_search: { title: "资源查询提醒", help: "开启后，资源查询完成时会按成员偏好推送。" },
+    status_query: { title: "状态查询提醒", help: "开启后，各板块状态查询完成时会按成员偏好推送。" },
+    wechat_claw_push: { title: "推送到 WeChat claw", help: "将允许的通知发送给已绑定的微信成员。" },
   };
 
   async function toggle(key: NotificationPreferenceKey) {
@@ -2065,6 +2174,7 @@ function MemberManagementCard({ onNavigate }: { onNavigate?: (key: NavKey) => vo
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [draftPreferences, setDraftPreferences] = useState<Record<string, any>>({});
   const [deleteConfirm, setDeleteConfirm] = useState<{ member: any; stage: 1 | 2 } | null>(null);
+  const [renameDialog, setRenameDialog] = useState<{ member: any; name: string } | null>(null);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const items = Array.isArray(bindings.data?.items) ? bindings.data.items : [];
@@ -2120,10 +2230,19 @@ function MemberManagementCard({ onNavigate }: { onNavigate?: (key: NavKey) => vo
     }
   }
 
-  async function editMember(member: any) {
-    const name = window.prompt("成员名称", member.display_name)?.trim();
-    if (!name || name === member.display_name) return;
-    await update(member, { display_name: name });
+  function editMember(member: any) {
+    setRenameDialog({ member, name: member.display_name });
+  }
+
+  async function saveMemberName() {
+    if (!renameDialog) return;
+    const name = renameDialog.name.trim();
+    if (!name || name === renameDialog.member.display_name) {
+      setRenameDialog(null);
+      return;
+    }
+    const saved = await update(renameDialog.member, { display_name: name });
+    if (saved) setRenameDialog(null);
   }
 
   async function deleteMember(member: any) {
@@ -2172,8 +2291,9 @@ function MemberManagementCard({ onNavigate }: { onNavigate?: (key: NavKey) => vo
           <p className="muted">点击成员卡片即可展开设置；通知偏好按成员独立保存。</p>
           <button type="button" className="primary" onClick={addMember} disabled={busy !== ""}><Plus size={16} /> 新增成员</button>
         </div>
-        <div className="member-card-grid">
-          {items.map((member: any) => {
+        <div className="member-selection-row">
+          <div className="member-card-grid">
+            {items.map((member: any) => {
             const configured = Boolean(member.connected);
             return (
               <article
@@ -2196,16 +2316,26 @@ function MemberManagementCard({ onNavigate }: { onNavigate?: (key: NavKey) => vo
                 {!configured && <button type="button" onClick={(event) => { event.stopPropagation(); openConfiguration(member); }}>前去配置</button>}
               </article>
             );
-          })}
-          {!items.length && <div className="member-empty">还没有成员。点击“新增成员”即可创建成员1并分配一个默认头像。</div>}
+            })}
+            {!items.length && <div className="member-empty">还没有成员。点击“新增成员”即可创建成员1并分配一个默认头像。</div>}
+          </div>
+          {selected && <div className="member-selection-actions">
+            <button type="button" onClick={() => editMember(selected)} disabled={busy !== ""}>修改成员名称</button>
+            <button type="button" className="danger" onClick={() => requestDelete(selected)} disabled={busy !== ""}>删除成员</button>
+            <button type="button" className="primary" onClick={() => void applyPreferences()} disabled={busy !== ""}>{busy === String(selected.id) ? "应用中..." : "应用"}</button>
+          </div>}
         </div>
         {selected && (
           <div className="member-notification-settings">
             <div className="member-settings-heading"><div><h3>{selected.display_name}的成员设置</h3><p className="muted">模块异常按小时采集结果计算：连续多个小时没有拉取到数据，才会推送。</p></div></div>
             <div className="member-notification-options">
               {([
-                ["download_started", "下载开始"],
-                ["download_completed", "下载完成"],
+                ["qb1_download_started", "qB1 下载开始"],
+                ["qb1_download_completed", "qB1 下载完成"],
+                ["qb2_download_started", "qB2 下载开始"],
+                ["qb2_download_completed", "qB2 下载完成"],
+                ["qb3_download_started", "qB3 下载开始"],
+                ["qb3_download_completed", "qB3 下载完成"],
               ] as const).map(([key, label]) => (
                 <label className="member-notification-option" key={key}>
                   <input type="checkbox" checked={Boolean(draftPreferences[key])} disabled={busy === String(selected.id)} onChange={() => setDraftPreferences((current) => ({ ...current, [key]: !current[key] }))} />
@@ -2243,10 +2373,22 @@ function MemberManagementCard({ onNavigate }: { onNavigate?: (key: NavKey) => vo
               ))}
               {!selectedInteractions.length && <p className="muted">手机端发起交互后，这里会保留最近 5 条的耗时与失败阶段。</p>}
             </div>
-            <div className="member-settings-actions"><button type="button" onClick={() => void editMember(selected)} disabled={busy !== ""}>修改成员名称</button><button type="button" className="danger" onClick={() => requestDelete(selected)} disabled={busy !== ""}>删除成员</button><button type="button" className="primary" onClick={() => void applyPreferences()} disabled={busy !== ""}>{busy === String(selected.id) ? "应用中..." : "应用"}</button></div>
           </div>
         )}
         {error && <p className="error">{error}</p>}
+        {renameDialog && <div className="app-dialog-backdrop" role="presentation" onMouseDown={() => setRenameDialog(null)}>
+          <form className="app-dialog account-dialog" role="dialog" aria-modal="true" aria-labelledby="rename-member-title" onMouseDown={(event) => event.stopPropagation()} onSubmit={(event) => { event.preventDefault(); void saveMemberName(); }}>
+            <span className="app-dialog-icon"><UserRound size={20} /></span>
+            <h3 id="rename-member-title">修改成员名称</h3>
+            <label>成员名称
+              <input autoFocus value={renameDialog.name} onChange={(event) => setRenameDialog((current) => current ? { ...current, name: event.target.value } : null)} maxLength={80} />
+            </label>
+            <div className="app-dialog-actions">
+              <button type="button" onClick={() => setRenameDialog(null)}>取消</button>
+              <button type="submit" className="primary" disabled={busy !== ""}>保存</button>
+            </div>
+          </form>
+        </div>}
         {deleteConfirm && <div className="app-dialog-backdrop" role="presentation" onMouseDown={() => setDeleteConfirm(null)}>
           <div className="app-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-member-title" onMouseDown={(event) => event.stopPropagation()}>
             <span className="app-dialog-icon"><Trash2 size={20} /></span>
@@ -2410,6 +2552,7 @@ function AdminUserManagementCard() {
 function SettingsPage({ user }: { user: User }) {
   const { data, reload } = useLoad<any>(() => user.role === "admin" ? api("/api/admin/integrations") : Promise.resolve(null), [user.role]);
   const storage = useLoad<any>(() => user.role === "admin" ? api("/api/admin/storage/status") : Promise.resolve(null), [user.role]);
+  const wechatBindings = useLoad<any>(() => user.role === "admin" ? api("/api/admin/wechat-claw/bindings") : Promise.resolve(null), [user.role]);
   const [activeStep, setActiveStep] = useState(() => {
     const saved = window.sessionStorage.getItem("ptmh.settings.activeStep") || "storage";
     return ["qb1", "qb2", "qb3"].includes(saved) ? "downloaders" : saved;
@@ -2419,20 +2562,22 @@ function SettingsPage({ user }: { user: User }) {
 
   const providers = data.providers.filter((provider: any) => ["mteam", "qb1", "qb2", "qb3", "tmdb", "ai", "wechat_claw"].includes(provider.provider));
   const providerById = Object.fromEntries(providers.map((provider: any) => [provider.provider, provider]));
+  const wechatClawConnected = Array.isArray(wechatBindings.data?.items) && wechatBindings.data.items.some((binding: any) => binding.connected);
   const steps = [
     { id: "storage", label: "NAS 存储", ready: Boolean(storage.data?.nas_storage_readable) },
     { id: "mteam", label: "M-Team", ready: providerStepReady(providerById.mteam) },
     { id: "downloaders", label: "下载器", ready: ["qb1", "qb2", "qb3"].every((id) => providerStepReady(providerById[id])) },
     { id: "tmdb", label: "TMDB", ready: providerStepReady(providerById.tmdb) },
     { id: "ai", label: "AI", ready: providerStepReady(providerById.ai) },
-    { id: "wechat_claw", label: "WeChat claw", ready: providerStepReady(providerById.wechat_claw) },
+    { id: "wechat_claw", label: "WeChat claw", ready: providerStepReady(providerById.wechat_claw) && wechatClawConnected },
   ];
   const activeProvider = providerById[activeStep];
 
   function selectStep(id: string) {
     setActiveStep(id);
     window.sessionStorage.setItem("ptmh.settings.activeStep", id);
-    window.requestAnimationFrame(() => document.getElementById("settings-active-card")?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    window.scrollTo(0, 0);
+    window.requestAnimationFrame(() => window.scrollTo(0, 0));
   }
 
   return (
@@ -2469,31 +2614,27 @@ function DownloadersSettingsCard({ providers, onChanged }: { providers: any[]; o
 function StorageSettingsCard({ status, loading, error }: { status: any; loading: boolean; error: string }) {
   const detectedPaths = Array.isArray(status?.nas_storage_detected_paths) ? status.nas_storage_detected_paths : [];
   const errors = Array.isArray(status?.nas_storage_errors) ? status.nas_storage_errors : [];
+  const readable = Boolean(status?.nas_storage_readable);
   return (
     <Panel title="存储空间">
       <div className="integration">
-        <div className={`notice ${status?.nas_storage_readable ? "success" : "info"}`}>
-          <strong>{loading ? "正在检测存储挂载..." : status?.nas_storage_summary_label || "未检测到存储挂载"}</strong>
+        <div className="notice info">
+          <strong>NAS 存储空间</strong>
           <span>填写 NAS 文件夹路径后，即可在仪表盘查看空间使用情况。</span>
         </div>
-        {error && <p className="error">{error}</p>}
-        {detectedPaths.length > 0 ? (
-          <div className="field-help">
-            <strong>已检测路径：</strong>
-            <span className="storage-path-list">{detectedPaths.map((path: string) => <code key={path}>{path}</code>)}</span>
-          </div>
-        ) : (
-          <div className="field-help">
-            <strong>未检测到挂载时：</strong>
-            <span>请重新部署容器，并把 docker-compose.yml 里 storage volumes 的左侧替换成 NAS 文件夹路径，例如 /volume1/qb1-downloads:/mnt/storage1:ro。</span>
-          </div>
-        )}
-        {errors.length > 0 && (
-          <div className="field-help">
-            <strong>检测提示：</strong>
-            <span>{errors.slice(0, 3).map((item: any) => `${item.path}: ${item.message}`).join("；")}</span>
-          </div>
-        )}
+        <div className="field-help">
+          <strong>配置方式</strong>
+          <span>重新部署容器时，将 docker-compose.yml 中 storage volumes 左侧替换为 NAS 文件夹路径，例如 /volume1/qb1-downloads:/mnt/storage1:ro。</span>
+        </div>
+        {!loading && <div className={`result-card ${error || !readable ? "failed" : "success"}`}>
+          <strong>{error || status?.nas_storage_summary_label || (readable ? "NAS 存储路径可访问" : "未检测到可访问的 NAS 挂载")}</strong>
+          {readable ? (
+            <span>已检测路径：<span className="storage-path-list">{detectedPaths.map((path: string) => <code key={path}>{path}</code>)}</span></span>
+          ) : (
+            <span>{errors.length ? errors.slice(0, 3).map((item: any) => `容器内路径 ${item.path} ${item.message || "无法访问"}`).join("；") : "请检查 NAS 文件夹路径是否已正确写入 YAML 并挂载到容器。"}</span>
+          )}
+        </div>}
+        {loading && <div className="result-card neutral"><strong>正在检测 NAS 挂载...</strong></div>}
       </div>
     </Panel>
   );
@@ -2578,6 +2719,7 @@ function AiIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
       await api(`/api/admin/integrations/ai`, { method: "PUT", body: JSON.stringify({ payload: payload() }) });
       setLocalResult({
         success: false,
+        state: "draft",
         provider: "ai",
         mode: "real",
         message: "AI 助手设置已保存。",
@@ -2745,7 +2887,6 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
     false,
   );
   const [busy, setBusy] = useState("");
-  const [showAdvanced, setShowAdvanced] = useState(false);
   const [localError, setLocalError] = useState("");
   const [localResult, setLocalResult] = useState<IntegrationTestResult | null>(provider.last_test_result);
   const result = localResult ?? provider.last_test_result;
@@ -2786,17 +2927,8 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
   function payload() {
     return {
       mode: "ilink",
-      name: form.name.trim() || "通知1",
-      base_url: form.base_url.trim() || "https://ilinkai.weixin.qq.com",
-      default_target: form.default_target.trim(),
-      admin_user_ids: form.admin_user_ids.trim(),
-      poll_timeout: Number(form.poll_timeout) || 25,
-      public_base_url: form.public_base_url.trim(),
-      inbound_token: form.inbound_token.trim(),
-      webhook_url: form.webhook_url.trim(),
-      webhook_secret: form.webhook_secret.trim(),
+      poll_timeout: Math.max(5, Number(form.poll_timeout) || 25),
       default_downloader_id: form.default_downloader_id,
-      timeout: Number(form.timeout) || 10,
     };
   }
 
@@ -2807,6 +2939,7 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
       await api("/api/admin/integrations/wechat_claw", { method: "PUT", body: JSON.stringify({ payload: payload() }) });
       setLocalResult({
         success: false,
+        state: "draft",
         provider: "wechat_claw",
         mode: "real",
         message: "微信连接设置已保存。",
@@ -2849,13 +2982,6 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
     } finally {
       setBusy("");
     }
-  }
-
-  function generateToken() {
-    const bytes = new Uint8Array(24);
-    window.crypto?.getRandomValues(bytes);
-    const token = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-    updateField("inbound_token", token || Math.random().toString(36).slice(2));
   }
 
   const setupPayload = setup.data?.qr_payload ?? {};
@@ -2910,27 +3036,12 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
     }
   }
 
-  async function removeBinding() {
-    if (!selectedBindingId || !window.confirm("删除这个微信绑定吗？它的登录态和互动记录也会删除。")) return;
-    setBusy("remove");
-    setLocalError("");
-    try {
-      await api(`/api/admin/wechat-claw/bindings/${selectedBindingId}`, { method: "DELETE" });
-      setSelectedBindingId(null);
-      await bindings.reload();
-    } catch (err) {
-      setLocalError((err as Error).message);
-    } finally {
-      setBusy("");
-    }
-  }
-
   return (
     <Panel title="微信连接">
       <div className="integration wechat-config">
-        <div className={`notice ${setup.data?.connected ? "success" : "info"}`}>
-          <strong>{setup.data?.connected ? "配置可用" : "扫码绑定微信"}</strong>
-          <span>{setup.data?.connected ? `${selectedBinding?.display_name || "当前成员"} 已完成扫码绑定，可以接收主动通知。` : "绑定后，可在手机上查询影视、搜索资源、发起下载并接收通知。"}</span>
+        <div className="notice info">
+          <strong>微信消息助手</strong>
+          <span>完成配置并扫码绑定后，可在微信中查询影视与站内资源、发起下载，并接收任务完成和异常通知。</span>
         </div>
 
         <div className="wechat-binding-tabs" aria-label="WeChat claw 成员">
@@ -2952,26 +3063,15 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
               <option value="qb3">qB3</option>
             </select>
           </label>
+          <label className="compact-field">轮询超时（秒）
+            <input type="number" min="5" max="120" value={form.poll_timeout} onChange={(event) => updateField("poll_timeout", event.target.value)} />
+          </label>
         </div>
-        <button className="inline-tool" type="button" onClick={() => setShowAdvanced((value) => !value)}>
-          <SlidersHorizontal size={16} /> {showAdvanced ? "隐藏高级设置" : "高级设置"}
-        </button>
-        {showAdvanced && <div className="settings-grid advanced-settings">
-          <label>微信服务地址
-            <CopyableInput value={form.base_url} onChange={(value) => updateField("base_url", value)} placeholder="https://ilinkai.weixin.qq.com" inputMode="url" />
-          </label>
-          <label>默认通知对象
-            <CopyableInput value={form.default_target} onChange={(value) => updateField("default_target", value)} placeholder="留空时发送给最近互动的成员" />
-          </label>
-          <label>轮询超时（秒）
-            <CopyableInput value={form.poll_timeout} onChange={(value) => updateField("poll_timeout", value)} inputMode="numeric" placeholder="25" />
-          </label>
-        </div>}
 
         {selectedBindingId && <div className="wechat-setup-card">
           <div className="wechat-setup-main">
             <div className="wechat-status-line">
-              <span>配置状态</span>
+              <span>绑定状态</span>
               <strong>{loginStatus}</strong>
             </div>
             {qrReady ? <WechatClawQrCode value={qrText} /> : (
@@ -2987,10 +3087,10 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
           </div>
 
           <div className="wechat-setup-side">
-            <div className="field-help compact-help">
-              <strong>微信连接状态</strong>
-              <span>账号：{setup.data?.account_id || "等待扫码"}</span>
-              <span>二维码：{qrcode.status === "confirmed" ? "已确认" : qrcode.status === "expired" ? "已过期" : "等待扫码"}</span>
+            <div className="wechat-connection-summary">
+              <strong>当前连接</strong>
+              <div><span>微信账号</span><b>{setup.data?.account_id || "等待扫码"}</b></div>
+              <div><span>二维码</span><b>{qrcode.status === "confirmed" ? "已确认" : qrcode.status === "expired" ? "已过期" : "等待扫码"}</b></div>
             </div>
           </div>
         </div>}
@@ -3003,6 +3103,7 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
         {!provider.enabled && !canEnable && <p className="muted">请先保存并测试，测试成功后再启用微信连接。</p>}
         {setup.error && <p className="error">{setup.error}</p>}
         {localError && <p className="error">{localError}</p>}
+        <TestResultCard result={result} emptyProvider="WeChat claw" />
       </div>
     </Panel>
   );
@@ -3052,6 +3153,7 @@ function LegacyWechatClawIntegrationEditor({ provider, onChanged }: { provider: 
       await api(`/api/admin/integrations/wechat_claw`, { method: "PUT", body: JSON.stringify({ payload: payload() }) });
       setLocalResult({
         success: false,
+        state: "draft",
         provider: "wechat_claw",
         mode: "real",
         message: "WeChat claw 草稿已保存。",
@@ -3184,6 +3286,7 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
       await api(`/api/admin/integrations/${provider.provider}`, { method: "PUT", body: JSON.stringify({ payload: payload() }) });
       setLocalResult({
         success: false,
+        state: "draft",
         provider: provider.provider,
         mode: "real",
         message: "草稿已保存。",
@@ -3267,13 +3370,12 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
 function MTeamIntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
   const saved = provider.saved_payload ?? {};
   const savedHeaders = saved.headers ?? {};
+  const legacyApiKey = String(saved.api_key ?? saved.passkey ?? savedHeaders.Authorization ?? "").replace(/^Bearer\s+/i, "");
   const [form, setForm] = useState<MTeamForm>({
     base_url: String(saved.base_url ?? "https://kp.m-team.cc"),
-    api_key: String(saved.api_key ?? ""),
+    api_key: legacyApiKey,
     cookie: String(savedHeaders.Cookie ?? ""),
     user_agent: String(savedHeaders["User-Agent"] ?? "PT-Media-Hub"),
-    authorization: String(savedHeaders.Authorization ?? ""),
-    passkey: String(saved.passkey ?? ""),
     timeout: String(saved.timeout ?? "10")
   });
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -3291,12 +3393,10 @@ function MTeamIntegrationEditor({ provider, onChanged }: { provider: any; onChan
     const headers: Record<string, string> = {};
     if (form.cookie.trim()) headers.Cookie = form.cookie.trim();
     if (form.user_agent.trim()) headers["User-Agent"] = form.user_agent.trim();
-    if (form.authorization.trim()) headers.Authorization = form.authorization.trim();
     return {
       base_url: form.base_url.trim() || "https://kp.m-team.cc",
       api_key: form.api_key.trim(),
       headers,
-      passkey: form.passkey.trim(),
       timeout: Number(form.timeout) || 10
     };
   }
@@ -3308,6 +3408,7 @@ function MTeamIntegrationEditor({ provider, onChanged }: { provider: any; onChan
       await api(`/api/admin/integrations/mteam`, { method: "PUT", body: JSON.stringify({ payload: payload() }) });
       setLocalResult({
         success: false,
+        state: "draft",
         provider: "mteam",
         mode: "mock",
         message: "草稿已保存。",
@@ -3374,14 +3475,8 @@ function MTeamIntegrationEditor({ provider, onChanged }: { provider: any; onChan
           <label>Cookie
             <SecretInput value={form.cookie} onChange={(value) => updateField("cookie", value)} placeholder="从浏览器复制完整 Cookie" autoComplete="off" />
           </label>
-          <label>Passkey
-            <SecretInput value={form.passkey} onChange={(value) => updateField("passkey", value)} placeholder="可选，下载链接使用；不是 API Key" autoComplete="off" />
-          </label>
           <label>超时时间（秒）
             <CopyableInput value={form.timeout} onChange={(value) => updateField("timeout", value)} inputMode="numeric" placeholder="10" />
-          </label>
-          <label>Authorization
-            <SecretInput value={form.authorization} onChange={(value) => updateField("authorization", value)} placeholder="可选，例如 Bearer token" autoComplete="off" />
           </label>
         </div>}
         <div className="actions">
@@ -3408,7 +3503,6 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
     language: String(saved.language ?? "zh-CN"),
     region: String(saved.region ?? "CN"),
     timeout: String(saved.timeout ?? "12"),
-    endpoint: String(saved.endpoint ?? "")
   });
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [busy, setBusy] = useState("");
@@ -3430,7 +3524,6 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
       language: form.language.trim() || "zh-CN",
       region: form.region.trim() || "CN",
       timeout: Number(form.timeout) || 12,
-      endpoint: form.endpoint.trim()
     };
   }
 
@@ -3441,6 +3534,7 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
       await api(`/api/admin/integrations/tmdb`, { method: "PUT", body: JSON.stringify({ payload: payload() }) });
       setLocalResult({
         success: false,
+        state: "draft",
         provider: "tmdb",
         mode: "real",
         can_enable: false,
@@ -3498,6 +3592,16 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
           <label>TMDB Bearer Token
             <SecretInput value={form.bearer_token} onChange={(value) => updateField("bearer_token", value)} placeholder="从 TMDB 账号设置中复制" autoComplete="off" />
           </label>
+          <label>语言
+            <select value={form.language} onChange={(event) => updateField("language", event.target.value)}>
+              {TMDB_LANGUAGE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+            </select>
+          </label>
+          <label>地区
+            <select value={form.region} onChange={(event) => updateField("region", event.target.value)}>
+              {TMDB_REGION_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+            </select>
+          </label>
         </div>
         <button className="inline-tool" type="button" onClick={() => setShowAdvanced((value) => !value)}>
           <SlidersHorizontal size={16} /> {showAdvanced ? "隐藏高级设置" : "高级设置"}
@@ -3518,17 +3622,8 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
           {isProxyMode && <label>代理地址
             <CopyableInput value={form.proxy_url} onChange={(value) => updateField("proxy_url", value)} placeholder="http://mihomo:7890" inputMode="url" />
           </label>}
-          <label>语言
-            <CopyableInput value={form.language} onChange={(value) => updateField("language", value)} placeholder="zh-CN" />
-          </label>
-          <label>地区
-            <CopyableInput value={form.region} onChange={(value) => updateField("region", value)} placeholder="CN" />
-          </label>
-          <label>API Key
-            <SecretInput value={form.api_key} onChange={(value) => updateField("api_key", value)} placeholder="仅在无法使用 Bearer Token 时填写" autoComplete="off" />
-          </label>
-          <label>服务地址
-            <CopyableInput value={form.endpoint} onChange={(value) => updateField("endpoint", value)} placeholder="通常无需修改" />
+          <label>TMDB API Key（备用凭据）
+            <SecretInput value={form.api_key} onChange={(value) => updateField("api_key", value)} placeholder="可替代 Bearer Token 使用" autoComplete="off" />
           </label>
           <label>超时时间（秒）
             <CopyableInput value={form.timeout} onChange={(value) => updateField("timeout", value)} inputMode="numeric" placeholder="12" />
@@ -3558,9 +3653,10 @@ function TestResultCard({ result, emptyProvider }: { result?: IntegrationTestRes
     );
   }
 
+  const tone = result.state === "draft" ? "neutral" : result.success ? "success" : "failed";
   return (
-    <div className={result.success ? "result-card success" : "result-card failed"}>
-      <strong>{result.message ?? (result.success ? "测试成功" : "测试失败")}</strong>
+    <div className={`result-card ${tone}`}>
+      <strong>{result.message ?? (result.state === "draft" ? "草稿已保存" : result.success ? "测试成功" : "测试失败")}</strong>
       {result.explanation && <span>{result.explanation}</span>}
       {result.next_step && <span>下一步：{result.next_step}</span>}
       {result.trace_id && <small>诊断编号：{result.trace_id}</small>}
@@ -3664,8 +3760,8 @@ function diagnosticModuleName(module: string): string {
     qb3: "qB下载器3",
     tmdb: "TMDB",
     ai: "AI 模块",
+    wechat_claw: "WeChat claw",
     nas_disk: "NAS 存储",
-    stats_engine: "数据统计",
   };
   return names[module] ?? module;
 }
@@ -3685,7 +3781,6 @@ function diagnosticStatusMeta(item: any): { label: string; detail: string; tone:
 
 function DiagnosticsPage() {
   const health = useLoad<any>(() => api("/api/diagnostics/health"), []);
-  const [exportPayload, setExportPayload] = useState<any | null>(null);
   const modules = health.data?.modules ?? [];
   const members = health.data?.wechat_members ?? [];
 
@@ -3728,11 +3823,6 @@ function DiagnosticsPage() {
           })}
           {!members.length && <p className="muted">尚未创建 WeChat claw 成员。</p>}
         </div>
-      </Panel>
-      <Panel title="诊断导出">
-        <p className="muted">导出的内容会自动脱敏，便于排查配置、网络和模块状态。</p>
-        <button onClick={() => api<any>("/api/diagnostics/export", { method: "POST" }).then(setExportPayload)}>导出脱敏 JSON</button>
-        {exportPayload && <pre>{JSON.stringify(exportPayload, null, 2)}</pre>}
       </Panel>
     </div>
   );

@@ -267,7 +267,10 @@ def test_cached_discover_does_not_schedule_immediate_refresh(monkeypatch):
     if created.status_code == 200:
         token = created.json()["access_token"]
     else:
-        token = client.post("/api/auth/login", json={"username": "admin", "password": "password123"}).json()["access_token"]
+        login = client.post("/api/auth/login", json={"username": "admin", "password": "password123"})
+        if login.status_code != 200:
+            login = client.post("/api/auth/login", json={"username": "admin", "password": "adminadmin"})
+        token = login.json()["access_token"]
 
     db = SessionLocal()
     try:
@@ -297,7 +300,13 @@ def test_qb_and_mteam_disable_environment_proxy(monkeypatch):
 
 def test_tmdb_enable_requires_real_success():
     created = client.post("/api/setup/admin", json={"username": "admin", "password": "password123"})
-    token = created.json()["access_token"] if created.status_code == 200 else client.post("/api/auth/login", json={"username": "admin", "password": "password123"}).json()["access_token"]
+    if created.status_code == 200:
+        token = created.json()["access_token"]
+    else:
+        login = client.post("/api/auth/login", json={"username": "admin", "password": "password123"})
+        if login.status_code != 200:
+            login = client.post("/api/auth/login", json={"username": "admin", "password": "adminadmin"})
+        token = login.json()["access_token"]
 
     saved = client.put(
         "/api/admin/integrations/tmdb",

@@ -141,7 +141,10 @@ class TmdbAdapter(MetadataAdapter):
                     genre_id = next((item["id"] for item in self._genres(current_type) if genre.lower() in str(item.get("name") or "").lower()), "")
                     discover_filters["genre"] = str(genre_id or "")
                 items.extend(self.discover_media(discover_filters).get("items") or [])
-        filtered = [item for item in items if self._matches_lookup_filters(item, filters)]
+        # Discover already applies the structured filters server-side. Its
+        # compact response omits production countries, so re-filtering it here
+        # would incorrectly discard region-specific queries.
+        filtered = [item for item in items if self._matches_lookup_filters(item, filters)] if query.strip() else items
         sort_by = str(filters.get("sort_by") or "").lower()
         if sort_by == "vote_average.desc":
             filtered.sort(key=lambda item: (float(item.get("rating") or 0), int(item.get("vote_count") or 0)), reverse=True)
@@ -149,7 +152,20 @@ class TmdbAdapter(MetadataAdapter):
             filtered.sort(key=lambda item: str(item.get("release_date") or ""), reverse=True)
         else:
             filtered.sort(key=lambda item: float(item.get("popularity") or 0), reverse=True)
-        return filtered[:10]
+        candidates = filtered[:10]
+        if query.strip():
+            return candidates
+
+        # Discover responses omit credits and episode metadata. Hydrate the
+        # compact candidates so assistant replies can use the same detail set
+        # as a title lookup.
+        detailed: list[dict[str, Any]] = []
+        for item in candidates:
+            try:
+                detailed.append(self.get_media_details(str(item["tmdb_id"]), str(item["media_type"])))
+            except Exception:
+                detailed.append(item)
+        return detailed
 
     @staticmethod
     def _matches_lookup_filters(item: dict[str, Any], filters: dict[str, Any]) -> bool:

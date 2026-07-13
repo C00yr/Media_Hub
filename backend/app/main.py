@@ -1,3 +1,5 @@
+import logging
+import secrets
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -6,14 +8,52 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import inspect, text
 
 from app.api.routes import router
+from app.auth.security import hash_password
 from app.config.settings import get_settings
-from app.db.session import Base, engine
+from app.db.session import Base, SessionLocal, engine
 from app.models import entities  # noqa: F401
+from app.models.entities import Setting, User
 from app.tasks.scheduler import build_scheduler, capture_snapshots, start_wechat_claw_polling, stop_wechat_claw_polling
 
 
 settings = get_settings()
 scheduler = build_scheduler(settings.snapshot_interval_minutes)
+logger = logging.getLogger(__name__)
+
+DEFAULT_ADMIN_USERNAME = "admin"
+DEFAULT_ADMIN_PASSWORD = "adminadmin"
+DEFAULT_CREDENTIALS_PENDING_KEY = "account.default_credentials_pending"
+SUPER_PASSWORD_SETTING_KEY = "auth.super_password"
+
+
+def ensure_default_admin() -> None:
+    db = SessionLocal()
+    try:
+        if db.query(User).filter(User.role == "admin").first() is not None:
+            return
+        db.add(User(username=DEFAULT_ADMIN_USERNAME, password_hash=hash_password(DEFAULT_ADMIN_PASSWORD), role="admin"))
+        db.add(Setting(key=DEFAULT_CREDENTIALS_PENDING_KEY, value={"required": True}))
+        db.commit()
+    finally:
+        db.close()
+
+
+def ensure_super_password() -> None:
+    db = SessionLocal()
+    try:
+        setting = db.query(Setting).filter(Setting.key == SUPER_PASSWORD_SETTING_KEY).one_or_none()
+        if setting and isinstance(setting.value, dict) and str(setting.value.get("password_hash") or ""):
+            return
+        super_password = secrets.token_urlsafe(24)
+        value = {"password_hash": hash_password(super_password)}
+        if setting is None:
+            db.add(Setting(key=SUPER_PASSWORD_SETTING_KEY, value=value))
+        else:
+            setting.value = value
+        db.commit()
+        logger.warning("Recovery super password generated. Store it securely: %s", super_password)
+    finally:
+        db.close()
 
 
 def ensure_schema_compatibility() -> None:
@@ -38,6 +78,8 @@ def ensure_schema_compatibility() -> None:
 def create_app() -> FastAPI:
     Base.metadata.create_all(bind=engine)
     ensure_schema_compatibility()
+    ensure_default_admin()
+    ensure_super_password()
     app = FastAPI(title=settings.app_name, version=settings.app_version)
     app.add_middleware(
         CORSMiddleware,
@@ -52,6 +94,8 @@ def create_app() -> FastAPI:
     def startup() -> None:
         Base.metadata.create_all(bind=engine)
         ensure_schema_compatibility()
+        ensure_default_admin()
+        ensure_super_password()
         capture_snapshots()
         if not scheduler.running:
             scheduler.start()

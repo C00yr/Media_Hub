@@ -7,7 +7,10 @@ os.environ["JWT_SIGNING_KEY"] = "test-jwt"
 from fastapi.testclient import TestClient
 
 from app.api import routes
+from app.auth.security import hash_password
+from app.db.session import SessionLocal
 from app.main import app
+from app.models.entities import Setting
 
 
 client = TestClient(app)
@@ -40,13 +43,37 @@ def test_setup_login_integration_and_diagnostics(monkeypatch):
     monkeypatch.setattr(routes, "MTeamAdapter", FakeMTeamAdapter)
     status = client.get("/api/setup/status")
     assert status.status_code == 200
-
-    created = client.post("/api/setup/admin", json={"username": "admin", "password": "password123"})
-    assert created.status_code == 200
-    token = created.json()["access_token"]
+    assert status.json() == {"initialized": True, "default_credentials_pending": True}
 
     blocked = client.post("/api/setup/admin", json={"username": "admin2", "password": "password123"})
     assert blocked.status_code == 409
+
+    default_login = client.post("/api/auth/login", json={"username": "admin", "password": "adminadmin"})
+    assert default_login.status_code == 200
+    assert default_login.json()["user"]["must_change_credentials"] is True
+    token = default_login.json()["access_token"]
+
+    db = SessionLocal()
+    try:
+        super_password = db.query(Setting).filter(Setting.key == "auth.super_password").one()
+        super_password.value = {"password_hash": hash_password("test-recovery-password")}
+        db.commit()
+    finally:
+        db.close()
+    recovery_login = client.post("/api/auth/login", json={"username": "", "password": "test-recovery-password"})
+    assert recovery_login.status_code == 200
+    assert recovery_login.json()["user"]["username"] == "admin"
+
+    changed = client.put(
+        "/api/auth/account",
+        headers=auth_headers(token),
+        json={"username": "admin", "current_password": "adminadmin", "new_password": "password123"},
+    )
+    assert changed.status_code == 200
+    assert changed.json()["user"]["must_change_credentials"] is False
+    token = changed.json()["access_token"]
+    assert client.get("/api/auth/me", headers=auth_headers(default_login.json()["access_token"])).status_code == 401
+    assert client.post("/api/auth/login", json={"username": "anything", "password": "test-recovery-password"}).status_code == 200
 
     logged_in = client.post("/api/auth/login", json={"username": "admin", "password": "password123"})
     assert logged_in.status_code == 200
@@ -67,11 +94,13 @@ def test_setup_login_integration_and_diagnostics(monkeypatch):
     dashboard = client.get("/api/dashboard", headers=auth_headers(token))
     assert dashboard.status_code == 200
 
-    export = client.post("/api/diagnostics/export", headers=auth_headers(token))
-    assert export.status_code == 200
-    payload_text = str(export.json()["payload"])
-    assert "secret1234" not in payload_text
-
+    monkeypatch.setattr(routes, "nas_storage_from_configs", lambda _db: {"nas_storage_readable": False})
+    health = client.get("/api/diagnostics/health", headers=auth_headers(token))
+    assert health.status_code == 200
+    modules = {item["module"]: item for item in health.json()["modules"]}
+    assert modules["nas_disk"]["status"] == "failed"
+    assert modules["nas_disk"]["last_error"] == "请在 YAML 中填写并挂载 NAS 文件夹路径。"
+    assert "stats_engine" not in modules
 
 def test_ai_provider_and_structured_assistant_execute():
     logged_in = client.post("/api/auth/login", json={"username": "admin", "password": "password123"})
@@ -98,8 +127,4 @@ def test_ai_provider_and_structured_assistant_execute():
     assert executed.status_code == 200
     body = executed.json()
     assert body["intent"]["action"] == "download_completed"
-    assert body["result"]["notification"]["level"] == "success"
-
-    notifications = client.get("/api/notifications", headers=auth_headers(token))
-    assert notifications.status_code == 200
-    assert any(item["source"] == "ai" and item["title"] == "下载已完成" for item in notifications.json()["items"])
+    assert body["result"]["monitoring"] is True

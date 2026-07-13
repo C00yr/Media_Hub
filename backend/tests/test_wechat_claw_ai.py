@@ -40,15 +40,11 @@ def auth_headers(token: str) -> dict[str, str]:
 
 
 def admin_token() -> str:
-    login = client.post("/api/auth/login", json={"username": "admin", "password": "password123"})
-    if login.status_code == 200:
-        return login.json()["access_token"]
-    created = client.post("/api/setup/admin", json={"username": "admin", "password": "password123"})
-    if created.status_code == 200:
-        return created.json()["access_token"]
-    login = client.post("/api/auth/login", json={"username": "admin", "password": "password123"})
-    assert login.status_code == 200
-    return login.json()["access_token"]
+    for password in ("password123", "adminadmin"):
+        login = client.post("/api/auth/login", json={"username": "admin", "password": password})
+        if login.status_code == 200:
+            return login.json()["access_token"]
+    raise AssertionError("default administrator login failed")
 
 
 def test_wechat_claw_provider_and_notification_preferences():
@@ -79,6 +75,13 @@ def test_wechat_claw_provider_and_notification_preferences():
     enabled = client.post("/api/admin/integrations/wechat_claw/enable", headers=auth_headers(token))
     assert enabled.status_code == 200
     assert enabled.json()["enabled"] is True
+
+    health = client.get("/api/diagnostics/health", headers=auth_headers(token))
+    assert health.status_code == 200
+    modules = {item["module"]: item for item in health.json()["modules"]}
+    assert modules["wechat_claw"]["status"] == "failed"
+    assert modules["wechat_claw"]["last_error"] == "尚未完成微信扫码绑定。"
+    assert "stats_engine" not in modules
 
     setup = client.get("/api/admin/wechat-claw/setup", headers=auth_headers(token))
     assert setup.status_code == 200
@@ -115,14 +118,13 @@ def test_wechat_claw_provider_and_notification_preferences():
     assert preferences.status_code == 200
     assert preferences.json()["preferences"]["download_completed"] is False
 
-    skipped = client.post(
+    monitored = client.post(
         "/api/assistant/execute",
         headers=auth_headers(token),
         json={"message": "测试完成通知", "intent": {"action": "download_completed", "message": "测试完成通知"}},
     )
-    assert skipped.status_code == 200
-    assert skipped.json()["result"]["notification_skipped"] is True
-    assert "跳过" in skipped.json()["reply"]
+    assert monitored.status_code == 200
+    assert monitored.json()["result"]["monitoring"] is True
 
 
 def test_mobile_reply_renderer_has_stable_sections():
@@ -288,12 +290,12 @@ def test_wechat_claw_bindings_keep_identity_preferences_and_sessions_isolated():
             "display_name": "客厅微信",
             "role_name": "电影推荐官",
             "enabled": True,
-            "notification_preferences": {"download_started": False, "download_completed": True},
+            "notification_preferences": {"qb1_download_started": False, "qb1_download_completed": True},
         },
     )
     assert updated.status_code == 200
     assert updated.json()["role_name"] == "电影推荐官"
-    assert updated.json()["notification_preferences"]["download_started"] is False
+    assert updated.json()["notification_preferences"]["qb1_download_started"] is False
 
     with SessionLocal() as db:
         update_wechat_claw_ilink_state(db, first_id, bot_token="first-token", sync_buf="first-cursor")
@@ -327,6 +329,149 @@ def test_mobile_agent_intents_ranking_and_templates_are_stable():
     )
     assert "TMDB 查询失败" in tmdb_error_reply
     assert "没有找到符合条件" not in tmdb_error_reply
+    assert "【TMDB" not in tmdb_error_reply
+
+    tmdb_reply = format_mobile_agent_reply(
+        {"intent_type": "tmdb_lookup"},
+        {
+            "items": [
+                {
+                    "title": "星际穿越",
+                    "original_title": "Interstellar",
+                    "media_type": "movie",
+                    "genres": ["科幻", "剧情"],
+                    "year": "2014",
+                    "rating": 8.7,
+                    "production_countries": ["美国", "英国"],
+                    "runtime": 169,
+                    "director": "克里斯托弗·诺兰",
+                    "cast": ["马修·麦康纳", "安妮·海瑟薇"],
+                    "overview": "一支探险队穿越虫洞，为人类寻找新的家园。",
+                },
+                {
+                    "title": "最后生还者",
+                    "media_type": "tv",
+                    "genres": ["剧情", "科幻"],
+                    "year": "2023",
+                    "rating": 8.6,
+                    "production_countries": ["美国"],
+                    "runtime": 50,
+                    "number_of_seasons": 3,
+                    "number_of_episodes": 16,
+                    "last_episode_to_air": {"season_number": 3, "episode_number": 8},
+                    "director": "克雷格·麦辛",
+                    "cast": ["佩德罗·帕斯卡", "贝拉·拉姆齐"],
+                    "overview": "末日后的护送旅程。",
+                },
+            ]
+        },
+    )
+    assert "【TMDB 影视查询】" not in tmdb_reply
+    assert "| # |" not in tmdb_reply
+    assert "- **1. 星际穿越 / Interstellar**" in tmdb_reply
+    assert "- 分类：电影 · 类型：科幻 / 剧情" in tmdb_reply
+    assert "克里斯托弗·诺兰" in tmdb_reply
+    assert "每集 50 分钟 · 共 3 季 · 16 集 · 更新至 S3E8" in tmdb_reply
+    assert "推荐" not in tmdb_reply
+
+    dashboard_reply = format_mobile_agent_reply(
+        {"intent_type": "dashboard_query"},
+        {
+            "overview": {
+                "total_upload_speed": 5 * 1024**2,
+                "download_tasks": 2,
+                "upload_tasks": 15,
+                "nas_space_label": "6.20 TiB / 10.00 TiB",
+                "nas_usage_percent": 62,
+                "nas_storage_readable": True,
+            },
+            "mteam": {
+                "user_level": "Power User",
+                "ratio": 3.42,
+                "bonus": 128560,
+                "bonus_delta_label": "+860.0",
+                "delta_window_label": "近5h",
+                "traffic_series": {
+                    "hour": [{"upload_total": 2 * 1024**3}],
+                    "day": [{"upload_total": 38 * 1024**3}],
+                    "week": [{"upload_total": 286 * 1024**3}],
+                    "month": [{"upload_total": 912 * 1024**3}],
+                },
+            },
+            "qbs": [{"id": "qb1", "name": "主下载器", "enabled": True, "online": True, "errors": 0}],
+        },
+    )
+    assert "仪表盘状态：运行正常" in dashboard_reply
+    assert "核心指标" in dashboard_reply
+    assert "今日上传：38.00 GB · 近一小时：2.00 GB" in dashboard_reply
+    assert "本周上传：286.00 GB · 本月上传：912.00 GB" in dashboard_reply
+    assert "分享率：3.42 · 魔力值：128560（近5h +860.0）" in dashboard_reply
+    assert "运行概览" in dashboard_reply
+    assert "需要关注" not in dashboard_reply
+
+    dashboard_alert_reply = format_mobile_agent_reply(
+        {"intent_type": "dashboard_query"},
+        {
+            "overview": {"nas_storage_readable": False},
+            "mteam": {"user_level": "-"},
+            "qbs": [{"id": "qb1", "enabled": True, "online": False}],
+        },
+    )
+    assert "仪表盘状态：需要关注" in dashboard_alert_reply
+    assert "- NAS 存储不可访问" in dashboard_alert_reply
+    assert "- M-Team 数据不可用" in dashboard_alert_reply
+    assert "- qB1 离线" in dashboard_alert_reply
+
+    mteam_reply = format_mobile_agent_reply(
+        {"intent_type": "dashboard_query"},
+        {
+            "mteam": {
+                "username": "media_user",
+                "user_level": "Power User",
+                "joined_at": "2024-01-01",
+                "vip": True,
+                "allow_download": True,
+                "warned": False,
+                "upload_total": 2 * 1024**4,
+                "upload_delta_label": "+5.00 GB",
+                "download_total": 512 * 1024**3,
+                "download_delta_label": "+1.00 GB",
+                "ratio": 3.42,
+                "ratio_delta_label": "+0.008",
+                "bonus": 128560,
+                "bonus_delta_label": "+860.0",
+                "seed_count": 42,
+                "seed_size": 3 * 1024**4,
+                "seed_size_delta_label": "+12.00 GB",
+                "active_uploads": 8,
+                "active_downloads": 1,
+                "active_delta_label": "上传 +2 / 下载 -1",
+                "seedtime_seconds": 5 * 86400 + 3 * 3600,
+                "leechtime_seconds": 2 * 3600 + 5 * 60,
+                "delta_window_label": "近5h",
+                "updated_at": "2026-07-13T10:30:00",
+                "source": "M-Team 原始数据（Real API）",
+                "traffic_series": {
+                    dimension: [{"upload_total": upload, "download_total": download}]
+                    for dimension, upload, download in [
+                        ("hour", 2 * 1024**3, 1 * 1024**3),
+                        ("day", 38 * 1024**3, 4 * 1024**3),
+                        ("week", 286 * 1024**3, 25 * 1024**3),
+                        ("month", 912 * 1024**3, 96 * 1024**3),
+                    ]
+                },
+            }
+        },
+    )
+    assert "M-Team 站点数据" in mteam_reply
+    assert "账号状态" in mteam_reply
+    assert "流量与收益" in mteam_reply
+    assert "累计上传：2.00 TB（近5h +5.00 GB）" in mteam_reply
+    assert "分享率：3.420（近5h +0.008）" in mteam_reply
+    assert "做种与活动" in mteam_reply
+    assert "当前活跃：上传 8 · 下载 1（近5h 上传 +2 / 下载 -1）" in mteam_reply
+    assert "本地快照流量" in mteam_reply
+    assert "今日：上传 38.00 GB · 下载 4.00 GB" in mteam_reply
 
     anime_filters = tmdb_filters_for_request(
         {"query": "尼古喵喵", "tmdb_filters": {"media_type": "movie"}},

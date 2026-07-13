@@ -91,16 +91,6 @@ class DebugTrace(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
-class DiagnosticExport(Base):
-    __tablename__ = "diagnostic_exports"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    trace_id: Mapped[str] = mapped_column(String(64), index=True)
-    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
-
-
 class DownloadAction(Base):
     __tablename__ = "download_actions"
 
