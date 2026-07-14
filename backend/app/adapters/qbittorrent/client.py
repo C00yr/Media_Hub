@@ -1,4 +1,5 @@
 import json
+import time
 from datetime import datetime
 from http.cookiejar import CookieJar
 from typing import Any
@@ -46,7 +47,7 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
         torrent_values = list(torrents.values()) if isinstance(torrents, dict) else []
         active_downloads = sum(1 for item in torrent_values if _is_active_download(item))
         active_uploads = sum(1 for item in torrent_values if _is_active_upload(item))
-        paused = sum(1 for item in torrent_values if "paused" in str(item.get("state") or "").lower())
+        paused = sum(1 for item in torrent_values if _is_paused_state(item.get("state")))
         errors = sum(1 for item in torrent_values if "error" in str(item.get("state") or "").lower())
         return {
             "id": downloader_id,
@@ -150,10 +151,13 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
         return {"accepted": True, "trace_id": trace_id("DL"), "downloader_id": downloader_id, "task_hash": None, "source": "torrent_file"}
 
     def mutate_torrent(self, downloader_id: str, torrent_hash: str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        verified_state: str | None = None
         if action == "pause":
             self._torrent_command(["/api/v2/torrents/pause", "/api/v2/torrents/stop"], {"hashes": torrent_hash})
+            verified_state = self._verify_torrent_running_state(torrent_hash, should_pause=True)
         elif action == "resume":
             self._torrent_command(["/api/v2/torrents/resume", "/api/v2/torrents/start"], {"hashes": torrent_hash})
+            verified_state = self._verify_torrent_running_state(torrent_hash, should_pause=False)
         elif action == "category":
             self._text_request("POST", "/api/v2/torrents/setCategory", form={"hashes": torrent_hash, "category": str(payload.get("category") or "")})
         elif action == "tags":
@@ -170,7 +174,10 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
             self._text_request("POST", "/api/v2/torrents/delete", form={"hashes": torrent_hash, "deleteFiles": "true" if action == "delete_files" else "false"})
         else:
             raise QbittorrentApiError(f"不支持的 qB 操作：{action}")
-        return {"accepted": True, "trace_id": trace_id("QBACT"), "downloader_id": downloader_id, "hash": torrent_hash, "action": action}
+        result = {"accepted": True, "trace_id": trace_id("QBACT"), "downloader_id": downloader_id, "hash": torrent_hash, "action": action}
+        if verified_state is not None:
+            result.update({"verified": True, "state": verified_state})
+        return result
 
     def test_connection(self) -> dict[str, Any]:
         version = self._text_request("GET", "/api/v2/app/version").strip()
@@ -303,6 +310,25 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
         if last_error:
             raise last_error
 
+    def _verify_torrent_running_state(self, torrent_hash: str, *, should_pause: bool) -> str:
+        last_state = ""
+        for attempt in range(4):
+            items = self._json_request("GET", "/api/v2/torrents/info", query={"hashes": torrent_hash})
+            if not isinstance(items, list) or not items:
+                raise QbittorrentApiError("qB 操作后找不到对应任务，无法确认是否生效")
+            task = items[0] if isinstance(items[0], dict) else {}
+            last_state = str(task.get("state") or "").strip()
+            is_paused = _is_paused_state(last_state)
+            state_key = last_state.lower()
+            if should_pause and is_paused:
+                return last_state
+            if not should_pause and state_key and not is_paused and state_key not in NON_RUNNING_STATES:
+                return last_state
+            if attempt < 3:
+                time.sleep(0.2)
+        expected = "暂停" if should_pause else "启动"
+        raise QbittorrentApiError(f"qB 已接收{expected}请求，但任务状态仍为 {last_state or '未知'}，操作未确认生效")
+
     def _json_request(self, method: str, path: str, query: dict[str, Any] | None = None, form: dict[str, Any] | None = None) -> Any:
         text = self._text_request(method, path, query=query, form=form)
         return json.loads(text or "{}")
@@ -366,6 +392,12 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
 
 DOWNLOADING_STATES = {"downloading", "stalleddl", "forceddl", "queueddl", "metadl", "allocating"}
 UPLOADING_STATES = {"uploading", "stalledup", "forcedup", "queuedup"}
+PAUSED_STATES = {"pauseddl", "pausedup", "stoppeddl", "stoppedup", "paused", "stopped"}
+NON_RUNNING_STATES = {"error", "missingfiles", "unknown"}
+
+
+def _is_paused_state(value: Any) -> bool:
+    return str(value or "").strip().lower() in PAUSED_STATES
 
 
 def _is_active_download(item: dict[str, Any]) -> bool:

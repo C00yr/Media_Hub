@@ -1,5 +1,6 @@
 import {
   Activity,
+  ArrowLeft,
   ArrowUp,
   Bell,
   CalendarDays,
@@ -44,6 +45,7 @@ type NavKey = "discover" | "dashboard" | "downloads" | "notifications" | "settin
 type TrafficDimension = "year" | "month" | "week" | "day" | "hour";
 type DiscoverMode = "home" | "dual" | "mteam";
 type DiscoverBrowseMode = "casual" | "filter";
+type DiscoverDetailHistoryEntry = { kind: "media" | "person"; item: any; scrollTop: number };
 type DiscoverFilters = {
   media_type: "movie" | "tv";
   sort_by: string;
@@ -52,6 +54,14 @@ type DiscoverFilters = {
   language: string;
   year: string;
   min_rating: string;
+};
+type DiscoverFilterSession = {
+  key: string;
+  filters: DiscoverFilters;
+  payload: any;
+  items: any[];
+  nextPage: number | null;
+  hasMore: boolean;
 };
 
 const DEFAULT_DISCOVER_FILTERS: DiscoverFilters = {
@@ -1116,6 +1126,7 @@ function InfoTile({ icon: Icon, label, value, delta, negative, className }: { ic
 
 function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
   const initialDiscover = useMemo(() => readLocalSnapshot<any>("discover.lists"), []);
+  const initialFilterSession = useMemo(() => readLocalSnapshot<DiscoverFilterSession>("discover.filter.session"), []);
   const { data, error, loading, setData } = useLoad<any>(() => api("/api/discover/lists?cached=true"), [], initialDiscover, false);
   const [query, setQuery] = useState("");
   const [media, setMedia] = useState<any[]>([]);
@@ -1128,23 +1139,26 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
   const [expandedDiscoverTitle, setExpandedDiscoverTitle] = useState<string | null>(null);
   const [selectedMedia, setSelectedMedia] = useState<any | null>(null);
   const [selectedPerson, setSelectedPerson] = useState<any | null>(null);
+  const [detailHistory, setDetailHistory] = useState<DiscoverDetailHistoryEntry[]>([]);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState("");
   const [resourceSort, setResourceSort] = useState("seeders");
   const [resourceSortDirection, setResourceSortDirection] = useState<"asc" | "desc">("desc");
-  const [discoverFilters, setDiscoverFilters] = useState<DiscoverFilters>(DEFAULT_DISCOVER_FILTERS);
-  const [filterPayload, setFilterPayload] = useState<any | null>(null);
-  const [filterItems, setFilterItems] = useState<any[]>([]);
+  const [discoverFilters, setDiscoverFilters] = useState<DiscoverFilters>(() => initialFilterSession?.filters ?? DEFAULT_DISCOVER_FILTERS);
+  const [filterPayload, setFilterPayload] = useState<any | null>(() => initialFilterSession?.payload ?? null);
+  const [filterItems, setFilterItems] = useState<any[]>(() => Array.isArray(initialFilterSession?.items) ? initialFilterSession.items : []);
   const [filterLoading, setFilterLoading] = useState(false);
   const [filterLoadingMore, setFilterLoadingMore] = useState(false);
   const [filterError, setFilterError] = useState("");
-  const [filterNextPage, setFilterNextPage] = useState<number | null>(null);
-  const [filterHasMore, setFilterHasMore] = useState(false);
+  const [filterNextPage, setFilterNextPage] = useState<number | null>(() => initialFilterSession?.nextPage ?? null);
+  const [filterHasMore, setFilterHasMore] = useState(() => Boolean(initialFilterSession?.hasMore));
   const filterRequestId = useRef(0);
   const filterKeyRef = useRef("");
+  const filterLoadedKeyRef = useRef(initialFilterSession?.key ?? "");
   const filterSentinelRef = useRef<HTMLDivElement | null>(null);
   const filterLoadingPageRef = useRef<number | null>(null);
   const detailReturnScrollRef = useRef<number | null>(null);
+  const detailRequestId = useRef(0);
   const lists = data ? [
     { title: "流行趋势", items: data.trending },
     { title: "热门电影", items: data.popular_movies },
@@ -1195,6 +1209,19 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
   }, [data]);
 
   useEffect(() => {
+    const key = discoverFilterKey(discoverFilters);
+    if (!filterPayload || filterLoadedKeyRef.current !== key) return;
+    writeLocalSnapshot("discover.filter.session", {
+      key,
+      filters: discoverFilters,
+      payload: filterPayload,
+      items: filterItems,
+      nextPage: filterNextPage,
+      hasMore: filterHasMore,
+    } satisfies DiscoverFilterSession);
+  }, [discoverFilters, filterPayload, filterItems, filterNextPage, filterHasMore]);
+
+  useEffect(() => {
     resetDiscoverHome();
   }, [resetToken]);
 
@@ -1202,11 +1229,14 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
     if (discoverMode !== "home" || browseMode !== "filter") return;
     const filterKey = discoverFilterKey(discoverFilters);
     filterKeyRef.current = filterKey;
+    if (filterLoadedKeyRef.current === filterKey && filterPayload) return;
     const timer = window.setTimeout(() => {
       loadDiscoverFilter(discoverFilters, { page: 1, pages: 1, cached: true }).then((result) => {
         if (filterKeyRef.current === filterKey && result?._preload?.preloaded) {
           window.setTimeout(() => {
-            if (!document.hidden) loadDiscoverFilter(discoverFilters, { page: 1, pages: 1, refresh: true, silent: true }).catch(() => undefined);
+            if (!document.hidden && filterKeyRef.current === filterKey) {
+              loadDiscoverFilter(discoverFilters, { page: 1, pages: 1, refresh: true, silent: true }).catch(() => undefined);
+            }
           }, REVALIDATE_DELAY_MS);
         }
       });
@@ -1256,6 +1286,7 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
   }, [selectedMedia, selectedPerson, expandedDiscoverTitle]);
 
   function resetDiscoverHome() {
+    detailRequestId.current += 1;
     setQuery("");
     setMedia([]);
     setTorrents([]);
@@ -1266,11 +1297,14 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
     setExpandedDiscoverTitle(null);
     setSelectedMedia(null);
     setSelectedPerson(null);
+    setDetailHistory([]);
+    setDetailLoading(false);
     setDetailError("");
     setFilterError("");
   }
 
   function switchBrowseMode(nextMode: DiscoverBrowseMode) {
+    detailRequestId.current += 1;
     setBrowseMode(nextMode);
     setDiscoverMode("home");
     setMedia([]);
@@ -1279,14 +1313,19 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
     setExpandedDiscoverTitle(null);
     setSelectedMedia(null);
     setSelectedPerson(null);
+    setDetailHistory([]);
+    setDetailLoading(false);
     setDetailError("");
   }
 
   function enterSearchMode() {
     if (discoverMode !== "dual") {
+      detailRequestId.current += 1;
       setDiscoverMode("dual");
       setSelectedMedia(null);
       setSelectedPerson(null);
+      setDetailHistory([]);
+      setDetailLoading(false);
       setExpandedDiscoverTitle(null);
     }
   }
@@ -1303,9 +1342,12 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
     setSearching(true);
     setSearchError("");
     setDiscoverMode("dual");
+    detailRequestId.current += 1;
     setExpandedDiscoverTitle(null);
     setSelectedMedia(null);
     setSelectedPerson(null);
+    setDetailHistory([]);
+    setDetailLoading(false);
     setMedia([]);
     setTorrents([]);
     setSearchHistory(writeSearchHistory(keyword));
@@ -1327,39 +1369,82 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
   async function openMediaDetail(item: any) {
     const tmdbId = mediaTmdbId(item);
     if (!tmdbId || !item.media_type) return;
-    detailReturnScrollRef.current = window.scrollY;
+    const currentDetail: DiscoverDetailHistoryEntry | null = selectedPerson
+      ? { kind: "person", item: selectedPerson, scrollTop: window.scrollY }
+      : selectedMedia
+        ? { kind: "media", item: selectedMedia, scrollTop: window.scrollY }
+        : null;
+    if (currentDetail) {
+      setDetailHistory((current) => [...current, currentDetail].slice(-20));
+    } else {
+      detailReturnScrollRef.current = window.scrollY;
+      setDetailHistory([]);
+    }
+    const requestId = detailRequestId.current + 1;
+    detailRequestId.current = requestId;
     setSelectedPerson(null);
     setSelectedMedia(item);
     setExpandedDiscoverTitle(null);
     setDetailLoading(true);
     setDetailError("");
+    window.requestAnimationFrame(() => window.scrollTo(0, 0));
     try {
-      setSelectedMedia(await api<any>(`/api/tmdb/media/${item.media_type}/${tmdbId}`));
+      const detail = await api<any>(`/api/tmdb/media/${item.media_type}/${tmdbId}`);
+      if (detailRequestId.current === requestId) setSelectedMedia(detail);
     } catch (err) {
-      setDetailError((err as Error).message);
+      if (detailRequestId.current === requestId) setDetailError((err as Error).message);
     } finally {
-      setDetailLoading(false);
+      if (detailRequestId.current === requestId) setDetailLoading(false);
     }
   }
 
   async function openPersonDetail(person: any) {
     const personId = person?.person_id ?? person?.id;
     if (!personId) return;
+    const currentDetail: DiscoverDetailHistoryEntry | null = selectedPerson
+      ? { kind: "person", item: selectedPerson, scrollTop: window.scrollY }
+      : selectedMedia
+        ? { kind: "media", item: selectedMedia, scrollTop: window.scrollY }
+        : null;
+    if (currentDetail) setDetailHistory((current) => [...current, currentDetail].slice(-20));
+    const requestId = detailRequestId.current + 1;
+    detailRequestId.current = requestId;
+    setSelectedMedia(null);
     setSelectedPerson(person);
     setDetailLoading(true);
     setDetailError("");
+    window.requestAnimationFrame(() => window.scrollTo(0, 0));
     try {
-      setSelectedPerson(await api<any>(`/api/tmdb/person/${personId}`));
+      const detail = await api<any>(`/api/tmdb/person/${personId}`);
+      if (detailRequestId.current === requestId) setSelectedPerson(detail);
     } catch (err) {
-      setDetailError((err as Error).message);
+      if (detailRequestId.current === requestId) setDetailError((err as Error).message);
     } finally {
-      setDetailLoading(false);
+      if (detailRequestId.current === requestId) setDetailLoading(false);
     }
   }
 
+  function returnToPreviousDetail() {
+    const previous = detailHistory[detailHistory.length - 1];
+    if (!previous) {
+      closeMediaDetail();
+      return;
+    }
+    detailRequestId.current += 1;
+    setDetailHistory((current) => current.slice(0, -1));
+    setSelectedMedia(previous.kind === "media" ? previous.item : null);
+    setSelectedPerson(previous.kind === "person" ? previous.item : null);
+    setDetailLoading(false);
+    setDetailError("");
+    window.requestAnimationFrame(() => window.scrollTo(0, previous.scrollTop));
+  }
+
   function closeMediaDetail() {
+    detailRequestId.current += 1;
     setSelectedMedia(null);
     setSelectedPerson(null);
+    setDetailHistory([]);
+    setDetailLoading(false);
     setDetailError("");
   }
 
@@ -1367,8 +1452,11 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
     const keyword = String(item?.title || item?.original_title || "").trim();
     if (!keyword) return;
     setQuery(keyword);
+    detailRequestId.current += 1;
     setSelectedMedia(null);
     setSelectedPerson(null);
+    setDetailHistory([]);
+    setDetailLoading(false);
     setExpandedDiscoverTitle(null);
     setMedia([]);
     setTorrents([]);
@@ -1403,6 +1491,7 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
     if (!append) filterRequestId.current = requestId;
     if (append) setFilterLoadingMore(true);
     else if (localSnapshot) {
+      filterLoadedKeyRef.current = discoverFilterKey(filters);
       setFilterPayload(localSnapshot);
       setFilterItems(localSnapshot?.items ?? []);
       setFilterNextPage(localSnapshot?.next_page ?? null);
@@ -1429,22 +1518,27 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
     try {
       const result = await api<any>(`/api/discover/filter?${params.toString()}`);
       if (filterRequestId.current === requestId) {
+        filterLoadedKeyRef.current = discoverFilterKey(filters);
         setFilterPayload((current: any) => append ? { ...(current ?? {}), ...result, options: result?.options ?? current?.options } : { ...result, options: result?.options ?? current?.options });
-        setFilterNextPage(result?.next_page ?? null);
-        setFilterHasMore(Boolean(result?.next_page));
-        setFilterItems((current) => append ? mergeMediaItems(current, result?.items ?? []) : (result?.items ?? []));
+        setFilterNextPage((current) => options.silent ? current : (result?.next_page ?? null));
+        setFilterHasMore((current) => options.silent ? current : Boolean(result?.next_page));
+        setFilterItems((current) => append
+          ? mergeMediaItems(current, result?.items ?? [])
+          : options.silent && current.length
+            ? mergeMediaItems(result?.items ?? [], current)
+            : (result?.items ?? []));
         if (!append && page === 1) writeLocalSnapshot(snapshotKey, result);
       }
       return result;
     } catch (err) {
       if (filterRequestId.current === requestId) {
-        if (!append) {
+        if (!append && !options.silent) {
           setFilterPayload(null);
           setFilterItems([]);
           setFilterNextPage(null);
           setFilterHasMore(false);
         }
-        setFilterError((err as Error).message);
+        if (!options.silent) setFilterError((err as Error).message);
       }
     } finally {
       if (append) {
@@ -1493,9 +1587,9 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
       )}
       {searchError && <p className="error">{searchError}</p>}
       {selectedPerson ? (
-        <PersonDetailPage person={selectedPerson} loading={detailLoading} error={detailError} onBack={() => setSelectedPerson(null)} onMediaSelect={openMediaDetail} />
+        <PersonDetailPage person={selectedPerson} loading={detailLoading} error={detailError} canGoBack={detailHistory.length > 0} onBack={returnToPreviousDetail} onExit={closeMediaDetail} onMediaSelect={openMediaDetail} />
       ) : selectedMedia ? (
-        <MediaDetailPage item={selectedMedia} loading={detailLoading} error={detailError} onBack={closeMediaDetail} onPersonSelect={openPersonDetail} onMediaSelect={openMediaDetail} onMTeamSearch={searchMTeamFromMedia} mteamSearching={searching} />
+        <MediaDetailPage item={selectedMedia} loading={detailLoading} error={detailError} canGoBack={detailHistory.length > 0} onBack={returnToPreviousDetail} onExit={closeMediaDetail} onPersonSelect={openPersonDetail} onMediaSelect={openMediaDetail} onMTeamSearch={searchMTeamFromMedia} mteamSearching={searching} />
       ) : expandedDiscoverList ? (
         <DiscoverCollectionPage title={expandedDiscoverList.title} items={expandedDiscoverList.items} onBack={() => setExpandedDiscoverTitle(null)} onSelect={openMediaDetail} />
       ) : (
@@ -1861,6 +1955,7 @@ function QbTorrentTable({ items, downloader, onChanged }: { items: any[]; downlo
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; item: any } | null>(null);
   const [deleteTorrentConfirm, setDeleteTorrentConfirm] = useState<any | null>(null);
   const [deletingTorrent, setDeletingTorrent] = useState(false);
+  const [torrentAction, setTorrentAction] = useState<"resume" | "pause" | "">("");
   const detailRequestId = useRef(0);
   const selectedItem = items.find((item) => item.hash === selectedHash) ?? null;
 
@@ -1906,10 +2001,20 @@ function QbTorrentTable({ items, downloader, onChanged }: { items: any[]; downlo
   }
 
   async function mutateTorrent(item: any, action: "resume" | "pause") {
-    await api(`/api/qb/${downloader}/torrents/${encodeURIComponent(item.hash)}/${action}`, { method: "POST", body: JSON.stringify({ payload: {} }) });
     setContextMenu(null);
-    onChanged();
-    if (item.hash === selectedHash) loadDetail(item.hash);
+    setTorrentAction(action);
+    setDetailError("");
+    try {
+      const result = await api<any>(`/api/qb/${downloader}/torrents/${encodeURIComponent(item.hash)}/${action}`, { method: "POST", body: JSON.stringify({ payload: {} }) });
+      if (!result?.verified) throw new Error(`qB 未能确认任务已${action === "pause" ? "暂停" : "启动"}`);
+      onChanged();
+      await loadDetail(item.hash);
+    } catch (err) {
+      setDetailError((err as Error).message);
+      onChanged();
+    } finally {
+      setTorrentAction("");
+    }
   }
 
   function requestDeleteTorrent(item: any) {
@@ -1924,7 +2029,7 @@ function QbTorrentTable({ items, downloader, onChanged }: { items: any[]; downlo
     setDetailError("");
     try {
       const confirmResult = await api<{ confirm_token: string }>(`/api/qb/${downloader}/torrents/${encodeURIComponent(item.hash)}/delete-confirm`, { method: "POST" });
-      await api(`/api/qb/${downloader}/torrents/${encodeURIComponent(item.hash)}?confirm_token=${encodeURIComponent(confirmResult.confirm_token)}&delete_files=false`, { method: "DELETE" });
+      await api(`/api/qb/${downloader}/torrents/${encodeURIComponent(item.hash)}?confirm_token=${encodeURIComponent(confirmResult.confirm_token)}&delete_files=true`, { method: "DELETE" });
       setDeleteTorrentConfirm(null);
       setDetail(null);
       setSelectedHash("");
@@ -2007,8 +2112,8 @@ function QbTorrentTable({ items, downloader, onChanged }: { items: any[]; downlo
       </section>
       {contextMenu && (
         <div className="qb-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} onClick={(event) => event.stopPropagation()}>
-          <button onClick={() => mutateTorrent(contextMenu.item, "resume")}>启动</button>
-          <button onClick={() => mutateTorrent(contextMenu.item, "pause")}>暂停</button>
+          <button onClick={() => mutateTorrent(contextMenu.item, "resume")} disabled={Boolean(torrentAction)}>启动</button>
+          <button onClick={() => mutateTorrent(contextMenu.item, "pause")} disabled={Boolean(torrentAction)}>暂停</button>
           <button className="danger" onClick={() => requestDeleteTorrent(contextMenu.item)}>删除</button>
         </div>
       )}
@@ -2016,7 +2121,7 @@ function QbTorrentTable({ items, downloader, onChanged }: { items: any[]; downlo
         <div className="app-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-torrent-title" onMouseDown={(event) => event.stopPropagation()}>
           <span className="app-dialog-icon"><Trash2 size={20} /></span>
           <h3 id="delete-torrent-title">删除下载任务？</h3>
-          <p>将从 {downloaderShortLabel(downloader)} 移除此任务，不会删除本地文件。</p>
+          <p>将从 {downloaderShortLabel(downloader)} 删除此任务，并永久删除对应的本地文件。此操作不可恢复。</p>
           <div className="field-help compact-help"><strong>{deleteTorrentConfirm.name}</strong></div>
           <div className="app-dialog-actions">
             <button type="button" onClick={() => setDeleteTorrentConfirm(null)} disabled={deletingTorrent}>取消</button>
@@ -2153,6 +2258,27 @@ function NotificationPreferencesCard() {
   );
 }
 
+const WECHAT_CLAW_MEMBER_LIMIT = 5;
+
+function isWechatClawMemberLimitError(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("最多可添加 5 位微信成员");
+}
+
+function MemberLimitDialog({ onClose }: { onClose: () => void }) {
+  return (
+    <div className="app-dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="app-dialog account-dialog" role="dialog" aria-modal="true" aria-labelledby="member-limit-title" onMouseDown={(event) => event.stopPropagation()}>
+        <span className="app-dialog-icon"><Users size={20} /></span>
+        <h3 id="member-limit-title">成员数量已达上限</h3>
+        <p>最多可添加 5 位微信成员。如需添加新成员，请先删除一位不再使用的成员。</p>
+        <div className="app-dialog-actions">
+          <button type="button" className="primary" onClick={onClose}>知道了</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const MEMBER_AVATARS: Record<string, { emoji: string; label: string }> = {
   mint: { emoji: "🌿", label: "薄荷" },
   violet: { emoji: "🪻", label: "紫罗兰" },
@@ -2175,9 +2301,11 @@ function MemberManagementCard({ onNavigate }: { onNavigate?: (key: NavKey) => vo
   const [draftPreferences, setDraftPreferences] = useState<Record<string, any>>({});
   const [deleteConfirm, setDeleteConfirm] = useState<{ member: any; stage: 1 | 2 } | null>(null);
   const [renameDialog, setRenameDialog] = useState<{ member: any; name: string } | null>(null);
+  const [memberLimitDialogOpen, setMemberLimitDialogOpen] = useState(false);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const items = Array.isArray(bindings.data?.items) ? bindings.data.items : [];
+  const memberLimit = Number(bindings.data?.limit) || WECHAT_CLAW_MEMBER_LIMIT;
   const selected = items.find((item: any) => item.id === selectedId) ?? null;
   const selectedInteractions: WechatClawInteraction[] = Array.isArray(selected?.recent_interactions) ? selected.recent_interactions.slice(0, 5) : [];
 
@@ -2217,6 +2345,10 @@ function MemberManagementCard({ onNavigate }: { onNavigate?: (key: NavKey) => vo
   }
 
   async function addMember() {
+    if (items.length >= memberLimit) {
+      setMemberLimitDialogOpen(true);
+      return;
+    }
     setBusy("add");
     setError("");
     try {
@@ -2224,7 +2356,8 @@ function MemberManagementCard({ onNavigate }: { onNavigate?: (key: NavKey) => vo
       await bindings.reload();
       setSelectedId(member.id);
     } catch (err) {
-      setError((err as Error).message);
+      if (isWechatClawMemberLimitError(err)) setMemberLimitDialogOpen(true);
+      else setError((err as Error).message);
     } finally {
       setBusy("");
     }
@@ -2400,6 +2533,7 @@ function MemberManagementCard({ onNavigate }: { onNavigate?: (key: NavKey) => vo
             </div>
           </div>
         </div>}
+        {memberLimitDialogOpen && <MemberLimitDialog onClose={() => setMemberLimitDialogOpen(false)} />}
       </div>
     </Panel>
   );
@@ -2888,6 +3022,7 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
   );
   const [busy, setBusy] = useState("");
   const [localError, setLocalError] = useState("");
+  const [memberLimitDialogOpen, setMemberLimitDialogOpen] = useState(false);
   const [localResult, setLocalResult] = useState<IntegrationTestResult | null>(provider.last_test_result);
   const result = localResult ?? provider.last_test_result;
   const canEnable = result?.provider === "wechat_claw" && result?.success === true && result?.can_enable === true;
@@ -3020,6 +3155,12 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
   }
 
   async function addBinding() {
+    const items = Array.isArray(bindings.data?.items) ? bindings.data.items : [];
+    const memberLimit = Number(bindings.data?.limit) || WECHAT_CLAW_MEMBER_LIMIT;
+    if (items.length >= memberLimit) {
+      setMemberLimitDialogOpen(true);
+      return;
+    }
     setBusy("add");
     setLocalError("");
     try {
@@ -3030,7 +3171,8 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
       await bindings.reload();
       setSelectedBindingId(binding.id);
     } catch (err) {
-      setLocalError((err as Error).message);
+      if (isWechatClawMemberLimitError(err)) setMemberLimitDialogOpen(true);
+      else setLocalError((err as Error).message);
     } finally {
       setBusy("");
     }
@@ -3104,6 +3246,7 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
         {setup.error && <p className="error">{setup.error}</p>}
         {localError && <p className="error">{localError}</p>}
         <TestResultCard result={result} emptyProvider="WeChat claw" />
+        {memberLimitDialogOpen && <MemberLimitDialog onClose={() => setMemberLimitDialogOpen(false)} />}
       </div>
     </Panel>
   );
@@ -4246,7 +4389,9 @@ function MediaDetailPage({
   item,
   loading,
   error,
+  canGoBack,
   onBack,
+  onExit,
   onPersonSelect,
   onMediaSelect,
   onMTeamSearch,
@@ -4255,7 +4400,9 @@ function MediaDetailPage({
   item: any;
   loading: boolean;
   error: string;
+  canGoBack: boolean;
   onBack: () => void;
+  onExit: () => void;
   onPersonSelect: (person: any) => void;
   onMediaSelect: (item: any) => void;
   onMTeamSearch: (item: any) => void;
@@ -4284,7 +4431,10 @@ function MediaDetailPage({
       {item.backdrop && <img className="tmdb-detail-backdrop" src={item.backdrop} alt="" loading="lazy" decoding="async" onError={handleImageError} />}
       <div className="tmdb-detail-haze" />
       <div className="tmdb-detail-glass">
-        <button className="tmdb-back" type="button" onClick={onBack}>返回发现</button>
+        <div className="tmdb-detail-nav">
+          {canGoBack && <button className="tmdb-back tmdb-back-icon" type="button" onClick={onBack} aria-label="返回上一层详情" title="返回上一层详情"><ArrowLeft size={18} /></button>}
+          <button className="tmdb-back" type="button" onClick={onExit}>返回发现</button>
+        </div>
         <button className="tmdb-mteam-search" type="button" onClick={() => onMTeamSearch(item)} disabled={mteamSearching} title="用影片名称在 M-Team 搜索资源">
           <Radar size={17} />
           {mteamSearching ? "搜索中" : "M-Team 搜索"}
@@ -4353,13 +4503,17 @@ function PersonDetailPage({
   person,
   loading,
   error,
+  canGoBack,
   onBack,
+  onExit,
   onMediaSelect
 }: {
   person: any;
   loading: boolean;
   error: string;
+  canGoBack: boolean;
   onBack: () => void;
+  onExit: () => void;
   onMediaSelect: (item: any) => void;
 }) {
   const works = Array.isArray(person.known_for) ? person.known_for : [];
@@ -4367,8 +4521,9 @@ function PersonDetailPage({
     <section className="tmdb-detail tmdb-person-detail">
       <div className="tmdb-detail-haze" />
       <div className="tmdb-detail-glass">
-        <div className="tmdb-person-actions">
-          <button className="tmdb-back tmdb-back-inline" type="button" onClick={onBack}>返回影片</button>
+        <div className="tmdb-detail-nav tmdb-person-actions">
+          {canGoBack && <button className="tmdb-back tmdb-back-icon" type="button" onClick={onBack} aria-label="返回上一层详情" title="返回上一层详情"><ArrowLeft size={18} /></button>}
+          <button className="tmdb-back" type="button" onClick={onExit}>返回发现</button>
         </div>
         {loading && <span className="tmdb-loading">正在读取演员作品...</span>}
         {error && <p className="error">{error}</p>}
@@ -4826,6 +4981,9 @@ function stateLabel(value: string): string {
     metadl: "获取元数据",
     pauseddl: "暂停",
     pausedup: "暂停",
+    stoppeddl: "暂停",
+    stoppedup: "暂停",
+    stopped: "暂停",
     checkingup: "校验",
     checkingdl: "校验",
     error: "错误",

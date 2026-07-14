@@ -35,21 +35,25 @@ Open `http://localhost:5173`.
 
 ## Docker
 
-Create `.env` from `.env.example` and replace both root secrets:
+For NAS or Docker Compose deployment, create a persistent `data` folder and start the stack:
 
 ```bash
-cp .env.example .env
+mkdir -p data
 docker compose up --build
 ```
 
 Open `http://localhost:8000`.
+
+The app generates its runtime encryption/JWT secrets on first start and stores them in
+`data/runtime-secrets.json`. Keep the `data` folder when upgrading or recreating containers.
+Advanced users can still create `.env` from `.env.example` to override network/storage defaults.
 
 ## TMDB Network Modes
 
 TMDB supports exactly two network modes:
 
 - `direct`: default. The backend connects to TMDB directly and uses DoH + IPv4 fallback.
-- `proxy`: only TMDB requests use the Mihomo sidecar proxy, usually `http://mihomo:7890`.
+- `proxy`: only TMDB requests use a proxy such as Mihomo, usually `http://mihomo:7890`.
 
 qBittorrent, M-Team, NAS storage checks, login, and all other app traffic are direct-only. Do not add global `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` variables to `pt-media-hub`.
 
@@ -60,7 +64,7 @@ TMDB_MODE=direct
 TMDB_PROXY_URL=http://mihomo:7890
 ```
 
-Values saved in the Settings page take priority over `.env`. To use proxy mode, copy `nas-mihomo/config.example.yaml` to `nas-mihomo/config.yaml`, add your own nodes from Clash Verge or your provider, and keep the final `MATCH,DIRECT` rule.
+Values saved in the Settings page take priority over `.env`. The default `docker-compose.yml` does not start Mihomo, so direct mode works without proxy files. To use proxy mode, add a Mihomo service or point `TMDB_PROXY_URL` to an existing proxy.
 
 ## NAS Storage Mounts
 
@@ -76,6 +80,7 @@ If the three folders are on the same NAS storage pool, the backend deduplicates 
 
 ## Deployment Notes
 
-- Keep `APP_CONFIG_ENCRYPTION_KEY` and `JWT_SIGNING_KEY` outside the app UI.
+- Keep the `data` folder private and persistent. It contains the app database and generated runtime secrets.
+- You do not need to create `.env` for a normal single-NAS deployment.
 - Do not put M-Team, qB, TMDB, AI, or WeChat Claw business credentials in Docker `.env`.
 - For remote access, prefer Tailscale or another private tunnel. Do not expose this app directly to the public internet.

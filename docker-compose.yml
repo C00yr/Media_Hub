@@ -1,40 +1,29 @@
 services:
-  mihomo:
-    image: metacubex/mihomo:latest
-    restart: unless-stopped
-    ports:
-      - "7890:7890"
-      - "9090:9090"
-    volumes:
-      - ./nas-mihomo/config.yaml:/root/.config/mihomo/config.yaml:ro
-
   pt-media-hub:
     build:
       context: .
       dockerfile: Dockerfile
     image: pt-media-hub:0.1.0-mvp
-    env_file:
-      - .env
     environment:
       DATABASE_URL: sqlite:////data/pt_media_hub.db
+      ENVIRONMENT: production
       STATIC_DIR: /app/static
+      APP_RUNTIME_SECRETS_FILE: /data/runtime-secrets.json
       TMDB_MODE: ${TMDB_MODE:-direct}
       TMDB_PROXY_URL: ${TMDB_PROXY_URL:-http://mihomo:7890}
     ports:
       - "8000:8000"
     volumes:
       - ./data:/data
-      # 把左侧替换成你的 NAS 文件夹路径；右侧 /mnt/storage1~3 不要改。
-      # APP 会自动扫描右侧固定路径，并按底层存储池去重统计容量。
-      # 例如：
+      # Replace the left side with real NAS folders. Keep /mnt/storage1~3 unchanged.
+      # The app scans these fixed container paths and deduplicates capacity by storage pool.
+      # Examples:
       #   /volume1/qb1-downloads:/mnt/storage1:ro
       #   /volume1/qb2-downloads:/mnt/storage2:ro
       #   /volume1/qb3-downloads:/mnt/storage3:ro
       - ${MEDIA_HUB_STORAGE_1:-./data}:/mnt/storage1:ro
       - ${MEDIA_HUB_STORAGE_2:-./data}:/mnt/storage2:ro
       - ${MEDIA_HUB_STORAGE_3:-./data}:/mnt/storage3:ro
-    depends_on:
-      - mihomo
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
       interval: 30s

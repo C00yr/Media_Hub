@@ -9,7 +9,9 @@ from fastapi.testclient import TestClient
 from app.adapters.ai.client import normalize_assistant_intent, render_mobile_reply
 from app.adapters.wechat_claw import WechatClawAdapter
 from app.api.routes import (
+    WECHAT_CLAW_INTERACTIONS_KEY,
     WechatClawMessageRequest,
+    _WECHAT_CLAW_ACTIVE_USER_ID,
     clear_wechat_claw_session,
     get_wechat_claw_mobile_search_result,
     get_wechat_claw_ilink_state,
@@ -30,6 +32,7 @@ from app.api.routes import (
 )
 from app.db.session import SessionLocal
 from app.main import app
+from app.models.entities import Setting
 
 
 client = TestClient(app)
@@ -309,6 +312,76 @@ def test_wechat_claw_bindings_keep_identity_preferences_and_sessions_isolated():
     assert second_setup.status_code == 200
     assert first_setup.json()["binding"]["role_name"] == "电影推荐官"
     assert first_setup.json()["account_id"] != second_setup.json()["account_id"] or first_setup.json()["binding"]["id"] != second_setup.json()["binding"]["id"]
+
+
+def test_wechat_claw_binding_member_limit_is_enforced():
+    token = admin_token()
+    headers = auth_headers(token)
+    listed = client.get("/api/admin/wechat-claw/bindings", headers=headers)
+    assert listed.status_code == 200
+    limit = listed.json()["limit"]
+    initial_count = len(listed.json()["items"])
+    created_ids: list[int] = []
+
+    try:
+        for index in range(initial_count, limit):
+            created = client.post(
+                "/api/admin/wechat-claw/bindings",
+                headers=headers,
+                json={"display_name": f"limit-member-{index + 1}"},
+            )
+            assert created.status_code == 200
+            created_ids.append(created.json()["id"])
+
+        blocked = client.post(
+            "/api/admin/wechat-claw/bindings",
+            headers=headers,
+            json={"display_name": "member-over-limit"},
+        )
+        assert blocked.status_code == 409
+        assert "最多可添加 5 位微信成员" in blocked.json()["detail"]
+
+        after = client.get("/api/admin/wechat-claw/bindings", headers=headers)
+        assert len(after.json()["items"]) == max(initial_count, limit)
+    finally:
+        for binding_id in created_ids:
+            deleted = client.delete(f"/api/admin/wechat-claw/bindings/{binding_id}", headers=headers)
+            assert deleted.status_code == 200
+
+
+def test_wechat_claw_binding_interactions_do_not_collide_with_legacy_global_key():
+    token = admin_token()
+    headers = auth_headers(token)
+    created = client.post(
+        "/api/admin/wechat-claw/bindings",
+        headers=headers,
+        json={"display_name": "phone-wechat", "role_name": "family-helper", "enabled": True},
+    )
+    assert created.status_code == 200
+    binding_id = created.json()["id"]
+
+    with SessionLocal() as db:
+        legacy = db.query(Setting).filter(Setting.key == WECHAT_CLAW_INTERACTIONS_KEY).one_or_none()
+        if legacy is None:
+            db.add(Setting(key=WECHAT_CLAW_INTERACTIONS_KEY, value={"items": []}))
+            db.commit()
+        scope = _WECHAT_CLAW_ACTIVE_USER_ID.set(binding_id)
+        try:
+            item = record_wechat_claw_interaction(
+                db,
+                WechatClawMessageRequest(message="dashboard status", user_id="wx-bound-user", conversation_id="conv-bound"),
+                {"action": "status_query", "intent_type": "dashboard_query"},
+                {"target": "dashboard"},
+                "dashboard ok",
+            )
+        finally:
+            _WECHAT_CLAW_ACTIVE_USER_ID.reset(scope)
+
+        scoped = db.query(Setting).filter(Setting.key == f"{WECHAT_CLAW_INTERACTIONS_KEY}.binding.{binding_id}").one_or_none()
+        assert item["user_id"] == "wx-bound-user"
+        assert scoped is not None
+        assert scoped.value["items"][0]["user_id"] == "wx-bound-user"
+        assert db.query(Setting).filter(Setting.key == WECHAT_CLAW_INTERACTIONS_KEY).count() == 1
 
 
 def test_mobile_agent_intents_ranking_and_templates_are_stable():

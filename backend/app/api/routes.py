@@ -67,6 +67,8 @@ _PRELOAD_TASK_LOCK = Lock()
 _PRELOAD_TASKS_RUNNING: set[str] = set()
 _WECHAT_CLAW_POLL_LOCKS: dict[int, Lock] = {}
 _WECHAT_CLAW_POLL_LOCK_GUARD = Lock()
+_WECHAT_CLAW_BINDING_CREATE_LOCK = Lock()
+_QB_TASK_METADATA_LOCK = Lock()
 _WECHAT_CLAW_ACTIVE_USER_ID: ContextVar[int | None] = ContextVar("wechat_claw_active_user_id", default=None)
 PRELOAD_PREFIX = "preload."
 TMDB_IMAGE_SIZES = {"w92", "w154", "w185", "w342", "w500", "w780", "w1280", "original"}
@@ -162,10 +164,12 @@ NOTIFICATION_PREFERENCES_KEY = "notification.preferences"
 WECHAT_CLAW_INTERACTIONS_KEY = "wechat_claw.interactions"
 WECHAT_CLAW_ILINK_STATE_KEY = "wechat_claw.ilink_state"
 WECHAT_CLAW_LAST_POLL_KEY = "wechat_claw.last_poll"
+WECHAT_CLAW_MEMBER_LIMIT = 5
 WECHAT_CLAW_INTERACTION_LIMIT = 5
 WECHAT_CLAW_PENDING_LIMIT = 100
 MODULE_HEALTH_PREFIX = "module.health."
 QB_TASK_STATE_PREFIX = "qb.task_state."
+QB_TASK_METADATA_PREFIX = "qb.task_metadata."
 WECHAT_CLAW_MOBILE_SELECTION_LIMIT = 10
 WECHAT_CLAW_MOBILE_SELECTION_TTL_SECONDS = 30 * 60
 MTEAM_INITIAL_DISPLAY_LIMIT = 5
@@ -252,6 +256,145 @@ def qb_task_state_setting_key(downloader_id: str) -> str:
     return f"{QB_TASK_STATE_PREFIX}{downloader_id}"
 
 
+def qb_task_metadata_setting_key(downloader_id: str) -> str:
+    return f"{QB_TASK_METADATA_PREFIX}{downloader_id}"
+
+
+def _bencoded_bytes(data: bytes, index: int) -> tuple[bytes, int]:
+    colon = data.find(b":", index)
+    if colon < 0 or not data[index:colon].isdigit():
+        raise ValueError("invalid bencoded bytes")
+    length = int(data[index:colon])
+    start = colon + 1
+    end = start + length
+    if end > len(data):
+        raise ValueError("truncated bencoded bytes")
+    return data[start:end], end
+
+
+def _bencoded_value_end(data: bytes, index: int, depth: int = 0) -> int:
+    if index >= len(data) or depth > 100:
+        raise ValueError("invalid bencoded value")
+    token = data[index:index + 1]
+    if token == b"i":
+        end = data.find(b"e", index + 1)
+        if end < 0:
+            raise ValueError("unterminated bencoded integer")
+        return end + 1
+    if token in {b"l", b"d"}:
+        cursor = index + 1
+        while cursor < len(data) and data[cursor:cursor + 1] != b"e":
+            cursor = _bencoded_value_end(data, cursor, depth + 1)
+            if token == b"d":
+                cursor = _bencoded_value_end(data, cursor, depth + 1)
+        if cursor >= len(data):
+            raise ValueError("unterminated bencoded collection")
+        return cursor + 1
+    if token.isdigit():
+        return _bencoded_bytes(data, index)[1]
+    raise ValueError("unsupported bencoded token")
+
+
+def torrent_info_hashes(content: bytes) -> list[str]:
+    try:
+        if not content.startswith(b"d"):
+            return []
+        cursor = 1
+        while cursor < len(content) and content[cursor:cursor + 1] != b"e":
+            key, cursor = _bencoded_bytes(content, cursor)
+            value_start = cursor
+            cursor = _bencoded_value_end(content, cursor)
+            if key == b"info":
+                encoded_info = content[value_start:cursor]
+                return [hashlib.sha1(encoded_info).hexdigest(), hashlib.sha256(encoded_info).hexdigest()]
+    except (ValueError, OverflowError):
+        return []
+    return []
+
+
+def normalized_mteam_task_metadata(item: dict[str, Any] | None) -> dict[str, Any]:
+    source = item if isinstance(item, dict) else {}
+    return {
+        "source": "mteam",
+        "torrent_id": str(source.get("id") or source.get("torrent_id") or "").strip()[:80],
+        "subtitle": str(source.get("subtitle") or "").strip()[:500],
+        "promotion_label": str(source.get("promotion_label") or "").strip()[:80],
+        "resolution": str(source.get("resolution") or "").strip()[:80],
+        "codec": str(source.get("codec") or "").strip()[:80],
+        "hdr": str(source.get("hdr") or "").strip()[:80],
+        "audio_codec": str(source.get("audio_codec") or "").strip()[:80],
+        "imdb_rating": str(source.get("imdb_rating") or "").strip()[:40],
+        "douban_rating": str(source.get("douban_rating") or "").strip()[:40],
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+
+def save_qb_task_metadata(
+    db: Session,
+    downloader_id: str,
+    torrent_content: bytes,
+    item: dict[str, Any] | None,
+) -> list[str]:
+    info_hashes = torrent_info_hashes(torrent_content)
+    if not info_hashes:
+        logger.warning("Unable to calculate torrent info hash for M-Team notification metadata")
+        return []
+    with _QB_TASK_METADATA_LOCK:
+        key = qb_task_metadata_setting_key(downloader_id)
+        row = db.query(Setting).filter(Setting.key == key).one_or_none()
+        value = dict(row.value) if row and isinstance(row.value, dict) else {}
+        tasks = value.get("tasks") if isinstance(value.get("tasks"), dict) else {}
+        metadata = normalized_mteam_task_metadata(item)
+        for info_hash in info_hashes:
+            tasks[info_hash.lower()] = metadata
+        tasks = dict(list(tasks.items())[-200:])
+        payload = {"tasks": tasks, "updated_at": datetime.utcnow().isoformat()}
+        if row is None:
+            db.add(Setting(key=key, value=payload))
+        else:
+            row.value = payload
+            row.updated_at = datetime.utcnow()
+        db.commit()
+    return info_hashes
+
+
+def get_qb_task_metadata(db: Session, downloader_id: str, task_hash: str) -> dict[str, Any]:
+    row = db.query(Setting).filter(Setting.key == qb_task_metadata_setting_key(downloader_id)).one_or_none()
+    value = row.value if row and isinstance(row.value, dict) else {}
+    tasks = value.get("tasks") if isinstance(value.get("tasks"), dict) else {}
+    metadata = tasks.get(str(task_hash or "").strip().lower())
+    return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def qb_task_description(metadata: dict[str, Any] | None) -> str:
+    source = metadata if isinstance(metadata, dict) and metadata.get("source") == "mteam" else {}
+    details: list[str] = []
+    subtitle = str(source.get("subtitle") or "").strip()
+    if subtitle:
+        details.append(subtitle)
+    promotion = str(source.get("promotion_label") or "").strip()
+    if promotion:
+        details.append(f"优惠：{promotion}")
+    quality = " · ".join(
+        str(source.get(key) or "").strip()
+        for key in ("resolution", "codec", "hdr", "audio_codec")
+        if str(source.get(key) or "").strip()
+    )
+    if quality:
+        details.append(f"清晰度：{quality}")
+    ratings = " / ".join(
+        label
+        for label in (
+            f"IMDb {str(source.get('imdb_rating') or '').strip()}" if source.get("imdb_rating") else "",
+            f"豆瓣 {str(source.get('douban_rating') or '').strip()}" if source.get("douban_rating") else "",
+        )
+        if label
+    )
+    if ratings:
+        details.append(f"评分：{ratings}")
+    return "；".join(details) if details else "暂无信息"
+
+
 def module_display_name(module: str) -> str:
     return {
         "mteam": "M-Team",
@@ -304,16 +447,20 @@ def _qb_task_state(task: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _qb_task_notification(downloader_id: str, event: str, task: dict[str, Any]) -> Notification:
+def _qb_task_notification(
+    downloader_id: str,
+    event: str,
+    task: dict[str, Any],
+    metadata: dict[str, Any] | None = None,
+) -> Notification:
     state = _qb_task_state(task)
     downloader = module_display_name(downloader_id)
     if event == "started":
-        title, level = "下载已开始", "info"
-        lines = [f"下载器：{downloader}", f"任务：{state['name']}", f"大小：{bytes_label(state['size'])}", f"状态：{state['state']}"]
+        title, level = f"{downloader}：下载已开始", "info"
+        lines = [f"任务：{state['name']}", f"大小：{bytes_label(state['size'])}", f"描述：{qb_task_description(metadata)}"]
     elif event == "completed":
-        title, level = "下载已完成", "success"
-        completed_at = str(task.get("completed_at") or "刚刚完成")
-        lines = [f"下载器：{downloader}", f"任务：{state['name']}", f"大小：{bytes_label(state['size'])}", f"完成时间：{completed_at}"]
+        title, level = f"{downloader}：下载已完成", "success"
+        lines = [f"任务：{state['name']}", f"大小：{bytes_label(state['size'])}", f"描述：{qb_task_description(metadata)}"]
     else:
         title, level = "下载任务异常", "error"
         lines = [f"下载器：{downloader}", f"任务：{state['name']}", f"状态：{state['state']}", "检查结果：任务进入异常状态"]
@@ -363,7 +510,9 @@ def record_qb_task_transitions(db: Session, downloader_id: str, tasks: list[dict
 
     emitted: list[str] = []
     for event, task in transitions:
-        notification = _qb_task_notification(downloader_id, event, task)
+        task_hash = str(task.get("hash") or "").strip()
+        metadata = get_qb_task_metadata(db, downloader_id, task_hash)
+        notification = _qb_task_notification(downloader_id, event, task, metadata)
         db.add(notification)
         db.commit()
         db.refresh(notification)
@@ -1372,6 +1521,9 @@ def save_wechat_claw_mobile_candidates(
             "promotion_type": str(item.get("promotion_type") or "").strip(),
             "codec": str(item.get("codec") or "").strip(),
             "hdr": str(item.get("hdr") or "").strip(),
+            "audio_codec": str(item.get("audio_codec") or "").strip(),
+            "imdb_rating": str(item.get("imdb_rating") or "").strip(),
+            "douban_rating": str(item.get("douban_rating") or "").strip(),
             "group": str(item.get("group") or "").strip(),
             "presentation": (presentation or {}).get(str(item.get("id") or ""), {}),
         }
@@ -1504,11 +1656,22 @@ def resolve_wechat_claw_default_downloader(db: Session) -> str:
     raise HTTPException(status_code=409, detail="未找到可用的默认 qB 下载器，请先在设置中启用 qB1、qB2 或 qB3。")
 
 
-def download_wechat_claw_selected_torrent(db: Session, torrent_id: str, actor: User) -> dict[str, Any]:
+def download_wechat_claw_selected_torrent(
+    db: Session,
+    torrent_id: str,
+    actor: User,
+    candidate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     downloader_id = resolve_wechat_claw_default_downloader(db)
     stage = "mteam_download_torrent"
     try:
         torrent_file = get_mteam_adapter_or_error(db).download_torrent_file(torrent_id)
+        task_hashes = save_qb_task_metadata(
+            db,
+            downloader_id,
+            torrent_file["content"],
+            candidate or {"id": torrent_id},
+        )
         stage = "qb_add_torrent_file"
         result = get_qb_adapter_or_error(db, downloader_id).add_torrent_file(
             downloader_id,
@@ -1520,9 +1683,16 @@ def download_wechat_claw_selected_torrent(db: Session, torrent_id: str, actor: U
         raise HTTPException(status_code=502, detail=f"下载种子失败：{exc}") from exc
     except QbittorrentApiError as exc:
         raise HTTPException(status_code=502, detail=f"推送到 {downloader_id} 失败：{exc}") from exc
-    db.add(DownloadAction(trace_id=result["trace_id"], downloader_id=downloader_id, action="add_mteam_mobile", target_hash=torrent_id, actor_user_id=actor.id, status="accepted"))
+    task_hash = task_hashes[0] if task_hashes else torrent_id
+    db.add(DownloadAction(trace_id=result["trace_id"], downloader_id=downloader_id, action="add_mteam_mobile", target_hash=task_hash, actor_user_id=actor.id, status="accepted"))
     db.commit()
-    return {**result, "torrent_id": torrent_id, "filename": torrent_file["filename"], "downloader_id": downloader_id}
+    return {
+        **result,
+        "torrent_id": torrent_id,
+        "task_hash": task_hash,
+        "filename": torrent_file["filename"],
+        "downloader_id": downloader_id,
+    }
 
 
 def rank_mteam_search_items(items: list[dict[str, Any]], filters: dict[str, Any]) -> tuple[list[dict[str, Any]], int | None]:
@@ -2207,10 +2377,11 @@ def record_wechat_claw_interaction(
         "created_at": datetime.utcnow().isoformat(),
     }
     current = get_wechat_claw_recent_interactions(db)
-    row = db.query(Setting).filter(Setting.key == wechat_claw_setting_key(WECHAT_CLAW_INTERACTIONS_KEY)).one_or_none()
+    interaction_key = wechat_claw_setting_key(WECHAT_CLAW_INTERACTIONS_KEY)
+    row = db.query(Setting).filter(Setting.key == interaction_key).one_or_none()
     value = {"items": [item, *current][:WECHAT_CLAW_INTERACTION_LIMIT]}
     if row is None:
-        row = Setting(key=WECHAT_CLAW_INTERACTIONS_KEY, value=value)
+        row = Setting(key=interaction_key, value=value)
         db.add(row)
     else:
         row.value = value
@@ -2262,6 +2433,15 @@ def update_wechat_claw_interaction_delivery(
     db.commit()
 
 
+def wechat_claw_notification_title(notification: Notification, action: str, role_name: str) -> str:
+    is_qb_download = notification.source == "qb_task_monitor" and bool(
+        re.fullmatch(r"qb[123]_download_(?:started|completed)", str(action or ""))
+    )
+    if is_qb_download or not role_name:
+        return notification.title
+    return f"【{role_name}】{notification.title}"
+
+
 def push_wechat_claw_notification(db: Session, notification: Notification, action: str) -> dict[str, Any]:
     # App-originated download events have no active chat scope. Fan them out to
     # every independently bound member instead of the legacy administrator bot.
@@ -2298,7 +2478,7 @@ def push_wechat_claw_notification(db: Session, notification: Notification, actio
         return adapter.send_message(
             {
                 "type": action,
-                "title": f"【{role_name}】{notification.title}" if role_name else notification.title,
+                "title": wechat_claw_notification_title(notification, action, role_name),
                 "message": notification.message,
                 "level": notification.level,
                 "source": notification.source,
@@ -2483,6 +2663,8 @@ def format_mteam_station_reply(mteam: dict[str, Any]) -> str:
     username = str(mteam.get("username") or "-").strip() or "-"
     source = str(mteam.get("source") or "M-Team 原始数据").strip()
     updated_at = str(mteam.get("updated_at") or "").replace("T", " ")[:16]
+    active_delta = str(mteam.get("active_delta_label") or "").strip()
+    active_delta_suffix = f"（{window} {active_delta}）" if active_delta else ""
     lines = [
         "M-Team 站点数据",
         "",
@@ -2498,7 +2680,7 @@ def format_mteam_station_reply(mteam: dict[str, Any]) -> str:
         "",
         "做种与活动",
         f"- 做种：{mteam_number_label(mteam.get('seed_count'))} 个 · {mteam_metric_with_delta(bytes_label(float(mteam.get('seed_size') or 0), 2), mteam.get('seed_size_delta_label'), window)}",
-        f"- 当前活跃：上传 {mteam.get('active_uploads', 0)} · 下载 {mteam.get('active_downloads', 0)}{f'（{window} {mteam.get("active_delta_label")}）' if mteam.get('active_delta_label') else ''}",
+        f"- 当前活跃：上传 {mteam.get('active_uploads', 0)} · 下载 {mteam.get('active_downloads', 0)}{active_delta_suffix}",
         f"- 做种时长：{mteam_duration_label(mteam.get('seedtime_seconds'))} · 下载时长：{mteam_duration_label(mteam.get('leechtime_seconds'))}",
         "",
         "本地快照流量",
@@ -3632,6 +3814,7 @@ def mteam_download_to_qb(
         mteam_adapter = get_mteam_adapter_or_error(db)
         stage = "mteam_download_torrent"
         torrent_file = mteam_adapter.download_torrent_file(torrent_id)
+        task_hashes = save_qb_task_metadata(db, downloader_id, torrent_file["content"], request.payload)
         stage = "qb_config"
         qb_adapter = get_qb_adapter_or_error(db, downloader_id)
         stage = "qb_add_torrent_file"
@@ -3645,9 +3828,10 @@ def mteam_download_to_qb(
         raise HTTPException(status_code=502, detail={"stage": stage, "provider": "mteam", "torrent_id": torrent_id, "message": str(exc)}) from exc
     except QbittorrentApiError as exc:
         raise HTTPException(status_code=502, detail={"stage": stage, "provider": downloader_id, "torrent_id": torrent_id, "message": str(exc)}) from exc
-    db.add(DownloadAction(trace_id=result["trace_id"], downloader_id=downloader_id, action="add_mteam", target_hash=torrent_id, actor_user_id=user.id, status="accepted"))
+    task_hash = task_hashes[0] if task_hashes else torrent_id
+    db.add(DownloadAction(trace_id=result["trace_id"], downloader_id=downloader_id, action="add_mteam", target_hash=task_hash, actor_user_id=user.id, status="accepted"))
     db.commit()
-    return {**result, "torrent_id": torrent_id, "filename": torrent_file["filename"]}
+    return {**result, "torrent_id": torrent_id, "task_hash": task_hash, "filename": torrent_file["filename"]}
 
 
 @router.post("/qb/{downloader_id}/torrents/{torrent_hash}/delete-confirm")
@@ -3983,7 +4167,10 @@ def update_notification_preferences(request: NotificationPreferencesPayload, _: 
 @router.get("/admin/wechat-claw/bindings")
 def list_wechat_claw_bindings(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
     bindings = ensure_wechat_claw_bindings(db)
-    return {"items": [wechat_claw_binding_status(db, binding) for binding in bindings]}
+    return {
+        "items": [wechat_claw_binding_status(db, binding) for binding in bindings],
+        "limit": WECHAT_CLAW_MEMBER_LIMIT,
+    }
 
 
 @router.post("/admin/wechat-claw/bindings")
@@ -3992,16 +4179,23 @@ def create_wechat_claw_binding(
     _: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    binding = WechatClawBinding(
-        display_name=request.display_name.strip() or next_wechat_claw_member_name(db),
-        role_name=request.role_name.strip() or "微信助手",
-        avatar_key=next_wechat_claw_avatar_key(db),
-        enabled=request.enabled,
-        notification_preferences=normalized_wechat_claw_binding_preferences(request.notification_preferences),
-    )
-    db.add(binding)
-    db.commit()
-    db.refresh(binding)
+    with _WECHAT_CLAW_BINDING_CREATE_LOCK:
+        ensure_wechat_claw_bindings(db)
+        if db.query(WechatClawBinding).count() >= WECHAT_CLAW_MEMBER_LIMIT:
+            raise HTTPException(
+                status_code=409,
+                detail="最多可添加 5 位微信成员。如需添加新成员，请先删除一位不再使用的成员。",
+            )
+        binding = WechatClawBinding(
+            display_name=request.display_name.strip() or next_wechat_claw_member_name(db),
+            role_name=request.role_name.strip() or "微信助手",
+            avatar_key=next_wechat_claw_avatar_key(db),
+            enabled=request.enabled,
+            notification_preferences=normalized_wechat_claw_binding_preferences(request.notification_preferences),
+        )
+        db.add(binding)
+        db.commit()
+        db.refresh(binding)
     return serialize_wechat_claw_binding(binding)
 
 
@@ -4205,7 +4399,7 @@ def handle_wechat_claw_text(
         parsed_intent = {"intent_type": "download_selected", "action": "download_selected", "download_confirmation": True}
         stage_started = time.perf_counter()
         try:
-            dispatch = download_wechat_claw_selected_torrent(db, str(pending_candidate["id"]), user)
+            dispatch = download_wechat_claw_selected_torrent(db, str(pending_candidate["id"]), user, pending_candidate)
             clear_wechat_claw_pending_download(db, request)
             result = {"intent_type": "download_selected", "state": "accepted", "candidate": pending_candidate, **dispatch}
         except HTTPException as exc:
