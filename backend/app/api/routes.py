@@ -40,6 +40,7 @@ from app.models.entities import (
     DownloadAction,
     IntegrationConfig,
     MTeamSnapshot,
+    MediaFavorite,
     Notification,
     QbSnapshot,
     Setting,
@@ -78,6 +79,7 @@ TMDB_DIRECT_IMAGE_RE = re.compile(
     re.IGNORECASE,
 )
 TMDB_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+NAS_STORAGE_SETUP_STATUS_KEY = "setup.nas_storage.status"
 
 
 class SetupAdminRequest(BaseModel):
@@ -112,6 +114,10 @@ class QbActionPayload(BaseModel):
 
 class AssistantChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
+
+
+class FavoritePayload(BaseModel):
+    media: dict[str, Any] = Field(default_factory=dict)
 
 
 class AssistantExecuteRequest(BaseModel):
@@ -739,9 +745,17 @@ def get_preload_cache(db: Session, name: str) -> dict[str, Any] | None:
     return row.value
 
 
-def set_preload_cache(db: Session, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+def set_preload_cache(
+    db: Session,
+    name: str,
+    payload: dict[str, Any],
+    *,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     row = db.query(Setting).filter(Setting.key == preload_cache_key(name)).one_or_none()
     value = {"payload": payload, "cached_at": datetime.utcnow().isoformat(), "name": name}
+    if context is not None:
+        value["context"] = context
     if row is None:
         row = Setting(key=preload_cache_key(name), value=value)
         db.add(row)
@@ -771,6 +785,68 @@ def rewrite_tmdb_image_urls(payload: Any) -> Any:
     if isinstance(payload, dict):
         return {key: rewrite_tmdb_image_urls(value) for key, value in payload.items()}
     return payload
+
+
+FAVORITE_MEDIA_FIELDS = {
+    "id",
+    "tmdb_id",
+    "media_type",
+    "title",
+    "original_title",
+    "year",
+    "release_date",
+    "runtime",
+    "rating",
+    "vote_count",
+    "popularity",
+    "poster",
+    "backdrop",
+    "overview",
+    "genres",
+    "original_language",
+    "production_countries",
+    "director",
+    "cast",
+}
+
+
+def normalize_favorite_media(media: dict[str, Any]) -> tuple[str, int, dict[str, Any]]:
+    media_type = str(media.get("media_type") or "").strip().lower()
+    if media_type not in {"movie", "tv"}:
+        raise HTTPException(status_code=422, detail="收藏条目缺少有效的影片类型。")
+    raw_tmdb_id = media.get("tmdb_id")
+    if not raw_tmdb_id:
+        raw_id = str(media.get("id") or "")
+        raw_tmdb_id = raw_id.rsplit("-", 1)[-1] if "-" in raw_id else raw_id
+    try:
+        tmdb_id = int(raw_tmdb_id)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="收藏条目缺少有效的 TMDB ID。") from exc
+    if tmdb_id <= 0:
+        raise HTTPException(status_code=422, detail="收藏条目缺少有效的 TMDB ID。")
+    payload = {key: value for key, value in media.items() if key in FAVORITE_MEDIA_FIELDS}
+    payload.update(
+        {
+            "id": f"{media_type}-{tmdb_id}",
+            "tmdb_id": tmdb_id,
+            "media_type": media_type,
+            "title": str(media.get("title") or "未命名").strip()[:240],
+        }
+    )
+    return media_type, tmdb_id, payload
+
+
+def serialize_media_favorite(favorite: MediaFavorite) -> dict[str, Any]:
+    payload = dict(favorite.media_payload or {})
+    payload.update(
+        {
+            "favorite_id": favorite.id,
+            "tmdb_id": favorite.tmdb_id,
+            "media_type": favorite.media_type,
+            "favorited_at": favorite.created_at.isoformat(),
+        }
+    )
+    return rewrite_tmdb_image_urls(payload)
 
 
 def with_preload_meta(payload: dict[str, Any], cache: dict[str, Any] | None, preloaded: bool) -> dict[str, Any]:
@@ -3009,7 +3085,17 @@ def get_qb_state_for_dashboard(db: Session, downloader_id: str) -> dict[str, Any
     if not row or not row.encrypted_payload or not row.enabled:
         return qb_placeholder_state(downloader_id, row)
     try:
-        return QbittorrentWebAdapter(get_decrypted_config(db, downloader_id) or {}).get_server_state(downloader_id)
+        state = QbittorrentWebAdapter(get_decrypted_config(db, downloader_id) or {}).get_server_state(downloader_id)
+        # The live qB response does not contain application-level config flags.
+        # The mobile dashboard template uses `enabled` to decide which
+        # downloaders to display, so preserve the flags from the config row.
+        state.update(
+            {
+                "configured": bool(row.encrypted_payload),
+                "enabled": bool(row.enabled),
+            }
+        )
+        return state
     except Exception as exc:
         return qb_placeholder_state(downloader_id, row, f"qB 真实数据读取失败：{exc}")
 
@@ -3087,6 +3173,78 @@ def nas_storage_from_configs(db: Session) -> dict[str, Any]:
         "nas_storage_configured": True,
         "nas_storage_readable": True,
         **common,
+    }
+
+
+def verified_nas_storage_setup_status(db: Session) -> dict[str, Any] | None:
+    row = db.query(Setting).filter(Setting.key == NAS_STORAGE_SETUP_STATUS_KEY).one_or_none()
+    value = row.value if row and isinstance(row.value, dict) else {}
+    if not value.get("verified"):
+        return None
+    paths = [str(path) for path in value.get("paths") or [] if str(path).strip()]
+    return {
+        "nas_free_space": float(value.get("nas_free_space") or 0),
+        "nas_total_space": float(value.get("nas_total_space") or 0),
+        "nas_used_space": float(value.get("nas_used_space") or 0),
+        "nas_usage_percent": value.get("nas_usage_percent"),
+        "nas_free_space_label": str(value.get("nas_free_space_label") or "-"),
+        "nas_free_space_source": str(value.get("nas_free_space_source") or ""),
+        "nas_space_label": str(value.get("nas_space_label") or "-"),
+        "nas_space_helper": str(value.get("nas_space_helper") or "已验证 NAS 存储挂载"),
+        "nas_storage_configured": True,
+        "nas_storage_readable": True,
+        "nas_storage_paths": paths,
+        "nas_storage_detected_paths": paths,
+        "nas_storage_pool_count": int(value.get("pool_count") or 0),
+        "nas_storage_folder_count": int(value.get("folder_count") or len(paths)),
+        "nas_storage_errors": [],
+        "nas_storage_summary_label": "NAS 存储挂载已验证",
+        "nas_storage_setup_verified": True,
+        "nas_storage_verified_at": value.get("verified_at"),
+        "nas_storage_check_source": "saved",
+    }
+
+
+def storage_status_from_setup_check(db: Session, refresh: bool = False) -> dict[str, Any]:
+    if not refresh:
+        verified = verified_nas_storage_setup_status(db)
+        if verified:
+            return verified
+
+    status = nas_storage_from_configs(db)
+    success = bool(status.get("nas_storage_readable"))
+    row = db.query(Setting).filter(Setting.key == NAS_STORAGE_SETUP_STATUS_KEY).one_or_none()
+    if success:
+        value = {
+            "verified": True,
+            "verified_at": datetime.utcnow().isoformat(),
+            "paths": status.get("nas_storage_detected_paths") or [],
+            "pool_count": status.get("nas_storage_pool_count") or 0,
+            "folder_count": status.get("nas_storage_folder_count") or 0,
+            "nas_free_space": status.get("nas_free_space") or 0,
+            "nas_total_space": status.get("nas_total_space") or 0,
+            "nas_used_space": status.get("nas_used_space") or 0,
+            "nas_usage_percent": status.get("nas_usage_percent"),
+            "nas_free_space_label": status.get("nas_free_space_label") or "-",
+            "nas_free_space_source": status.get("nas_free_space_source") or "",
+            "nas_space_label": status.get("nas_space_label") or "-",
+            "nas_space_helper": status.get("nas_space_helper") or "",
+        }
+        if row is None:
+            db.add(Setting(key=NAS_STORAGE_SETUP_STATUS_KEY, value=value))
+        else:
+            row.value = value
+            row.updated_at = datetime.utcnow()
+        db.commit()
+    elif refresh and row is not None:
+        row.value = {"verified": False, "checked_at": datetime.utcnow().isoformat()}
+        row.updated_at = datetime.utcnow()
+        db.commit()
+
+    return {
+        **status,
+        "nas_storage_setup_verified": success,
+        "nas_storage_check_source": "live",
     }
 
 
@@ -3344,8 +3502,8 @@ def list_integrations(_: User = Depends(require_admin), db: Session = Depends(ge
 
 
 @router.get("/admin/storage/status")
-def admin_storage_status(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
-    return nas_storage_from_configs(db)
+def admin_storage_status(refresh: bool = Query(default=False), _: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    return storage_status_from_setup_check(db, refresh)
 
 
 @router.put("/admin/integrations/{provider}")
@@ -3529,7 +3687,7 @@ def build_dashboard_payload(db: Session) -> dict[str, Any]:
             connection["message"] = f"M-Team 真实数据读取失败：{exc}"
             mteam = empty_mteam_stats("M-Team 真实数据读取失败，请回到设置页重新测试。")
     qbs = [get_qb_state_for_dashboard(db, downloader_id) for downloader_id in ["qb1", "qb2", "qb3"]]
-    nas_space = nas_storage_from_configs(db)
+    nas_space = storage_status_from_setup_check(db)
     persist_dashboard_snapshots(db, mteam, qbs, mteam_ok)
     if mteam_ok:
         apply_mteam_five_hour_deltas(db, mteam)
@@ -3870,12 +4028,43 @@ def qb_delete(downloader_id: str, torrent_hash: str, confirm_token: str = Query(
     return result
 
 
-def build_discover_payload(db: Session) -> dict[str, Any]:
+def enabled_tmdb_discover_config(db: Session) -> dict[str, Any] | None:
     config_row = get_config(db, "tmdb")
     if not config_row or not config_row.enabled:
+        return None
+    config = get_decrypted_config(db, "tmdb") or {}
+    if not any(str(config.get(key) or "").strip() for key in ("api_key", "bearer_token", "token")):
+        return None
+    return config
+
+
+def tmdb_discover_cache_context(db: Session) -> dict[str, Any]:
+    config_row = get_config(db, "tmdb")
+    configured = enabled_tmdb_discover_config(db) is not None
+    return {
+        "provider": "tmdb",
+        "config_version": int(config_row.config_version) if config_row else 0,
+        "enabled": bool(config_row and config_row.enabled),
+        "configured": configured,
+    }
+
+
+def tmdb_discover_cache_is_current(db: Session, cache: dict[str, Any] | None) -> bool:
+    if not cache or cache.get("context") != tmdb_discover_cache_context(db):
+        return False
+    payload = cache.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    expected_configured = bool(cache["context"]["configured"])
+    return payload.get("source") == "tmdb" and payload.get("configured") is expected_configured
+
+
+def build_discover_payload(db: Session) -> dict[str, Any]:
+    config = enabled_tmdb_discover_config(db)
+    if config is None:
         return {"source": "tmdb", "configured": False, "message": "请先在设置中保存并启用 TMDB API Key 或 Bearer Token。", "trending": [], "popular_movies": [], "popular_tv": [], "top_rated_movies": [], "top_rated_tv": []}
     try:
-        return TmdbAdapter(get_decrypted_config(db, "tmdb") or {}).get_discover_lists()
+        return TmdbAdapter(config).get_discover_lists()
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"TMDB 数据获取失败：{exc}") from exc
 
@@ -3905,24 +4094,94 @@ def discover_filter_cache_name(filters: dict[str, Any]) -> str:
 
 
 def build_discover_filter_payload(db: Session, filters: dict[str, Any]) -> dict[str, Any]:
-    config_row = get_config(db, "tmdb")
-    if config_row and config_row.enabled:
-        try:
-            return TmdbAdapter(get_decrypted_config(db, "tmdb") or {}).discover_media(filters)
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"TMDB 条件筛选失败：{exc}") from exc
-    return MockMetadataAdapter().discover_media(filters)
+    config = enabled_tmdb_discover_config(db)
+    if config is None:
+        page = max(1, int(filters.get("page") or 1))
+        pages = max(1, int(filters.get("pages") or 1))
+        return {
+            "source": "tmdb",
+            "configured": False,
+            "message": "请先在设置中保存并启用 TMDB API Key 或 Bearer Token。",
+            "filters": filters,
+            "items": [],
+            "page": page,
+            "start_page": page,
+            "pages": pages,
+            "next_page": None,
+            "total_pages": 0,
+            "total_results": 0,
+            "options": {},
+        }
+    try:
+        return TmdbAdapter(config).discover_media(filters)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"TMDB 条件筛选失败：{exc}") from exc
+
+
+@router.get("/favorites")
+def list_favorites(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    rows = (
+        db.query(MediaFavorite)
+        .filter(MediaFavorite.user_id == user.id)
+        .order_by(MediaFavorite.created_at.desc(), MediaFavorite.id.desc())
+        .all()
+    )
+    return {"items": [serialize_media_favorite(row) for row in rows], "count": len(rows)}
+
+
+@router.post("/favorites")
+def add_favorite(request: FavoritePayload, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    media_type, tmdb_id, payload = normalize_favorite_media(request.media)
+    row = (
+        db.query(MediaFavorite)
+        .filter(
+            MediaFavorite.user_id == user.id,
+            MediaFavorite.media_type == media_type,
+            MediaFavorite.tmdb_id == tmdb_id,
+        )
+        .one_or_none()
+    )
+    created = row is None
+    if row is None:
+        row = MediaFavorite(user_id=user.id, media_type=media_type, tmdb_id=tmdb_id, media_payload=payload)
+        db.add(row)
+    else:
+        row.media_payload = payload
+        row.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(row)
+    return {"item": serialize_media_favorite(row), "created": created}
+
+
+@router.delete("/favorites/{media_type}/{tmdb_id}")
+def remove_favorite(media_type: str, tmdb_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    normalized_type = media_type.strip().lower()
+    if normalized_type not in {"movie", "tv"}:
+        raise HTTPException(status_code=422, detail="收藏条目类型无效。")
+    row = (
+        db.query(MediaFavorite)
+        .filter(
+            MediaFavorite.user_id == user.id,
+            MediaFavorite.media_type == normalized_type,
+            MediaFavorite.tmdb_id == tmdb_id,
+        )
+        .one_or_none()
+    )
+    if row is not None:
+        db.delete(row)
+        db.commit()
+    return {"removed": row is not None, "media_type": normalized_type, "tmdb_id": tmdb_id}
 
 
 def refresh_discover_filter_preload(db: Session, filters: dict[str, Any]) -> dict[str, Any]:
     payload = build_discover_filter_payload(db, filters)
-    set_preload_cache(db, discover_filter_cache_name(filters), payload)
+    set_preload_cache(db, discover_filter_cache_name(filters), payload, context=tmdb_discover_cache_context(db))
     return payload
 
 
 def refresh_discover_preload(db: Session) -> dict[str, Any]:
     payload = build_discover_payload(db)
-    set_preload_cache(db, "discover", payload)
+    set_preload_cache(db, "discover", payload, context=tmdb_discover_cache_context(db))
     try:
         refresh_discover_filter_preload(db, default_discover_filter())
     except Exception:
@@ -3940,7 +4199,7 @@ def discover_lists(
 ) -> dict[str, Any]:
     if cached and not refresh:
         cache = get_preload_cache(db, "discover")
-        if cache:
+        if tmdb_discover_cache_is_current(db, cache):
             return with_preload_meta(cache["payload"], cache, True)
     payload = refresh_discover_preload(db)
     return with_preload_meta(payload, get_preload_cache(db, "discover"), False)
@@ -3979,7 +4238,7 @@ def discover_filter(
     cache_name = discover_filter_cache_name(filters)
     if cached and not refresh:
         cache = get_preload_cache(db, cache_name)
-        if cache:
+        if tmdb_discover_cache_is_current(db, cache):
             return with_preload_meta(cache["payload"], cache, True)
     payload = refresh_discover_filter_preload(db, filters)
     return with_preload_meta(payload, get_preload_cache(db, cache_name), False)
@@ -4669,7 +4928,7 @@ def diagnostics_health(_: User = Depends(require_admin), db: Session = Depends(g
     integrations = {row.provider: row for row in db.query(IntegrationConfig).all()}
     bindings = ensure_wechat_claw_bindings(db)
     wechat_claw_connected = any(wechat_claw_binding_status(db, binding)["connected"] for binding in bindings)
-    storage = nas_storage_from_configs(db)
+    storage = storage_status_from_setup_check(db)
     modules = []
     for provider in PROVIDERS + ["nas_disk"]:
         row = integrations.get(provider)

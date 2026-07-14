@@ -22,9 +22,9 @@ TMDB_DOH_URL = "https://doh.pub/resolve"
 DEFAULT_TMDB_PROXY_URL = "http://mihomo:7890"
 DISCOVER_SORT_OPTIONS = [
     {"value": "popularity.desc", "label": "综合排序"},
-    {"value": "release_date.desc", "label": "首播时间"},
+    {"value": "release_date.desc", "label": "首播时间优先"},
     {"value": "vote_average.desc", "label": "高分优先"},
-    {"value": "vote_count.desc", "label": "讨论热度"},
+    {"value": "vote_count.desc", "label": "讨论热度优先"},
 ]
 DISCOVER_REGION_OPTIONS = [
     {"value": "", "label": "不限地区"},
@@ -39,7 +39,28 @@ DISCOVER_REGION_OPTIONS = [
     {"value": "DE", "label": "德国"},
     {"value": "IN", "label": "印度"},
     {"value": "TH", "label": "泰国"},
+    {"value": "OTHER", "label": "其他"},
 ]
+DISCOVER_PRIMARY_REGION_CODES = frozenset(option["value"] for option in DISCOVER_REGION_OPTIONS if option["value"] not in {"", "OTHER"})
+DISCOVER_OTHER_REGION_CODES = tuple(
+    code
+    for code in """
+    AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ
+    CA CC CD CF CG CH CI CK CL CM CO CR CU CV CW CX CY CZ DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO GA GD
+    GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HM HN HR HT HU ID IE IL IM IQ IR IS IT JE JM JO KE KG KH KI KM
+    KN KP KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX
+    MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB
+    SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TJ TK TL TM TN TO TR TT TV TZ UA UG UM UY
+    UZ VA VC VE VG VI VN VU WF WS XK YE YT ZA ZM ZW
+    """.split()
+    if code not in DISCOVER_PRIMARY_REGION_CODES
+)
+DISCOVER_OTHER_REGION_QUERY = "|".join(DISCOVER_OTHER_REGION_CODES)
+DISCOVER_GENRE_NAME_OVERRIDES_ZH = {
+    "10765": "科幻与奇幻",
+    "10768": "战争与政治",
+}
+DISCOVER_HIDDEN_GENRE_IDS = {"10770"}
 DISCOVER_LANGUAGE_OPTIONS = [
     {"value": "", "label": "不限语言"},
     {"value": "zh", "label": "中文"},
@@ -267,8 +288,8 @@ class TmdbAdapter(MetadataAdapter):
         if genre:
             params["with_genres"] = genre
         if region:
-            params["with_origin_country"] = region
-            if media_type == "movie":
+            params["with_origin_country"] = DISCOVER_OTHER_REGION_QUERY if region == "OTHER" else region
+            if media_type == "movie" and region != "OTHER":
                 params["region"] = region
         elif media_type == "movie":
             params["region"] = self.region
@@ -400,7 +421,13 @@ class TmdbAdapter(MetadataAdapter):
                 return [dict(item) for item in cached]
         payload = self._get(f"/genre/{media_type}/list", {})
         genres = payload.get("genres") if isinstance(payload.get("genres"), list) else []
-        result = [{"id": str(genre.get("id")), "name": genre.get("name")} for genre in genres if genre.get("id") and genre.get("name")]
+        result = []
+        for genre in genres:
+            genre_id = str(genre.get("id") or "")
+            genre_name = genre.get("name")
+            if not genre_id or not genre_name or genre_id in DISCOVER_HIDDEN_GENRE_IDS:
+                continue
+            result.append({"id": genre_id, "name": DISCOVER_GENRE_NAME_OVERRIDES_ZH.get(genre_id, genre_name)})
         with _DISCOVER_OPTIONS_LOCK:
             _DISCOVER_GENRE_CACHE[cache_key] = (now + _DISCOVER_OPTIONS_TTL_SECONDS, [dict(item) for item in result])
         return result

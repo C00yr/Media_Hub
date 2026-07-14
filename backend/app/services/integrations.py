@@ -2,6 +2,7 @@ import json
 from datetime import datetime
 from typing import Any
 
+from cryptography.fernet import InvalidToken
 from sqlalchemy.orm import Session
 
 from app.models.entities import ConfigAuditLog, IntegrationConfig
@@ -11,6 +12,15 @@ from app.utils.redaction import parse_raw_headers, redact_payload
 
 
 PROVIDERS = ["mteam", "qb1", "qb2", "qb3", "tmdb", "ai", "wechat_claw"]
+
+
+def decode_saved_payload(value: str | None) -> tuple[dict[str, Any], bool]:
+    if not value:
+        return {}, False
+    try:
+        return json.loads(decrypt_text(value)), False
+    except (InvalidToken, UnicodeDecodeError, json.JSONDecodeError):
+        return {}, True
 
 
 def normalize_payload(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -108,7 +118,8 @@ def get_decrypted_config(db: Session, provider: str) -> dict[str, Any] | None:
     row = get_config(db, provider)
     if not row or not row.encrypted_payload:
         return None
-    return json.loads(decrypt_text(row.encrypted_payload))
+    payload, unreadable = decode_saved_payload(row.encrypted_payload)
+    return None if unreadable else payload
 
 
 def upsert_config(
@@ -125,13 +136,12 @@ def upsert_config(
         db.add(row)
     else:
         row.config_version += 1
-        if provider == "tmdb" and row.encrypted_payload:
-            previous = json.loads(decrypt_text(row.encrypted_payload))
+        previous, _ = decode_saved_payload(row.encrypted_payload)
+        if provider == "tmdb":
             for key in ("api_key", "bearer_token", "proxy_url"):
                 if key not in normalized and previous.get(key):
                     normalized[key] = previous[key]
-        if provider == "mteam" and row.encrypted_payload:
-            previous = json.loads(decrypt_text(row.encrypted_payload))
+        if provider == "mteam":
             previous_headers = previous.get("headers", {})
             current_headers = normalized.get("headers", {})
             for key in ("Cookie", "Authorization", "User-Agent"):
@@ -142,16 +152,13 @@ def upsert_config(
             for key in ("api_key", "passkey"):
                 if key not in normalized and previous.get(key):
                     normalized[key] = previous[key]
-        if provider in {"qb1", "qb2", "qb3"} and row.encrypted_payload:
-            previous = json.loads(decrypt_text(row.encrypted_payload))
+        if provider in {"qb1", "qb2", "qb3"}:
             if "password" not in normalized and previous.get("password"):
                 normalized["password"] = previous["password"]
-        if provider == "ai" and row.encrypted_payload:
-            previous = json.loads(decrypt_text(row.encrypted_payload))
+        if provider == "ai":
             if "api_key" not in normalized and previous.get("api_key"):
                 normalized["api_key"] = previous["api_key"]
-        if provider == "wechat_claw" and row.encrypted_payload:
-            previous = json.loads(decrypt_text(row.encrypted_payload))
+        if provider == "wechat_claw":
             for key in ("inbound_token", "webhook_secret"):
                 if key not in normalized and previous.get(key):
                     normalized[key] = previous[key]
@@ -237,5 +244,7 @@ def serialize_config(row: IntegrationConfig, include_plain_payload: bool = False
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
     }
     if include_plain_payload:
-        data["saved_payload"] = json.loads(decrypt_text(row.encrypted_payload)) if row.encrypted_payload else {}
+        saved_payload, unreadable = decode_saved_payload(row.encrypted_payload)
+        data["saved_payload"] = saved_payload
+        data["configuration_unreadable"] = unreadable
     return data

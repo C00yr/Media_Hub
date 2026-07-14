@@ -14,7 +14,9 @@ import {
   EyeOff,
   Film,
   Gauge,
+  Grid3X3,
   HardDrive,
+  Heart,
   Lock,
   LogOut,
   MessageSquare,
@@ -36,12 +38,12 @@ import {
   Wrench
 } from "lucide-react";
 import QRCode from "qrcode";
-import { FormEvent, KeyboardEvent, MouseEvent, PointerEvent, ReactNode, RefObject, SyntheticEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, MouseEvent, PointerEvent, ReactNode, RefObject, SyntheticEvent, createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { api, formatBytes, formatSpeed, getToken, normalizeApiErrorMessage, setToken } from "../api/client";
 
 type User = { id?: number; username: string; role: string; must_change_credentials?: boolean };
 type SetupStatus = { initialized: boolean; default_credentials_pending?: boolean };
-type NavKey = "discover" | "dashboard" | "downloads" | "notifications" | "settings" | "diagnostics";
+type NavKey = "discover" | "favorites" | "dashboard" | "downloads" | "notifications" | "settings" | "diagnostics";
 type TrafficDimension = "year" | "month" | "week" | "day" | "hour";
 type DiscoverMode = "home" | "dual" | "mteam";
 type DiscoverBrowseMode = "casual" | "filter";
@@ -63,6 +65,34 @@ type DiscoverFilterSession = {
   nextPage: number | null;
   hasMore: boolean;
 };
+
+type FavoritesContextValue = {
+  items: any[];
+  loading: boolean;
+  error: string;
+  isFavorite: (item: any) => boolean;
+  isBusy: (item: any) => boolean;
+  toggle: (item: any) => Promise<void>;
+};
+
+const FavoritesContext = createContext<FavoritesContextValue>({
+  items: [],
+  loading: false,
+  error: "",
+  isFavorite: () => false,
+  isBusy: () => false,
+  toggle: async () => undefined,
+});
+
+function useFavorites() {
+  return useContext(FavoritesContext);
+}
+
+function favoriteMediaKey(item: any): string {
+  const mediaType = String(item?.media_type || "").toLowerCase();
+  const tmdbId = mediaTmdbId(item);
+  return mediaType && tmdbId ? `${mediaType}:${tmdbId}` : "";
+}
 
 const DEFAULT_DISCOVER_FILTERS: DiscoverFilters = {
   media_type: "movie",
@@ -250,6 +280,7 @@ type NotificationPreferenceKey = "download_started" | "download_completed" | "re
 
 const navItems: { key: NavKey; label: string; icon: typeof Film; admin?: boolean }[] = [
   { key: "discover", label: "发现", icon: Film },
+  { key: "favorites", label: "收藏", icon: Heart },
   { key: "dashboard", label: "仪表盘", icon: Gauge },
   { key: "downloads", label: "下载", icon: Download },
   { key: "notifications", label: "通知", icon: Bell },
@@ -259,11 +290,12 @@ const navItems: { key: NavKey; label: string; icon: typeof Film; admin?: boolean
 
 const pageDescriptions: Record<NavKey, string> = {
   discover: "从 TMDB 获取流行趋势、热门内容和高分片单。",
+  favorites: "集中查看收藏的电影和剧集，并按收藏时间回顾。",
   dashboard: "查看站点、下载器和 NAS 的核心运行指标。",
   downloads: "查看和管理多个 qB 下载器中的任务。",
   notifications: "集中查看系统提醒和任务通知。",
   settings: "管理运行时凭据，敏感信息只在后端加密保存。",
-  diagnostics: "查看核心模块是否正常运行，并导出脱敏诊断信息。"
+  diagnostics: "查看核心模块是否正常运行。"
 };
 
 function useLoad<T>(loader: () => Promise<T>, deps: unknown[], initialData: T | null = null, clearOnLoad = true) {
@@ -290,6 +322,7 @@ function useLoad<T>(loader: () => Promise<T>, deps: unknown[], initialData: T | 
     error,
     loading,
     reload: () => {
+      setLoading(true);
       return loader()
         .then((value) => {
           setData(value);
@@ -300,7 +333,8 @@ function useLoad<T>(loader: () => Promise<T>, deps: unknown[], initialData: T | 
           setError((err as Error).message);
           setData(null);
           throw err;
-        });
+        })
+        .finally(() => setLoading(false));
     },
     setData
   };
@@ -308,7 +342,7 @@ function useLoad<T>(loader: () => Promise<T>, deps: unknown[], initialData: T | 
 
 const SEARCH_HISTORY_STORAGE_KEY = "ptmh_search_history";
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "ptmh_sidebar_collapsed";
-const LOCAL_SNAPSHOT_PREFIX = "ptmh_snapshot:v2:";
+const LOCAL_SNAPSHOT_PREFIX = "ptmh_snapshot:v3:";
 const LOCAL_SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024;
 const REVALIDATE_DELAY_MS = 3000;
 const TMDB_DIRECT_IMAGE_RE = /https:\/\/image\.tmdb\.org\/t\/p\/(w\d+|original)\/([A-Za-z0-9_./-]+\.(?:jpg|jpeg|png|webp))/gi;
@@ -406,6 +440,10 @@ export function App() {
   const [discoverResetToken, setDiscoverResetToken] = useState(0);
   const [selectedDownloader, setSelectedDownloader] = useState("qb1");
   const [accountDialogOpen, setAccountDialogOpen] = useState(false);
+  const [favoriteItems, setFavoriteItems] = useState<any[]>([]);
+  const [favoritesLoading, setFavoritesLoading] = useState(false);
+  const [favoritesError, setFavoritesError] = useState("");
+  const [favoriteBusyKeys, setFavoriteBusyKeys] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
     api<SetupStatus>("/api/setup/status").then(setSetupStatus);
@@ -417,6 +455,28 @@ export function App() {
   useEffect(() => {
     if (user?.must_change_credentials) setAccountDialogOpen(true);
   }, [user?.must_change_credentials]);
+
+  useEffect(() => {
+    let alive = true;
+    if (!user) {
+      setFavoriteItems([]);
+      setFavoritesError("");
+      return () => { alive = false; };
+    }
+    setFavoritesLoading(true);
+    setFavoritesError("");
+    api<any>("/api/favorites")
+      .then((value) => {
+        if (alive) setFavoriteItems(Array.isArray(value?.items) ? value.items : []);
+      })
+      .catch((err) => {
+        if (alive) setFavoritesError((err as Error).message);
+      })
+      .finally(() => {
+        if (alive) setFavoritesLoading(false);
+      });
+    return () => { alive = false; };
+  }, [user?.id]);
 
   useEffect(() => {
     window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, String(sidebarCollapsed));
@@ -434,6 +494,47 @@ export function App() {
       setDiscoverResetToken((value) => value + 1);
     }
     setActive(key);
+  }
+
+  function isFavorite(item: any) {
+    const key = favoriteMediaKey(item);
+    return Boolean(key && favoriteItems.some((favorite) => favoriteMediaKey(favorite) === key));
+  }
+
+  function isFavoriteBusy(item: any) {
+    const key = favoriteMediaKey(item);
+    return Boolean(key && favoriteBusyKeys.has(key));
+  }
+
+  async function toggleFavorite(item: any) {
+    const key = favoriteMediaKey(item);
+    if (!key || favoriteBusyKeys.has(key)) return;
+    const previous = favoriteItems;
+    const existing = previous.find((favorite) => favoriteMediaKey(favorite) === key);
+    setFavoriteBusyKeys((current) => new Set(current).add(key));
+    setFavoritesError("");
+    if (existing) {
+      setFavoriteItems((current) => current.filter((favorite) => favoriteMediaKey(favorite) !== key));
+    } else {
+      setFavoriteItems((current) => [{ ...item, favorited_at: new Date().toISOString() }, ...current]);
+    }
+    try {
+      if (existing) {
+        await api(`/api/favorites/${item.media_type}/${mediaTmdbId(item)}`, { method: "DELETE" });
+      } else {
+        const response = await api<any>("/api/favorites", { method: "POST", body: JSON.stringify({ media: item }) });
+        setFavoriteItems((current) => [response.item, ...current.filter((favorite) => favoriteMediaKey(favorite) !== key)]);
+      }
+    } catch (err) {
+      setFavoriteItems(previous);
+      setFavoritesError((err as Error).message);
+    } finally {
+      setFavoriteBusyKeys((current) => {
+        const next = new Set(current);
+        next.delete(key);
+        return next;
+      });
+    }
   }
 
   return (
@@ -483,19 +584,21 @@ export function App() {
             {user.username} / {user.role === "admin" ? "管理员" : "用户"}
           </button>
         </header>
-        <ActivePage
-          user={user}
-          resetToken={active === "discover" ? discoverResetToken : 0}
-          selectedDownloader={selectedDownloader}
-          onNavigate={openNav}
-          onOpenDownloader={(downloaderId) => {
-            setSelectedDownloader(downloaderId);
-            setActive("downloads");
-          }}
-        />
+        <FavoritesContext.Provider value={{ items: favoriteItems, loading: favoritesLoading, error: favoritesError, isFavorite, isBusy: isFavoriteBusy, toggle: toggleFavorite }}>
+          <ActivePage
+            user={user}
+            resetToken={active === "discover" ? discoverResetToken : 0}
+            selectedDownloader={selectedDownloader}
+            onNavigate={openNav}
+            onOpenDownloader={(downloaderId) => {
+              setSelectedDownloader(downloaderId);
+              setActive("downloads");
+            }}
+          />
+        </FavoritesContext.Provider>
       </main>
       <nav className="bottom-nav">
-        {visibleNav.filter((item) => ["discover", "dashboard", "downloads", "notifications", "settings", "diagnostics"].includes(item.key)).map((item) => {
+        {visibleNav.filter((item) => ["discover", "favorites", "dashboard", "downloads", "notifications", "settings", "diagnostics"].includes(item.key)).map((item) => {
           const Icon = item.icon;
           return (
             <button className={active === item.key ? "active" : ""} onClick={() => openNav(item.key)} key={item.key} aria-label={item.label}>
@@ -840,16 +943,35 @@ function DashboardPage({ onOpenDownloader }: { onOpenDownloader?: (downloaderId:
 
   if (!data) return <Panel title="仪表盘"><p>正在加载运行数据...</p></Panel>;
 
+  const enabledDownloaders = data.qbs.filter((qb: any) => qb.configured !== false && qb.enabled !== false);
+  const onlineDownloaders = enabledDownloaders.filter((qb: any) => qb.online).length;
+
   return (
     <div className="grid-page dashboard-page">
       <div className="dashboard-composite">
-        <section className="metric-grid dashboard-overview">
-          <Metric icon={Download} title="总下载速度" value={formatSpeed(data.overview.total_download_speed)} source="" />
-          <Metric icon={Upload} title="总上传速度" value={formatSpeed(data.overview.total_upload_speed)} source="" />
-          <Metric icon={Activity} title="活跃上传/下载" value={<ActiveTransferCounts upload={data.overview.upload_tasks ?? 0} download={data.overview.download_tasks ?? 0} />} source="" />
-          <StorageMetric overview={data.overview} />
+        <section className="dashboard-surface dashboard-summary-surface">
+          <div className="dashboard-section-heading">
+            <div className="dashboard-section-title">
+              <span className="dashboard-section-icon"><Gauge size={18} /></span>
+              <div><span className="dashboard-eyebrow">运行概览</span><h2>核心指标</h2></div>
+            </div>
+            <span className="dashboard-section-note">吞吐、任务与存储</span>
+          </div>
+          <div className="metric-grid dashboard-overview">
+            <Metric tone="download" icon={Download} title="总下载速度" value={formatSpeed(data.overview.total_download_speed)} source="" />
+            <Metric tone="upload" icon={Upload} title="总上传速度" value={formatSpeed(data.overview.total_upload_speed)} source="" />
+            <Metric tone="activity" icon={Activity} title="活跃上传/下载" value={<ActiveTransferCounts upload={data.overview.upload_tasks ?? 0} download={data.overview.download_tasks ?? 0} />} source="" />
+            <StorageMetric overview={data.overview} />
+          </div>
         </section>
-        <section className="dashboard-downloaders">
+        <section className="dashboard-surface dashboard-downloaders">
+          <div className="dashboard-section-heading">
+            <div className="dashboard-section-title">
+              <span className="dashboard-section-icon downloader"><HardDrive size={18} /></span>
+              <div><span className="dashboard-eyebrow">任务节点</span><h2>下载器</h2></div>
+            </div>
+            <span className={onlineDownloaders === enabledDownloaders.length && enabledDownloaders.length ? "dashboard-section-note online" : "dashboard-section-note"}>{onlineDownloaders}/{enabledDownloaders.length} 在线</span>
+          </div>
           <div className="cards-row downloader-card-grid">
             {data.qbs.map((qb: any) => qb.locked ? <LockedCard key={qb.id} title={downloaderDashboardTitle(qb)} message={qb.message} onOpen={() => onOpenDownloader?.(qb.id)} /> : <DownloaderCard key={qb.id} qb={qb} onOpen={onOpenDownloader} onTestConnection={testQbConnection} testingConnection={testingQbId === qb.id} />)}
           </div>
@@ -898,9 +1020,12 @@ function MTeamSnapshotPanel({
   const deltas = mteamDeltaLabels(mteam);
 
   return (
-    <section className="panel">
+    <section className="panel mteam-panel">
       <div className="mteam-panel-header">
-        <h2><a className="mteam-title-link" href="https://kp.m-team.cc/index" target="_blank" rel="noreferrer">站点用户数据 - M-Team</a></h2>
+        <div className="mteam-panel-title">
+          <span className="dashboard-section-icon mteam"><Database size={18} /></span>
+          <div><span className="dashboard-eyebrow">站点数据</span><h2><a className="mteam-title-link" href="https://kp.m-team.cc/index" target="_blank" rel="noreferrer">M-Team 用户概览</a></h2></div>
+        </div>
         <div className="mteam-status-tools" title={statusTitle}>
           <button className="status-dot-button" onClick={onTestConnection} disabled={testingConnection} title="测试 M-Team 连通性" aria-label="测试 M-Team 连通性">
             <span className={connected ? "status-dot online" : "status-dot offline"} />
@@ -913,14 +1038,14 @@ function MTeamSnapshotPanel({
         </div>
       </div>
       <div className="mteam-stat-grid">
-        <InfoTile icon={UserRound} label="用户等级" value={mteam.user_level ?? "User"} />
-        <InfoTile icon={Coins} label="魔力值" value={numberLabel(mteam.bonus)} delta={deltas.bonus} />
-        <InfoTile icon={Percent} label="分享率" value={numberLabel(mteam.ratio, 3)} delta={deltas.ratio} negative={String(deltas.ratio ?? "").includes("-")} />
-        <InfoTile icon={Upload} label="总上传量" value={formatBytesFixed(mteam.upload_total, 2)} delta={deltas.upload} />
-        <InfoTile icon={Download} label="总下载量" value={formatBytes(mteam.download_total)} delta={deltas.download} />
-        <InfoTile icon={Activity} label="当前活跃上传/下载" value={<ActiveTransferCounts upload={mteam.active_uploads ?? 0} download={mteam.active_downloads ?? 0} />} />
-        <InfoTile icon={Database} label="总做种体积" value={formatBytes(mteam.seed_size ?? 0)} delta={deltas.seed_size} negative={String(deltas.seed_size ?? "").includes("-")} />
-        <InfoTile icon={CalendarDays} label="加入时间" value={mteam.joined_at ?? "-"} delta={joinedDurationLabel(mteam.joined_at)} />
+        <InfoTile className="secondary" icon={UserRound} label="用户等级" value={mteam.user_level ?? "User"} />
+        <InfoTile className="emphasis" icon={Coins} label="魔力值" value={numberLabel(mteam.bonus)} delta={deltas.bonus} />
+        <InfoTile className="emphasis" icon={Percent} label="分享率" value={numberLabel(mteam.ratio, 3)} delta={deltas.ratio} negative={String(deltas.ratio ?? "").includes("-")} />
+        <InfoTile className="positive" icon={Upload} label="总上传量" value={formatBytesFixed(mteam.upload_total, 2)} delta={deltas.upload} />
+        <InfoTile className="warm" icon={Download} label="总下载量" value={formatBytes(mteam.download_total)} delta={deltas.download} />
+        <InfoTile className="activity" icon={Activity} label="当前活跃上传/下载" value={<ActiveTransferCounts upload={mteam.active_uploads ?? 0} download={mteam.active_downloads ?? 0} />} />
+        <InfoTile className="secondary" icon={Database} label="总做种体积" value={formatBytes(mteam.seed_size ?? 0)} delta={deltas.seed_size} negative={String(deltas.seed_size ?? "").includes("-")} />
+        <InfoTile className="subtle" icon={CalendarDays} label="加入时间" value={mteam.joined_at ?? "-"} delta={joinedDurationLabel(mteam.joined_at)} />
       </div>
       <div className="traffic-chart">
         <div className="traffic-chart-header">
@@ -1520,13 +1645,11 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
       if (filterRequestId.current === requestId) {
         filterLoadedKeyRef.current = discoverFilterKey(filters);
         setFilterPayload((current: any) => append ? { ...(current ?? {}), ...result, options: result?.options ?? current?.options } : { ...result, options: result?.options ?? current?.options });
-        setFilterNextPage((current) => options.silent ? current : (result?.next_page ?? null));
-        setFilterHasMore((current) => options.silent ? current : Boolean(result?.next_page));
+        setFilterNextPage(result?.next_page ?? null);
+        setFilterHasMore(Boolean(result?.next_page));
         setFilterItems((current) => append
           ? mergeMediaItems(current, result?.items ?? [])
-          : options.silent && current.length
-            ? mergeMediaItems(result?.items ?? [], current)
-            : (result?.items ?? []));
+          : (result?.items ?? []));
         if (!append && page === 1) writeLocalSnapshot(snapshotKey, result);
       }
       return result;
@@ -1676,9 +1799,9 @@ function DiscoverFilterPage({
   const genreOptions = options?.genres?.[filters.media_type] ?? [];
   const sortOptions = options?.sorts ?? [
     { value: "popularity.desc", label: "综合排序" },
-    { value: "release_date.desc", label: "首播时间" },
+    { value: "release_date.desc", label: "首播时间优先" },
     { value: "vote_average.desc", label: "高分优先" },
-    { value: "vote_count.desc", label: "讨论热度" },
+    { value: "vote_count.desc", label: "讨论热度优先" },
   ];
   const regionOptions = options?.regions ?? [
     { value: "", label: "不限地区" },
@@ -1686,8 +1809,14 @@ function DiscoverFilterPage({
     { value: "HK", label: "中国香港" },
     { value: "TW", label: "中国台湾" },
     { value: "US", label: "美国" },
+    { value: "GB", label: "英国" },
     { value: "JP", label: "日本" },
     { value: "KR", label: "韩国" },
+    { value: "FR", label: "法国" },
+    { value: "DE", label: "德国" },
+    { value: "IN", label: "印度" },
+    { value: "TH", label: "泰国" },
+    { value: "OTHER", label: "其他" },
   ];
   const languageOptions = options?.languages ?? [
     { value: "", label: "不限语言" },
@@ -1779,9 +1908,9 @@ function discoverYearOptions() {
     { value: "2020s", label: "2020年代" },
     { value: "2010s", label: "2010年代" },
     { value: "2000s", label: "2000年代" },
-    { value: "1990s", label: "90年代" },
-    { value: "1980s", label: "80年代" },
-    { value: "1970s", label: "70年代" },
+    { value: "1990s", label: "1990年代" },
+    { value: "1980s", label: "1980年代" },
+    { value: "1970s", label: "1970年代" },
   ];
 }
 
@@ -2684,7 +2813,8 @@ function AdminUserManagementCard() {
 }
 
 function SettingsPage({ user }: { user: User }) {
-  const { data, reload } = useLoad<any>(() => user.role === "admin" ? api("/api/admin/integrations") : Promise.resolve(null), [user.role]);
+  const integrations = useLoad<any>(() => user.role === "admin" ? api("/api/admin/integrations") : Promise.resolve(null), [user.role]);
+  const { data, error, loading, reload } = integrations;
   const storage = useLoad<any>(() => user.role === "admin" ? api("/api/admin/storage/status") : Promise.resolve(null), [user.role]);
   const wechatBindings = useLoad<any>(() => user.role === "admin" ? api("/api/admin/wechat-claw/bindings") : Promise.resolve(null), [user.role]);
   const [activeStep, setActiveStep] = useState(() => {
@@ -2692,10 +2822,25 @@ function SettingsPage({ user }: { user: User }) {
     return ["qb1", "qb2", "qb3"].includes(saved) ? "downloaders" : saved;
   });
   if (user.role !== "admin") return <div className="grid-page"><PersonalWechatClawCard /></div>;
-  if (!data) return <Panel title="设置"><p>正在加载...</p></Panel>;
+  if (!data) return (
+    <Panel title="设置">
+      {loading ? (
+        <p>正在加载设置...</p>
+      ) : (
+        <div className="integration">
+          <p className="error">{error || "设置数据加载失败，请稍后重试。"}</p>
+          <div className="actions">
+            <button type="button" className="primary" onClick={() => reload().catch(() => undefined)}>重新加载</button>
+          </div>
+        </div>
+      )}
+    </Panel>
+  );
 
   const providers = data.providers.filter((provider: any) => ["mteam", "qb1", "qb2", "qb3", "tmdb", "ai", "wechat_claw"].includes(provider.provider));
   const providerById = Object.fromEntries(providers.map((provider: any) => [provider.provider, provider]));
+  const unreadableProviders = providers.filter((provider: any) => provider.configuration_unreadable);
+  const settingsProviderNames: Record<string, string> = { mteam: "M-Team", qb1: "qB1", qb2: "qB2", qb3: "qB3", tmdb: "TMDB", ai: "AI", wechat_claw: "WeChat claw" };
   const wechatClawConnected = Array.isArray(wechatBindings.data?.items) && wechatBindings.data.items.some((binding: any) => binding.connected);
   const steps = [
     { id: "storage", label: "NAS 存储", ready: Boolean(storage.data?.nas_storage_readable) },
@@ -2717,6 +2862,9 @@ function SettingsPage({ user }: { user: User }) {
   return (
     <div className="grid-page settings-flow">
       <Panel title="配置向导">
+        {unreadableProviders.length > 0 && (
+          <p className="error">部分配置由另一套加密密钥保存，当前实例无法读取。请重新填写并保存：{unreadableProviders.map((provider: any) => settingsProviderNames[provider.provider] ?? provider.provider).join("、")}。</p>
+        )}
         <div className="settings-stepper" aria-label="配置步骤">
           {steps.map((step, index) => <button type="button" key={step.id} className={activeStep === step.id ? "settings-step active" : "settings-step"} onClick={() => selectStep(step.id)}>
             <span className={step.ready ? "settings-step-dot ready" : "settings-step-dot pending"}>{index + 1}</span>
@@ -2734,7 +2882,7 @@ function SettingsPage({ user }: { user: User }) {
 
 function providerStepReady(provider: any): boolean {
   const result = provider?.last_test_result;
-  return Boolean(provider?.enabled && result?.success === true && result?.can_enable !== false);
+  return Boolean(!provider?.configuration_unreadable && provider?.enabled && result?.success === true && result?.can_enable !== false);
 }
 
 function DownloadersSettingsCard({ providers, onChanged }: { providers: any[]; onChanged: () => void }) {
@@ -3975,9 +4123,9 @@ function Panel({ title, children }: { title: string; children: ReactNode }) {
   return <section className="panel"><h2>{title}</h2>{children}</section>;
 }
 
-function Metric({ icon: Icon, title, value, source }: { icon?: typeof Film; title: string; value: ReactNode; source: string }) {
+function Metric({ icon: Icon, title, value, source, tone }: { icon?: typeof Film; title: string; value: ReactNode; source: string; tone?: "download" | "upload" | "activity" }) {
   return (
-    <div className="metric">
+    <div className={tone ? `metric metric-${tone}` : "metric"}>
       <small>{Icon && <span className="metric-icon"><Icon size={14} /></span>}{title}</small>
       <strong>{value}</strong>
       {source && <span>{source}</span>}
@@ -3988,7 +4136,7 @@ function Metric({ icon: Icon, title, value, source }: { icon?: typeof Film; titl
 function StorageMetric({ overview }: { overview: any }) {
   const storage = storageDisplay(overview);
   return (
-    <div className="metric storage-metric">
+    <div className="metric storage-metric metric-storage">
       <div className="storage-metric-head">
         <small><span className="metric-icon"><Database size={14} /></span> 存储空间</small>
         <strong className="storage-metric-percent">{storage.value}</strong>
@@ -4057,7 +4205,7 @@ function DownloaderCard({
   }
 
   return (
-    <article className={configured ? "downloader-node" : "downloader-node empty"} role="button" tabIndex={0} onClick={openDownloader} onKeyDown={handleCardKeyDown}>
+    <article className={`downloader-node ${configured ? "" : "empty"} ${online ? "online" : "offline"}`.trim()} role="button" tabIndex={0} onClick={openDownloader} onKeyDown={handleCardKeyDown}>
       <div className="downloader-node-top">
         <div className="downloader-node-title" title={statusTitle}>
           <h3>{displayName}</h3>
@@ -4338,6 +4486,30 @@ function DiscoverCollectionPage({ title, items = [], onBack, onSelect }: { title
   );
 }
 
+function FavoriteButton({ item, detail = false }: { item: any; detail?: boolean }) {
+  const favorites = useFavorites();
+  const active = favorites.isFavorite(item);
+  const busy = favorites.isBusy(item);
+  const label = active ? "取消收藏" : "加入收藏";
+  return (
+    <button
+      className={`${detail ? "detail-favorite-button" : "poster-favorite-button"}${active ? " active" : ""}`}
+      type="button"
+      aria-label={label}
+      title={label}
+      aria-pressed={active}
+      disabled={busy}
+      onClick={(event) => {
+        event.stopPropagation();
+        void favorites.toggle(item);
+      }}
+      onKeyDown={(event) => event.stopPropagation()}
+    >
+      <Heart size={detail ? 19 : 18} fill={active ? "currentColor" : "none"} />
+    </button>
+  );
+}
+
 function DiscoverPosterCard({ item, eager = false, onSelect }: { item: any; eager?: boolean; onSelect: (item: any) => void }) {
   const [infoOpen, setInfoOpen] = useState(false);
   const rating = Number(item.rating ?? 0);
@@ -4376,6 +4548,7 @@ function DiscoverPosterCard({ item, eager = false, onSelect }: { item: any; eage
         <img src={item.poster} alt="" loading={eager ? "eager" : "lazy"} decoding="async" fetchPriority={eager ? "high" : "auto"} onError={handleImageError} />
         <span className="poster-type">{item.media_type === "tv" ? "电视剧" : "电影"}</span>
         {rating > 0 && <span className="poster-rating">{numberLabel(rating, 1)}</span>}
+        <FavoriteButton item={item} />
         <div className="poster-hover">
           {details.map((detail) => <span key={detail}>{detail}</span>)}
         </div>
@@ -4395,7 +4568,8 @@ function MediaDetailPage({
   onPersonSelect,
   onMediaSelect,
   onMTeamSearch,
-  mteamSearching
+  mteamSearching = false,
+  exitLabel = "返回发现"
 }: {
   item: any;
   loading: boolean;
@@ -4403,10 +4577,11 @@ function MediaDetailPage({
   canGoBack: boolean;
   onBack: () => void;
   onExit: () => void;
-  onPersonSelect: (person: any) => void;
+  onPersonSelect?: (person: any) => void;
   onMediaSelect: (item: any) => void;
-  onMTeamSearch: (item: any) => void;
-  mteamSearching: boolean;
+  onMTeamSearch?: (item: any) => void;
+  mteamSearching?: boolean;
+  exitLabel?: string;
 }) {
   const castMembers = Array.isArray(item.cast_members) ? item.cast_members : [];
   const recommendations = Array.isArray(item.recommendations) ? item.recommendations : [];
@@ -4433,12 +4608,17 @@ function MediaDetailPage({
       <div className="tmdb-detail-glass">
         <div className="tmdb-detail-nav">
           {canGoBack && <button className="tmdb-back tmdb-back-icon" type="button" onClick={onBack} aria-label="返回上一层详情" title="返回上一层详情"><ArrowLeft size={18} /></button>}
-          <button className="tmdb-back" type="button" onClick={onExit}>返回发现</button>
+          <button className="tmdb-back" type="button" onClick={onExit}>{exitLabel}</button>
         </div>
-        <button className="tmdb-mteam-search" type="button" onClick={() => onMTeamSearch(item)} disabled={mteamSearching} title="用影片名称在 M-Team 搜索资源">
-          <Radar size={17} />
-          {mteamSearching ? "搜索中" : "M-Team 搜索"}
-        </button>
+        <div className="tmdb-detail-actions">
+          <FavoriteButton item={item} detail />
+          {onMTeamSearch && (
+            <button className="tmdb-mteam-search" type="button" onClick={() => onMTeamSearch(item)} disabled={mteamSearching} title="用影片名称在 M-Team 搜索资源">
+              <Radar size={17} />
+              {mteamSearching ? "搜索中" : "M-Team 搜索"}
+            </button>
+          )}
+        </div>
         {loading && <span className="tmdb-loading">正在读取 TMDB 详情...</span>}
         {error && <p className="error">{error}</p>}
         <div className="tmdb-detail-main">
@@ -4477,12 +4657,18 @@ function MediaDetailPage({
       <section className="tmdb-detail-section">
         <div className="discover-section-header"><h2><span />演员阵容</h2></div>
         <div className="tmdb-cast-rail">
-          {castMembers.map((person: any) => (
+          {castMembers.map((person: any) => onPersonSelect ? (
             <button className="tmdb-person-card" type="button" onClick={() => onPersonSelect(person)} key={person.id}>
               <img src={person.profile} alt="" loading="lazy" decoding="async" onError={handleImageError} />
               <strong>{person.name}</strong>
               <span>{person.character ? `饰 ${person.character}` : "演员"}</span>
             </button>
+          ) : (
+            <div className="tmdb-person-card" key={person.id}>
+              <img src={person.profile} alt="" loading="lazy" decoding="async" onError={handleImageError} />
+              <strong>{person.name}</strong>
+              <span>{person.character ? `饰 ${person.character}` : "演员"}</span>
+            </div>
           ))}
           {!castMembers.length && <p className="muted">暂无演员阵容。</p>}
         </div>
@@ -4943,6 +5129,122 @@ function mediaTmdbId(item: any): string {
   return parts.length > 1 ? parts[parts.length - 1] : id;
 }
 
+function favoriteMonthKey(value: string): string {
+  const normalized = /T/.test(value) && !/(Z|[+-]\d{2}:?\d{2})$/.test(value) ? `${value}Z` : value;
+  const date = new Date(normalized);
+  if (Number.isNaN(date.getTime())) return "unknown";
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function favoriteMonthLabel(key: string): string {
+  if (key === "unknown") return "时间未知";
+  const [year, month] = key.split("-");
+  return `${year}年${Number(month)}月`;
+}
+
+function FavoritesPage() {
+  const favorites = useFavorites();
+  const [viewMode, setViewMode] = useState<"grid" | "timeline">("grid");
+  const [selectedMedia, setSelectedMedia] = useState<any | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState("");
+
+  const timelineGroups = useMemo(() => {
+    const groups = new Map<string, any[]>();
+    favorites.items.forEach((item) => {
+      const key = favoriteMonthKey(String(item.favorited_at || ""));
+      groups.set(key, [...(groups.get(key) || []), item]);
+    });
+    return Array.from(groups.entries()).map(([key, items]) => ({ key, label: favoriteMonthLabel(key), items }));
+  }, [favorites.items]);
+
+  async function openFavoriteDetail(item: any) {
+    const tmdbId = mediaTmdbId(item);
+    if (!tmdbId || !item.media_type) return;
+    setSelectedMedia(item);
+    setDetailLoading(true);
+    setDetailError("");
+    window.requestAnimationFrame(() => window.scrollTo(0, 0));
+    try {
+      setSelectedMedia(await api<any>(`/api/tmdb/media/${item.media_type}/${tmdbId}`));
+    } catch (err) {
+      setDetailError((err as Error).message);
+    } finally {
+      setDetailLoading(false);
+    }
+  }
+
+  if (selectedMedia) {
+    return (
+      <MediaDetailPage
+        item={selectedMedia}
+        loading={detailLoading}
+        error={detailError}
+        canGoBack={false}
+        onBack={() => undefined}
+        onExit={() => setSelectedMedia(null)}
+        onMediaSelect={openFavoriteDetail}
+        exitLabel="返回收藏"
+      />
+    );
+  }
+
+  return (
+    <div className="grid-page favorites-page">
+      <section className="favorites-toolbar">
+        <div>
+          <span className="favorites-eyebrow">MY COLLECTION</span>
+          <h2>我的收藏</h2>
+          <p>{favorites.items.length ? `已收藏 ${favorites.items.length} 部作品` : "喜欢的影片会在这里汇集"}</p>
+        </div>
+        <button
+          className={viewMode === "timeline" ? "favorites-view-button active" : "favorites-view-button"}
+          type="button"
+          onClick={() => setViewMode((current) => current === "grid" ? "timeline" : "grid")}
+          aria-label={viewMode === "grid" ? "切换到收藏时间视图" : "切换到海报视图"}
+          title={viewMode === "grid" ? "按收藏时间查看" : "返回海报视图"}
+        >
+          {viewMode === "grid" ? <CalendarDays size={20} /> : <Grid3X3 size={20} />}
+        </button>
+      </section>
+
+      {favorites.error && <p className="error">{favorites.error}</p>}
+      {favorites.loading && !favorites.items.length && <Panel title="收藏"><p>正在读取收藏...</p></Panel>}
+      {!favorites.loading && !favorites.items.length && (
+        <section className="favorites-empty">
+          <span><Heart size={30} /></span>
+          <h3>还没有收藏影片</h3>
+          <p>在发现页点击海报右下角的爱心，影片就会出现在这里。</p>
+        </section>
+      )}
+
+      {favorites.items.length > 0 && viewMode === "grid" && (
+        <div className="poster-grid favorites-grid">
+          {favorites.items.map((item, index) => <DiscoverPosterCard item={item} eager={index < eagerPosterLimit()} onSelect={openFavoriteDetail} key={favoriteMediaKey(item)} />)}
+        </div>
+      )}
+
+      {favorites.items.length > 0 && viewMode === "timeline" && (
+        <div className="favorites-timeline">
+          {timelineGroups.map((group) => (
+            <section className="favorites-time-group" key={group.key}>
+              <header><h3>{group.label}</h3><span>{group.items.length} 部</span></header>
+              <div className="poster-grid favorites-grid">
+                {group.items.map((item) => (
+                  <div className="favorite-time-item" key={favoriteMediaKey(item)}>
+                    <DiscoverPosterCard item={item} onSelect={openFavoriteDetail} />
+                    <time dateTime={item.favorited_at}>收藏于 {formatDateLabel(item.favorited_at)}</time>
+                  </div>
+                ))}
+              </div>
+            </section>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ratingStars(value: number): boolean[] {
   const filled = Math.max(0, Math.min(10, Math.round(Number(value || 0))));
   return Array.from({ length: 10 }, (_, index) => index < filled);
@@ -5031,6 +5333,7 @@ function mteamResourceDetailUrl(item: any): string {
 
 const pages: Record<NavKey, (props: { user: User; resetToken?: number; selectedDownloader?: string; onNavigate?: (key: NavKey) => void; onOpenDownloader?: (downloaderId: string) => void }) => ReactNode> = {
   discover: DiscoverPage,
+  favorites: FavoritesPage,
   dashboard: DashboardPage,
   downloads: DownloadsPage,
   notifications: NotificationsAssistantPage,

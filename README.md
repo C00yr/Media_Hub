@@ -15,23 +15,24 @@ PT Media Hub is a NAS-first Docker Web App for media discovery, PT download moni
 
 ## Local Development
 
-Backend:
+### Windows one-click start (recommended)
+
+1. Double-click `start-dev.cmd` in the project root.
+2. Open `http://127.0.0.1:5173`.
+3. Double-click `stop-dev.cmd` when finished.
+
+The launcher always stores local development data in `data/local`, while NAS/Docker stores its data in the mounted `/data` directory. It refuses to replace an existing frontend on port 5173, automatically selects a backend port from 18001-18010, and does not use Uvicorn `--reload`. This prevents a local development process from sharing the NAS SQLite database or generating an uncontrolled Windows reload log.
+
+On the first run, install dependencies once:
 
 ```bash
 cd backend
 py -m pip install -e ".[test]"
-py -m uvicorn app.main:app --reload
-```
-
-Frontend:
-
-```bash
 cd frontend
 npm install
-npm run dev
 ```
 
-Open `http://localhost:5173`.
+For manual advanced startup, use the same `APP_RUNTIME_PROFILE=local`, `APP_DATA_DIR=<project>/data/local`, database, and secret-file values used by `scripts/start-dev.ps1`. Do not use the NAS `/data` path and do not add `--reload` on Windows.
 
 ## Docker
 
@@ -47,6 +48,8 @@ Open `http://localhost:8000`.
 The app generates its runtime encryption/JWT secrets on first start and stores them in
 `data/runtime-secrets.json`. Keep the `data` folder when upgrading or recreating containers.
 Advanced users can still create `.env` from `.env.example` to override network/storage defaults.
+
+Source-code development and NAS deployment are separate application instances. Do not copy the NAS database into `data/local`, and do not point local `DATABASE_URL` at a NAS share. The backend validates this at startup and rejects accidental cross-profile SQLite paths.
 
 ## TMDB Network Modes
 

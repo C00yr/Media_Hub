@@ -6,6 +6,9 @@
 .tmp-*
 _exports/
 .npm-cache/
+.pnpm-store/
+frontend/pnpm-lock.yaml
+frontend/pnpm-workspace.yaml
 data/
 backend/data/
 backend/.pytest_cache/

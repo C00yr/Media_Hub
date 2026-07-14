@@ -5,6 +5,8 @@ services:
       dockerfile: Dockerfile
     image: pt-media-hub:0.1.0-mvp
     environment:
+      APP_RUNTIME_PROFILE: nas
+      APP_DATA_DIR: /data
       DATABASE_URL: sqlite:////data/pt_media_hub.db
       ENVIRONMENT: production
       STATIC_DIR: /app/static

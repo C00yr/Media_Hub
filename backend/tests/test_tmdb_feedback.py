@@ -153,6 +153,48 @@ def test_tmdb_discover_lists_are_lightweight(monkeypatch):
     assert payload["trending"][0]["poster"].startswith("/api/tmdb/image/w342/")
     assert payload["trending"][0]["genres"] == ["Action"]
 
+def test_tmdb_discover_genres_use_chinese_overrides_and_hide_tv_movie(monkeypatch):
+    def fake_get(self, path, params):
+        if path == "/genre/tv/list":
+            return {
+                "genres": [
+                    {"id": 10765, "name": "Sci-Fi & Fantasy"},
+                    {"id": 10768, "name": "War & Politics"},
+                    {"id": 18, "name": "剧情"},
+                ]
+            }
+        return {"genres": [{"id": 10770, "name": "电视电影"}, {"id": 28, "name": "动作"}]}
+
+    monkeypatch.setattr(TmdbAdapter, "_get", fake_get)
+    adapter = TmdbAdapter({"mode": "direct", "bearer_token": "token", "language": "zh-CN-filter-test"})
+    options = adapter.get_discover_filter_options()
+
+    assert options["genres"]["tv"] == [
+        {"id": "10765", "name": "科幻与奇幻"},
+        {"id": "10768", "name": "战争与政治"},
+        {"id": "18", "name": "剧情"},
+    ]
+    assert options["genres"]["movie"] == [{"id": "28", "name": "动作"}]
+
+
+def test_tmdb_discover_other_region_expands_to_unlisted_countries(monkeypatch):
+    discover_params = []
+
+    def fake_get(self, path, params):
+        if path.startswith("/genre/"):
+            return {"genres": []}
+        discover_params.append(params)
+        return {"page": 1, "total_pages": 1, "total_results": 0, "results": []}
+
+    monkeypatch.setattr(TmdbAdapter, "_get", fake_get)
+    adapter = TmdbAdapter({"mode": "direct", "bearer_token": "token", "language": "zh-CN-region-test"})
+    adapter.discover_media({"media_type": "movie", "region": "OTHER", "include_options": False})
+
+    countries = set(discover_params[0]["with_origin_country"].split("|"))
+    assert {"CA", "AU", "ES", "IT", "BR"}.issubset(countries)
+    assert countries.isdisjoint(tmdb_client.DISCOVER_PRIMARY_REGION_CODES)
+    assert "region" not in discover_params[0]
+
 
 class FakeImageHeaders:
     def get_content_type(self):
@@ -274,7 +316,21 @@ def test_cached_discover_does_not_schedule_immediate_refresh(monkeypatch):
 
     db = SessionLocal()
     try:
-        routes.set_preload_cache(db, "discover", {"configured": True, "trending": [], "popular_movies": [], "popular_tv": [], "top_rated_movies": [], "top_rated_tv": []})
+        configured = routes.enabled_tmdb_discover_config(db) is not None
+        routes.set_preload_cache(
+            db,
+            "discover",
+            {
+                "source": "tmdb",
+                "configured": configured,
+                "trending": [],
+                "popular_movies": [],
+                "popular_tv": [],
+                "top_rated_movies": [],
+                "top_rated_tv": [],
+            },
+            context=routes.tmdb_discover_cache_context(db),
+        )
     finally:
         db.close()
 
@@ -286,6 +342,17 @@ def test_cached_discover_does_not_schedule_immediate_refresh(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["_preload"]["preloaded"] is True
+
+
+def test_discover_filter_without_tmdb_never_returns_mock_items(monkeypatch):
+    monkeypatch.setattr(routes, "enabled_tmdb_discover_config", lambda _db: None)
+
+    result = routes.build_discover_filter_payload(None, routes.default_discover_filter())
+
+    assert result["source"] == "tmdb"
+    assert result["configured"] is False
+    assert result["items"] == []
+    assert result["next_page"] is None
 
 
 def test_qb_and_mteam_disable_environment_proxy(monkeypatch):

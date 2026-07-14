@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.sqlite import JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -198,6 +198,19 @@ class Notification(Base):
     read: Mapped[bool] = mapped_column(Boolean, default=False)
     source: Mapped[str] = mapped_column(String(64), default="app")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class MediaFavorite(Base):
+    __tablename__ = "media_favorites"
+    __table_args__ = (UniqueConstraint("user_id", "media_type", "tmdb_id", name="uq_media_favorite_user_title"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    media_type: Mapped[str] = mapped_column(String(16), index=True)
+    tmdb_id: Mapped[int] = mapped_column(Integer, index=True)
+    media_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class Setting(Base):
