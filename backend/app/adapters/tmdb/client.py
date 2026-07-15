@@ -8,10 +8,11 @@ from contextlib import contextmanager
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
-from urllib.request import ProxyHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from app.adapters.base import MetadataAdapter
 from app.config.settings import get_settings
+from app.services.integrations import TMDB_PROXY_DOMAIN_ALLOWLIST
 
 
 TMDB_API_BASE = "https://api.themoviedb.org/3"
@@ -19,7 +20,6 @@ TMDB_IMAGE_PROXY_BASE = "/api/tmdb/image"
 PLACEHOLDER_POSTER = "https://placehold.co/342x513?text=No+Poster"
 PLACEHOLDER_PROFILE = "https://placehold.co/185x278?text=No+Photo"
 TMDB_DOH_URL = "https://doh.pub/resolve"
-DEFAULT_TMDB_PROXY_URL = "http://mihomo:7890"
 DISCOVER_SORT_OPTIONS = [
     {"value": "popularity.desc", "label": "综合排序"},
     {"value": "release_date.desc", "label": "首播时间优先"},
@@ -112,21 +112,15 @@ class TmdbImageError(RuntimeError):
 
 class TmdbAdapter(MetadataAdapter):
     def __init__(self, config: dict[str, Any]):
-        settings = get_settings()
         self.api_key = str(config.get("api_key") or "").strip()
         self.bearer_token = str(config.get("bearer_token") or config.get("token") or "").strip()
         self.language = str(config.get("language") or "zh-CN").strip()
         self.region = str(config.get("region") or "CN").strip()
-        self.mode = str(config.get("mode") or settings.tmdb_mode or "direct").strip().lower()
-        if self.mode not in {"direct", "proxy"}:
-            self.mode = "direct"
-        self.proxy_url = str(config.get("proxy_url") or settings.tmdb_proxy_url or DEFAULT_TMDB_PROXY_URL).strip()
+        self.proxy_enabled, self.proxy_url, self.proxy_domains = resolve_tmdb_proxy_settings(config)
         self.base_url = str(config.get("endpoint") or TMDB_API_BASE).strip().rstrip("/")
         self.timeout = int(config.get("timeout") or 12)
         if not self.api_key and not self.bearer_token:
             raise TmdbConfigError("TMDB API Key or Bearer Token is not configured")
-        if self.mode == "proxy" and not self.proxy_url:
-            raise TmdbConfigError("TMDB proxy URL is not configured")
 
     def search_media(self, query: str) -> list[dict[str, Any]]:
         if not query.strip():
@@ -363,13 +357,7 @@ class TmdbAdapter(MetadataAdapter):
         }
 
     def network_detail(self) -> dict[str, Any]:
-        return {
-            "network_mode": self.mode,
-            "route_label": "TMDB：mihomo VPN 代理" if self.mode == "proxy" else "TMDB：直连 + DoH",
-            "proxy_enabled": self.mode == "proxy",
-            "proxy_url": _display_proxy_url(self.proxy_url) if self.mode == "proxy" else "",
-            "non_tmdb_policy": "direct_only",
-        }
+        return tmdb_network_detail(self.proxy_enabled, self.proxy_url, self.proxy_domains)
 
     def _test_image_connection(self) -> dict[str, Any]:
         payload = self._get("/trending/all/day", {"include_adult": "false"})
@@ -388,7 +376,7 @@ class TmdbAdapter(MetadataAdapter):
             headers={"Accept": "image/jpeg,image/png,image/webp,*/*", "User-Agent": "PT-Media-Hub"},
         )
         try:
-            with open_tmdb_network_request(request, self.mode, self.proxy_url, self.timeout) as response:
+            with open_tmdb_network_request(request, self.proxy_enabled, self.proxy_url, self.proxy_domains, self.timeout) as response:
                 content = response.read(32)
                 if not _looks_like_image_bytes(content):
                     content_type = response.headers.get_content_type() if response.headers else ""
@@ -468,7 +456,7 @@ class TmdbAdapter(MetadataAdapter):
         if self.bearer_token:
             headers["Authorization"] = f"Bearer {self.bearer_token}"
         request = Request(url, headers=headers)
-        with open_tmdb_network_request(request, self.mode, self.proxy_url, self.timeout) as response:
+        with open_tmdb_network_request(request, self.proxy_enabled, self.proxy_url, self.proxy_domains, self.timeout) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def _normalize_item(self, item: dict[str, Any]) -> dict[str, Any]:
@@ -582,10 +570,59 @@ class TmdbAdapter(MetadataAdapter):
 
 
 def _display_proxy_url(value: str) -> str:
-    parsed = urlparse(value if "://" in value else f"http://{value}")
-    if not parsed.netloc:
-        return value
-    return parsed.netloc
+    parsed = urlparse(value)
+    if not parsed.hostname:
+        return ""
+    return f"{parsed.hostname}:{parsed.port}" if parsed.port else parsed.hostname
+
+
+def resolve_tmdb_proxy_settings(config: dict[str, Any] | None = None) -> tuple[bool, str, frozenset[str]]:
+    config = config or {}
+    settings = get_settings()
+    if "proxy_enabled" in config:
+        enabled = config.get("proxy_enabled") is True
+    elif str(config.get("mode") or "").strip().lower() in {"direct", "proxy"}:
+        enabled = str(config.get("mode")).strip().lower() == "proxy"
+    else:
+        enabled = str(settings.tmdb_mode or "direct").strip().lower() == "proxy"
+
+    raw_domains = config.get("proxy_domains") if "proxy_domains" in config else list(TMDB_PROXY_DOMAIN_ALLOWLIST)
+    if not isinstance(raw_domains, (list, tuple, set, frozenset)):
+        raw_domains = []
+    domains = frozenset(domain for domain in TMDB_PROXY_DOMAIN_ALLOWLIST if domain in raw_domains)
+    proxy_url = str(config.get("proxy_url") or settings.tmdb_proxy_url or "").strip()
+    if enabled:
+        parsed = urlparse(proxy_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise TmdbConfigError("代理地址必须是有效的 http:// 或 https:// 地址")
+        if not domains:
+            raise TmdbConfigError("启用代理时至少选择一个需要代理的网站")
+    return enabled, proxy_url, domains
+
+
+def tmdb_request_uses_proxy(url: str, proxy_enabled: bool, proxy_domains: set[str] | frozenset[str]) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return proxy_enabled and host in TMDB_PROXY_DOMAIN_ALLOWLIST and host in proxy_domains
+
+
+def tmdb_network_detail(proxy_enabled: bool, proxy_url: str, proxy_domains: set[str] | frozenset[str]) -> dict[str, Any]:
+    routes = {
+        domain: "proxy" if proxy_enabled and domain in proxy_domains else "direct"
+        for domain in TMDB_PROXY_DOMAIN_ALLOWLIST
+    }
+    active_proxy_domains = [domain for domain in TMDB_PROXY_DOMAIN_ALLOWLIST if routes[domain] == "proxy"]
+    return {
+        "network_mode": "selective_proxy" if active_proxy_domains else "direct",
+        "route_label": "TMDB：精细代理" if active_proxy_domains else "TMDB：直连 + DoH",
+        "proxy_enabled": bool(active_proxy_domains),
+        "proxy_url": _display_proxy_url(proxy_url) if active_proxy_domains else "",
+        "proxy_domains": active_proxy_domains,
+        "domain_routes": routes,
+        "non_tmdb_policy": "direct_only",
+    }
 
 
 def _tmdb_image_url(size: str, image_path: Any, fallback: str) -> str:
@@ -609,9 +646,18 @@ def _looks_like_image_bytes(content: bytes) -> bool:
     return False
 
 
-def open_tmdb_network_request(request: Request, mode: str, proxy_url: str, timeout: int):
-    request.tmdb_proxy_url = proxy_url or DEFAULT_TMDB_PROXY_URL
-    opener = _urlopen_with_proxy if mode == "proxy" else _urlopen_with_doh_ipv4
+def open_tmdb_network_request(
+    request: Request,
+    proxy_enabled: bool,
+    proxy_url: str,
+    proxy_domains: set[str] | frozenset[str],
+    timeout: int,
+):
+    use_proxy = tmdb_request_uses_proxy(request.full_url, proxy_enabled, proxy_domains)
+    request.tmdb_proxy_url = proxy_url
+    request.tmdb_proxy_domains = frozenset(proxy_domains)
+    request.tmdb_network_mode = "proxy" if use_proxy else "direct"
+    opener = _urlopen_with_proxy if use_proxy else _urlopen_with_doh_ipv4
     return opener(request, timeout=timeout)
 
 
@@ -620,9 +666,42 @@ def _urlopen_no_proxy(request: Request, timeout: int):
 
 
 def _urlopen_with_proxy(request: Request, timeout: int):
-    proxy_url = getattr(request, "tmdb_proxy_url", "") or DEFAULT_TMDB_PROXY_URL
-    opener = build_opener(ProxyHandler({"http": proxy_url, "https": proxy_url}))
+    proxy_url = str(getattr(request, "tmdb_proxy_url", "") or "").strip()
+    parsed_proxy = urlparse(proxy_url)
+    if parsed_proxy.scheme not in {"http", "https"} or not parsed_proxy.hostname:
+        raise URLError("TMDB proxy URL is missing or invalid")
+    allowed_domains = getattr(request, "tmdb_proxy_domains", frozenset())
+    if not tmdb_request_uses_proxy(request.full_url, True, allowed_domains):
+        try:
+            blocked_host = (urlparse(request.full_url).hostname or "unknown").lower()
+        except ValueError:
+            blocked_host = "invalid"
+        raise URLError(f"TMDB proxy policy blocked host: {blocked_host}")
+    original_host = (urlparse(request.full_url).hostname or "").lower()
+    opener = build_opener(
+        ProxyHandler({"http": proxy_url, "https": proxy_url}),
+        _SameHostProxyRedirectHandler(original_host, allowed_domains),
+    )
     return opener.open(request, timeout=timeout)
+
+
+class _SameHostProxyRedirectHandler(HTTPRedirectHandler):
+    def __init__(self, original_host: str, allowed_domains: set[str] | frozenset[str] | None = None):
+        self.original_host = original_host
+        self.allowed_domains = frozenset(allowed_domains or {original_host})
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            new_host = (urlparse(newurl).hostname or "").lower()
+        except ValueError:
+            new_host = ""
+        if (
+            not new_host
+            or new_host != self.original_host
+            or not tmdb_request_uses_proxy(newurl, True, self.allowed_domains)
+        ):
+            raise URLError(f"Cross-host proxy redirect blocked: {self.original_host} -> {new_host or 'unknown'}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def _urlopen_with_ipv4_fallback(request: Request, timeout: int):

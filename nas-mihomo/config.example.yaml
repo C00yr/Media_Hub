@@ -1,40 +1,79 @@
-# Copy this file to config.yaml, then replace the sample proxy with nodes
-# exported from Clash Verge or your proxy provider.
+# Media Hub 专用 Mihomo 配置模板
+#
+# 使用方法：
+# 1. 复制为 config.yaml（config.yaml 已被 git 忽略）。
+# 2. 替换下面的订阅地址和代理密码。
+# 3. 让 Mihomo 与 Media Hub 位于同一个 Docker 网络。
+# 4. 在 Media Hub「设置 > 媒体搜索 > 代理配置」中填写：
+#    http://mediahub:你的代理密码@mihomo:7890
+#
+# Media Hub 已经负责判断哪些域名允许使用代理，因此这里不需要再写
+# api.themoviedb.org / image.tmdb.org 规则，也不要开启 TUN 或透明代理。
+
 mixed-port: 7890
-external-controller: 0.0.0.0:9090
-allow-lan: false
+allow-lan: true
+bind-address: "*"
 mode: rule
 log-level: info
+ipv6: false
+unified-delay: true
+tcp-concurrent: true
 
+# mixed-port 对同一 Docker 网络开放，因此默认增加认证。
+# 请替换为只包含字母和数字的长随机密码，填写代理 URL 时无需额外编码。
+authentication:
+  - "mediahub:CHANGE_ME_TO_A_LONG_RANDOM_PASSWORD"
+
+profile:
+  store-selected: true
+
+# 这是代理节点的来源，不是 Media Hub 的 TMDB 配置。
+# 将 url 替换为代理服务商提供的 Clash / Mihomo 订阅地址。
+proxy-providers:
+  media-hub-subscription:
+    type: http
+    url: "https://REPLACE_WITH_YOUR_SUBSCRIPTION_URL"
+    path: ./proxy_providers/media-hub-subscription.yaml
+    interval: 21600
+    proxy: DIRECT
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 300
+      timeout: 5000
+      lazy: true
+      expected-status: 204
+
+# 自动选择订阅中延迟较低的可用节点。
+proxy-groups:
+  - name: MEDIA-HUB-PROXY
+    type: url-test
+    use:
+      - media-hub-subscription
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 80
+    lazy: true
+    timeout: 5000
+    expected-status: 204
+
+# 这里使用 MATCH 是有意设计：
+# 只有 Media Hub 已批准的请求才会进入这个专用代理端口，Mihomo 只负责转发。
+rules:
+  - MATCH,MEDIA-HUB-PROXY
+
+# 普通 HTTP 代理模式不要求 Media Hub 使用 Mihomo DNS，但 Mihomo 仍需解析
+# 订阅节点的域名。以下配置避免依赖容器内不确定的默认 DNS。
 dns:
   enable: true
-  listen: 0.0.0.0:1053
   ipv6: false
-  enhanced-mode: fake-ip
+  enhanced-mode: redir-host
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
   nameserver:
     - https://doh.pub/dns-query
     - https://dns.alidns.com/dns-query
-
-proxies:
-  - name: replace-with-your-node
-    type: ss
-    server: 127.0.0.1
-    port: 8388
-    cipher: aes-128-gcm
-    password: replace-me
-
-proxy-groups:
-  - name: TMDB-PROXY
-    type: url-test
-    proxies:
-      - replace-with-your-node
-    url: https://api.themoviedb.org/3/configuration
-    interval: 300
-    tolerance: 100
-
-rules:
-  - DOMAIN-SUFFIX,themoviedb.org,TMDB-PROXY
-  - DOMAIN-SUFFIX,tmdb.org,TMDB-PROXY
-  - DOMAIN-SUFFIX,tmdb.com,TMDB-PROXY
-  - DOMAIN-SUFFIX,image.tmdb.org,TMDB-PROXY
-  - MATCH,DIRECT
+  proxy-server-nameserver:
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query

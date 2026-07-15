@@ -5,6 +5,7 @@ import {
   Bell,
   CalendarDays,
   Check,
+  CircleAlert,
   Clock3,
   Coins,
   Copy,
@@ -122,6 +123,20 @@ const TMDB_REGION_OPTIONS = [
   { value: "KR", label: "韩国" },
 ];
 
+const TMDB_PROXY_DOMAIN_OPTIONS = [
+  {
+    domain: "api.themoviedb.org",
+    label: "TMDB 数据接口",
+    description: "用于搜索、发现、影视详情、演职员、趋势和筛选数据。网络受限时使用代理通常可提升返回速度、降低超时概率并提高稳定性。",
+  },
+  {
+    domain: "image.tmdb.org",
+    label: "TMDB 图片资源",
+    description: "用于海报、背景图、头像和 Logo。网络受限时使用代理通常可减少图片空白，提高加载与缓存成功率。",
+  },
+] as const;
+const TMDB_PROXY_DOMAINS = TMDB_PROXY_DOMAIN_OPTIONS.map((option) => option.domain);
+
 type IntegrationTestResult = {
   success?: boolean;
   state?: "draft";
@@ -139,6 +154,8 @@ type IntegrationTestResult = {
     route_label?: string;
     proxy_enabled?: boolean;
     proxy_url?: string;
+    proxy_domains?: string[];
+    domain_routes?: Record<string, "proxy" | "direct">;
     non_tmdb_policy?: string;
     image_host?: string;
     image_probe?: {
@@ -151,10 +168,11 @@ type IntegrationTestResult = {
 };
 
 type TmdbForm = {
-  mode: string;
   api_key: string;
   bearer_token: string;
+  proxy_enabled: boolean;
   proxy_url: string;
+  proxy_domains: string[];
   language: string;
   region: string;
   timeout: string;
@@ -1735,7 +1753,7 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
             <>
               {loading && !data && <Panel title="发现"><p>正在从 TMDB 加载片单...</p></Panel>}
               {error && <Panel title="TMDB 获取失败"><p className="error">{error}</p></Panel>}
-              {data && !data.configured && <Panel title="需要配置 TMDB"><p>{data.message}</p><p className="muted">进入“设置”，在 TMDB 配置里填写 API Key 或 Bearer Token，保存并启用后再回到发现页。</p></Panel>}
+              {data && !data.configured && <Panel title="需要配置媒体搜索"><p>{data.message}</p><p className="muted">进入“设置”的“媒体搜索”，填写 TMDB API Key 或 Bearer Token，保存并启用后再回到发现页。</p></Panel>}
               {lists.map((list, index) => <PosterRail title={list.title} items={list.items} eagerLimit={index === 0 ? eagerPosterLimit() : 0} onMore={() => setExpandedDiscoverTitle(list.title)} onSelect={openMediaDetail} key={list.title} />)}
             </>
           )}
@@ -2819,7 +2837,8 @@ function SettingsPage({ user }: { user: User }) {
   const wechatBindings = useLoad<any>(() => user.role === "admin" ? api("/api/admin/wechat-claw/bindings") : Promise.resolve(null), [user.role]);
   const [activeStep, setActiveStep] = useState(() => {
     const saved = window.sessionStorage.getItem("ptmh.settings.activeStep") || "storage";
-    return ["qb1", "qb2", "qb3"].includes(saved) ? "downloaders" : saved;
+    if (["qb1", "qb2", "qb3"].includes(saved)) return "downloaders";
+    return saved === "tmdb" ? "media_search" : saved;
   });
   if (user.role !== "admin") return <div className="grid-page"><PersonalWechatClawCard /></div>;
   if (!data) return (
@@ -2846,7 +2865,7 @@ function SettingsPage({ user }: { user: User }) {
     { id: "storage", label: "NAS 存储", ready: Boolean(storage.data?.nas_storage_readable) },
     { id: "mteam", label: "M-Team", ready: providerStepReady(providerById.mteam) },
     { id: "downloaders", label: "下载器", ready: ["qb1", "qb2", "qb3"].every((id) => providerStepReady(providerById[id])) },
-    { id: "tmdb", label: "TMDB", ready: providerStepReady(providerById.tmdb) },
+    { id: "media_search", label: "媒体搜索", ready: providerStepReady(providerById.tmdb) },
     { id: "ai", label: "AI", ready: providerStepReady(providerById.ai) },
     { id: "wechat_claw", label: "WeChat claw", ready: providerStepReady(providerById.wechat_claw) && wechatClawConnected },
   ];
@@ -2874,7 +2893,7 @@ function SettingsPage({ user }: { user: User }) {
         <p className="muted">按顺序完成连接测试；绿点表示配置已验证，红点表示尚未配置或测试未通过。点击任一步即可切换到对应配置。</p>
       </Panel>
       <div className="settings-active-card" id="settings-active-card" key={activeStep}>
-        {activeStep === "storage" ? <StorageSettingsCard status={storage.data} loading={storage.loading} error={storage.error} /> : activeStep === "downloaders" ? <DownloadersSettingsCard providers={[providerById.qb1, providerById.qb2, providerById.qb3]} onChanged={reload} /> : activeProvider ? <IntegrationEditor provider={activeProvider} onChanged={reload} /> : <Panel title="配置"><p className="muted">该配置项不可用。</p></Panel>}
+        {activeStep === "storage" ? <StorageSettingsCard status={storage.data} loading={storage.loading} error={storage.error} /> : activeStep === "downloaders" ? <DownloadersSettingsCard providers={[providerById.qb1, providerById.qb2, providerById.qb3]} onChanged={reload} /> : activeStep === "media_search" ? <MediaSearchSettingsCard provider={providerById.tmdb} onChanged={reload} /> : activeProvider ? <IntegrationEditor provider={activeProvider} onChanged={reload} /> : <Panel title="配置"><p className="muted">该配置项不可用。</p></Panel>}
       </div>
     </div>
   );
@@ -2924,7 +2943,6 @@ function StorageSettingsCard({ status, loading, error }: { status: any; loading:
 
 function IntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
   if (provider.provider === "mteam") return <MTeamIntegrationEditor provider={provider} onChanged={onChanged} />;
-  if (provider.provider === "tmdb") return <TmdbIntegrationEditor provider={provider} onChanged={onChanged} />;
   if (provider.provider === "ai") return <AiIntegrationEditor provider={provider} onChanged={onChanged} />;
   if (provider.provider === "wechat_claw") return <WechatClawIntegrationEditor provider={provider} onChanged={onChanged} />;
   if (["qb1", "qb2", "qb3"].includes(provider.provider)) return <QbIntegrationEditor provider={provider} onChanged={onChanged} />;
@@ -3783,14 +3801,17 @@ function MTeamIntegrationEditor({ provider, onChanged }: { provider: any; onChan
   );
 }
 
-function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
+function MediaSearchSettingsCard({ provider, onChanged }: { provider: any; onChanged: () => void }) {
   const saved = provider.saved_payload ?? {};
-  const initialMode = ["direct", "proxy"].includes(String(saved.mode ?? "")) ? String(saved.mode) : "direct";
+  const savedProxyDomains = Array.isArray(saved.proxy_domains)
+    ? saved.proxy_domains.filter((domain: string) => TMDB_PROXY_DOMAINS.includes(domain as typeof TMDB_PROXY_DOMAINS[number]))
+    : [...TMDB_PROXY_DOMAINS];
   const [form, setForm] = useState<TmdbForm>({
-    mode: initialMode,
     api_key: String(saved.api_key ?? ""),
     bearer_token: String(saved.bearer_token ?? ""),
-    proxy_url: String(saved.proxy_url ?? "http://mihomo:7890"),
+    proxy_enabled: typeof saved.proxy_enabled === "boolean" ? saved.proxy_enabled : saved.mode === "proxy",
+    proxy_url: String(saved.proxy_url ?? "http://host.docker.internal:7890"),
+    proxy_domains: savedProxyDomains,
     language: String(saved.language ?? "zh-CN"),
     region: String(saved.region ?? "CN"),
     timeout: String(saved.timeout ?? "12"),
@@ -3802,16 +3823,26 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
   const result = localResult ?? provider.last_test_result;
   const canEnable = result?.provider === "tmdb" && result?.mode === "real" && result?.can_enable === true;
 
-  function updateField(key: keyof TmdbForm, value: string) {
+  function updateField<K extends keyof TmdbForm>(key: K, value: TmdbForm[K]) {
     setForm((current) => ({ ...current, [key]: value }));
+  }
+
+  function toggleProxyDomain(domain: string) {
+    setForm((current) => ({
+      ...current,
+      proxy_domains: current.proxy_domains.includes(domain)
+        ? current.proxy_domains.filter((item) => item !== domain)
+        : [...current.proxy_domains, domain],
+    }));
   }
 
   function payload() {
     return {
-      mode: form.mode,
       api_key: form.api_key.trim(),
       bearer_token: form.bearer_token.trim(),
-      proxy_url: form.proxy_url.trim() || "http://mihomo:7890",
+      proxy_enabled: form.proxy_enabled,
+      proxy_url: form.proxy_url.trim(),
+      proxy_domains: form.proxy_domains,
       language: form.language.trim() || "zh-CN",
       region: form.region.trim() || "CN",
       timeout: Number(form.timeout) || 12,
@@ -3830,8 +3861,8 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
         mode: "real",
         can_enable: false,
         message: "草稿已保存。",
-        explanation: "密钥已保存。",
-        next_step: "点击“保存并测试”，确认连接后再启用 TMDB。",
+        explanation: "媒体源凭据和精细代理策略已保存。",
+        next_step: "点击“保存并测试”，确认数据接口和图片资源均可访问。",
       });
       onChanged();
     } catch (err) {
@@ -3870,11 +3901,35 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
     }
   }
 
-  const isProxyMode = form.mode === "proxy";
+  let proxyValidationMessage = "";
+  if (form.proxy_enabled) {
+    try {
+      const parsed = new URL(form.proxy_url);
+      if (!["http:", "https:"].includes(parsed.protocol) || !parsed.hostname) proxyValidationMessage = "代理地址必须是有效的 http:// 或 https:// 地址。";
+    } catch {
+      proxyValidationMessage = "代理地址必须是有效的 http:// 或 https:// 地址。";
+    }
+    if (!form.proxy_domains.length) proxyValidationMessage = "启用代理时至少选择一个需要代理的网站。";
+  }
 
   return (
-    <Panel title="TMDB 配置">
-      <div className="integration tmdb-editor">
+    <div className="media-search-settings">
+      <Panel title="媒体源">
+        <div className="integration media-source-selector">
+          <label>当前媒体源
+            <select value="tmdb" onChange={() => undefined}>
+              <option value="tmdb">TMDB（当前支持）</option>
+            </select>
+          </label>
+          <div className="field-help compact-help">
+            <strong>媒体搜索来源</strong>
+            <span>当前由 TMDB 提供电影、剧集、演员、趋势和图片信息；后续可以在这里继续增加其他媒体源。</span>
+          </div>
+        </div>
+      </Panel>
+
+      <Panel title="TMDB 配置">
+        <div className="integration tmdb-editor">
         <div className="notice info">
           <strong>影视资料库</strong>
           <span>配置后，可在发现页和 AI 助手中查询电影、剧集和演员信息。</span>
@@ -3897,40 +3952,56 @@ function TmdbIntegrationEditor({ provider, onChanged }: { provider: any; onChang
         <button className="inline-tool" type="button" onClick={() => setShowAdvanced((value) => !value)}>
           <SlidersHorizontal size={16} /> {showAdvanced ? "隐藏高级设置" : "高级设置"}
         </button>
-        {showAdvanced && <div className="integration advanced-settings">
-        <div className="tmdb-mode-row">
-          <span>连接方式</span>
-          <div className="segmented compact">
-            <button type="button" className={!isProxyMode ? "active" : ""} onClick={() => updateField("mode", "direct")}>
-              <Radar size={16} /> 默认
-            </button>
-            <button type="button" className={isProxyMode ? "active" : ""} onClick={() => updateField("mode", "proxy")}>
-              <ShieldCheck size={16} /> 使用代理
-            </button>
-          </div>
-        </div>
-        <div className="settings-grid">
-          {isProxyMode && <label>代理地址
-            <CopyableInput value={form.proxy_url} onChange={(value) => updateField("proxy_url", value)} placeholder="http://mihomo:7890" inputMode="url" />
-          </label>}
+        {showAdvanced && <div className="settings-grid advanced-settings">
           <label>TMDB API Key（备用凭据）
             <SecretInput value={form.api_key} onChange={(value) => updateField("api_key", value)} placeholder="可替代 Bearer Token 使用" autoComplete="off" />
           </label>
           <label>超时时间（秒）
             <CopyableInput value={form.timeout} onChange={(value) => updateField("timeout", value)} inputMode="numeric" placeholder="12" />
           </label>
-        </div>
         </div>}
+        </div>
+      </Panel>
+
+      <Panel title="代理配置">
+        <div className="integration tmdb-editor proxy-settings-card">
+          <div className="notice info">
+            <strong>按网站精细使用代理</strong>
+            <span>只有下方勾选网站对应的 Media Hub 请求会交给代理。M-Team、qBittorrent、NAS 存储、本地接口和其他请求始终直连。</span>
+          </div>
+          <label className="proxy-toggle-row">
+            <span><ShieldCheck size={17} /><strong>使用已有 Mihomo / HTTP 代理</strong></span>
+            <input type="checkbox" checked={form.proxy_enabled} onChange={(event) => updateField("proxy_enabled", event.target.checked)} />
+          </label>
+          {form.proxy_enabled && <label>代理地址
+            <CopyableInput value={form.proxy_url} onChange={(value) => updateField("proxy_url", value)} placeholder="http://代理服务器地址:端口" inputMode="url" />
+            <span className="field-note">填写 Media Hub 容器能够访问的 HTTP/HTTPS 代理地址，例如同一 Docker 网络中的 http://mihomo:7890。</span>
+          </label>}
+          <div className="proxy-domain-list" aria-label="需要使用代理的网站">
+            {TMDB_PROXY_DOMAIN_OPTIONS.map((option) => (
+              <label className={form.proxy_enabled ? "proxy-domain-option" : "proxy-domain-option disabled"} key={option.domain}>
+                <input type="checkbox" checked={form.proxy_domains.includes(option.domain)} disabled={!form.proxy_enabled} onChange={() => toggleProxyDomain(option.domain)} />
+                <span>
+                  <strong>{option.label}</strong>
+                  <code>{option.domain}</code>
+                  <small>{option.description}</small>
+                </span>
+              </label>
+            ))}
+          </div>
+          {!form.proxy_enabled && <p className="muted">代理当前关闭，TMDB 数据和图片请求都会通过直连与 DoH 尝试访问。</p>}
+          {proxyValidationMessage && <p className="error">{proxyValidationMessage}</p>}
         <div className="actions">
-          <button onClick={saveDraft} disabled={busy !== ""}>{busy === "draft" ? "正在保存..." : "保存草稿"}</button>
-          <button className="primary" onClick={saveAndTest} disabled={busy !== ""}>{busy === "test" ? "正在测试..." : "保存并测试"}</button>
+          <button onClick={saveDraft} disabled={busy !== "" || Boolean(proxyValidationMessage)}>{busy === "draft" ? "正在保存..." : "保存媒体搜索设置"}</button>
+          <button className="primary" onClick={saveAndTest} disabled={busy !== "" || Boolean(proxyValidationMessage)}>{busy === "test" ? "正在测试..." : "保存并测试"}</button>
           <button onClick={toggleEnabled} disabled={busy !== "" || (!provider.enabled && !canEnable)}>{provider.enabled ? "停用" : "启用"}</button>
         </div>
         {!provider.enabled && !canEnable && <p className="muted">请先“保存并测试”，测试成功后才能启用 TMDB。</p>}
         {localError && <p className="error">{localError}</p>}
-        <TestResultCard result={result} emptyProvider="TMDB" />
+        <TestResultCard result={result} emptyProvider="媒体搜索" />
+        </div>
+      </Panel>
       </div>
-    </Panel>
   );
 }
 
@@ -3945,11 +4016,18 @@ function TestResultCard({ result, emptyProvider }: { result?: IntegrationTestRes
   }
 
   const tone = result.state === "draft" ? "neutral" : result.success ? "success" : "failed";
+  const domainRoutes = result.detail?.domain_routes ?? {};
   return (
     <div className={`result-card ${tone}`}>
       <strong>{result.message ?? (result.state === "draft" ? "草稿已保存" : result.success ? "测试成功" : "测试失败")}</strong>
       {result.explanation && <span>{result.explanation}</span>}
       {result.next_step && <span>下一步：{result.next_step}</span>}
+      {Object.keys(domainRoutes).length > 0 && <div className="proxy-route-summary">
+        {TMDB_PROXY_DOMAIN_OPTIONS.map((option) => domainRoutes[option.domain] && <span key={option.domain}>
+          <code>{option.domain}</code>
+          <b className={domainRoutes[option.domain] === "proxy" ? "proxy" : "direct"}>{domainRoutes[option.domain] === "proxy" ? "代理" : "直连"}</b>
+        </span>)}
+      </div>}
       {result.trace_id && <small>诊断编号：{result.trace_id}</small>}
     </div>
   );
@@ -3979,15 +4057,14 @@ function SecretInput(props: {
   autoComplete?: string;
 }) {
   const [visible, setVisible] = useState(false);
-  const displayed = visible || !props.value ? props.value : "*".repeat(Math.min(Math.max(props.value.length, 8), 48));
   return (
     <div className="input-with-tools sensitive">
       <input
-        value={displayed}
+        type={visible ? "text" : "password"}
+        value={props.value}
         onChange={(event) => props.onChange(event.target.value)}
         placeholder={props.placeholder}
         autoComplete={props.autoComplete}
-        readOnly={!visible && Boolean(props.value)}
       />
       <div className="input-tools">
         <button className="icon-tool" type="button" onClick={() => setVisible((current) => !current)} title={visible ? "隐藏明文" : "显示明文"} aria-label={visible ? "隐藏明文" : "显示明文"}>
@@ -4605,6 +4682,10 @@ function MediaDetailPage({
     <section className="tmdb-detail">
       {item.backdrop && <img className="tmdb-detail-backdrop" src={item.backdrop} alt="" loading="lazy" decoding="async" onError={handleImageError} />}
       <div className="tmdb-detail-haze" />
+      {(loading || error) && <div className="tmdb-detail-status-stack" aria-live="polite">
+        {loading && <div className="tmdb-loading" role="status"><RefreshCw size={15} aria-hidden="true" /><span>正在读取 TMDB 详情...</span></div>}
+        {error && <div className="tmdb-detail-error" role="alert"><CircleAlert size={16} aria-hidden="true" /><span>{error}</span></div>}
+      </div>}
       <div className="tmdb-detail-glass">
         <div className="tmdb-detail-nav">
           {canGoBack && <button className="tmdb-back tmdb-back-icon" type="button" onClick={onBack} aria-label="返回上一层详情" title="返回上一层详情"><ArrowLeft size={18} /></button>}
@@ -4619,8 +4700,6 @@ function MediaDetailPage({
             </button>
           )}
         </div>
-        {loading && <span className="tmdb-loading">正在读取 TMDB 详情...</span>}
-        {error && <p className="error">{error}</p>}
         <div className="tmdb-detail-main">
           <img className="tmdb-detail-poster" src={item.poster} alt="" loading="eager" decoding="async" fetchPriority="high" onError={handleImageError} />
           <div className="tmdb-detail-copy">
@@ -4703,28 +4782,44 @@ function PersonDetailPage({
   onMediaSelect: (item: any) => void;
 }) {
   const works = Array.isArray(person.known_for) ? person.known_for : [];
+  const aliases = Array.isArray(person.also_known_as) ? person.also_known_as.filter(Boolean).slice(0, 4) : [];
+  const department = personDepartmentLabel(person.known_for_department);
   return (
     <section className="tmdb-detail tmdb-person-detail">
       <div className="tmdb-detail-haze" />
-      <div className="tmdb-detail-glass">
-        <div className="tmdb-detail-nav tmdb-person-actions">
+      {(loading || error) && <div className="tmdb-detail-status-stack" aria-live="polite">
+        {loading && <div className="tmdb-loading" role="status"><RefreshCw size={15} aria-hidden="true" /><span>正在读取演员作品...</span></div>}
+        {error && <div className="tmdb-detail-error" role="alert"><CircleAlert size={16} aria-hidden="true" /><span>{error}</span></div>}
+      </div>}
+      <div className="tmdb-person-header">
+        <div className="tmdb-person-toolbar">
+          <div className="tmdb-detail-nav tmdb-person-actions">
           {canGoBack && <button className="tmdb-back tmdb-back-icon" type="button" onClick={onBack} aria-label="返回上一层详情" title="返回上一层详情"><ArrowLeft size={18} /></button>}
           <button className="tmdb-back" type="button" onClick={onExit}>返回发现</button>
+          </div>
         </div>
-        {loading && <span className="tmdb-loading">正在读取演员作品...</span>}
-        {error && <p className="error">{error}</p>}
         <div className="tmdb-person-hero">
-          <img src={person.profile} alt="" loading="eager" decoding="async" fetchPriority="high" onError={handleImageError} />
-          <div>
-            <span className="tmdb-type-pill">{person.known_for_department || "Acting"}</span>
+          <div className="tmdb-person-portrait-wrap">
+            <img src={person.profile} alt={person.name || "人物头像"} loading="eager" decoding="async" fetchPriority="high" onError={handleImageError} />
+          </div>
+          <div className="tmdb-person-identity">
+            <span className="tmdb-person-department"><UserRound size={15} />{department}</span>
             <h2>{person.name}</h2>
-            <p className="tmdb-subtitle">{[person.birthday, person.place_of_birth].filter(Boolean).join(" / ")}</p>
-            <p className="tmdb-overview">{person.biography || "暂无演员简介。"}</p>
+            <div className="tmdb-person-meta">
+              {person.birthday && <span><small>出生日期</small><strong>{personDateLabel(person.birthday)}</strong></span>}
+              {person.deathday && <span><small>逝世日期</small><strong>{personDateLabel(person.deathday)}</strong></span>}
+              {person.place_of_birth && <span className="wide"><small>出生地点</small><strong>{person.place_of_birth}</strong></span>}
+            </div>
+            {aliases.length > 0 && <p className="tmdb-person-aliases"><strong>其他名字</strong><span>{aliases.join(" / ")}</span></p>}
           </div>
         </div>
       </div>
-      <section className="tmdb-detail-section">
-        <div className="discover-section-header"><h2><span />相关作品</h2></div>
+      <section className="tmdb-person-biography">
+        <div className="discover-section-header"><h2><span />人物简介</h2></div>
+        <p>{person.biography || "暂无人物简介。"}</p>
+      </section>
+      <section className="tmdb-detail-section tmdb-person-works">
+        <div className="discover-section-header"><h2><span />相关作品</h2>{works.length > 0 && <small>共 {works.length} 部</small>}</div>
         <div className="poster-rail">
           {works.map((work: any) => <DiscoverPosterCard item={work} onSelect={onMediaSelect} key={work.id} />)}
           {!works.length && <p className="muted">暂无相关作品。</p>}
@@ -5001,6 +5096,32 @@ function mediaCountryLabel(item: any): string {
   if (countries.length) return countries.slice(0, 2).map(localizedCountryName).join(" / ");
   const language = String(item.original_language ?? "").trim();
   return language ? localizedLanguageName(language) : "";
+}
+
+function personDepartmentLabel(value: unknown): string {
+  const department = String(value || "").trim();
+  const labels: Record<string, string> = {
+    Acting: "演员",
+    Directing: "导演",
+    Writing: "编剧",
+    Production: "制片",
+    Camera: "摄影",
+    Editing: "剪辑",
+    Sound: "声音",
+    Art: "美术",
+    "Costume & Make-Up": "服装与造型",
+    "Visual Effects": "视觉特效",
+    Crew: "剧组",
+    Creator: "创作者",
+  };
+  return labels[department] || department || "影视工作者";
+}
+
+function personDateLabel(value: unknown): string {
+  const raw = String(value || "").trim();
+  const matched = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+  if (!matched) return raw;
+  return `${matched[1]}年${Number(matched[2])}月${Number(matched[3])}日`;
 }
 
 function mediaLanguageLabel(item: any): string {

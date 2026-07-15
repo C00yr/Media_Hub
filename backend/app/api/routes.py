@@ -14,7 +14,6 @@ from socket import timeout as SocketTimeout
 from threading import Lock
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
 from urllib.request import Request
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, status
@@ -27,7 +26,14 @@ from app.adapters.mock import MockMetadataAdapter
 from app.adapters.mteam import MTeamAdapter, MTeamApiError, MTeamConfigError
 from app.adapters.qbittorrent import QbittorrentApiError, QbittorrentConfigError, QbittorrentWebAdapter
 from app.adapters.tmdb import TmdbAdapter
-from app.adapters.tmdb.client import DEFAULT_TMDB_PROXY_URL, TmdbConfigError, TmdbDohError, TmdbImageError, open_tmdb_network_request
+from app.adapters.tmdb.client import (
+    TmdbConfigError,
+    TmdbDohError,
+    TmdbImageError,
+    open_tmdb_network_request,
+    resolve_tmdb_proxy_settings,
+    tmdb_network_detail,
+)
 from app.adapters.wechat_claw import WechatClawAdapter, WechatClawApiError, WechatClawConfigError
 from app.api.deps import get_current_user, has_qb2_grant, require_admin
 from app.auth.security import create_access_token, decode_token, hash_password, verify_password
@@ -989,15 +995,12 @@ def _prune_tmdb_image_cache(cache_dir: Path) -> None:
             break
 
 
-def _tmdb_image_network_config(db: Session) -> tuple[str, str, int]:
+def _tmdb_image_network_config(db: Session) -> tuple[bool, str, frozenset[str], int]:
     row = get_config(db, "tmdb")
     config = get_decrypted_config(db, "tmdb") if row and row.encrypted_payload else {}
-    mode = str((config or {}).get("mode") or settings.tmdb_mode or "direct").strip().lower()
-    if mode not in {"direct", "proxy"}:
-        mode = "direct"
-    proxy_url = str((config or {}).get("proxy_url") or settings.tmdb_proxy_url or DEFAULT_TMDB_PROXY_URL).strip()
+    proxy_enabled, proxy_url, proxy_domains = resolve_tmdb_proxy_settings(config or {})
     timeout = int((config or {}).get("timeout") or 12)
-    return mode, proxy_url, timeout
+    return proxy_enabled, proxy_url, proxy_domains, timeout
 
 
 def refresh_dashboard_preload_task() -> None:
@@ -1041,19 +1044,8 @@ def refresh_download_preload_task(downloader_id: str) -> None:
 
 
 def tmdb_network_detail_from_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
-    config = config or {}
-    mode = str(config.get("mode") or settings.tmdb_mode or "direct").strip().lower()
-    if mode not in {"direct", "proxy"}:
-        mode = "direct"
-    proxy_url = str(config.get("proxy_url") or settings.tmdb_proxy_url or DEFAULT_TMDB_PROXY_URL).strip()
-    proxy_host = urlparse(proxy_url if "://" in proxy_url else f"http://{proxy_url}").netloc if proxy_url else ""
-    return {
-        "network_mode": mode,
-        "route_label": "TMDB：mihomo VPN 代理" if mode == "proxy" else "TMDB：直连 + DoH",
-        "proxy_enabled": mode == "proxy",
-        "proxy_url": proxy_host if mode == "proxy" else "",
-        "non_tmdb_policy": "direct_only",
-    }
+    proxy_enabled, proxy_url, proxy_domains = resolve_tmdb_proxy_settings(config or {})
+    return tmdb_network_detail(proxy_enabled, proxy_url, proxy_domains)
 
 
 def tmdb_test_result(success: bool, trace: str, message: str, explanation: str, next_step: str, error_type: str | None = None, http_status: int | None = None, detail: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -3510,14 +3502,21 @@ def admin_storage_status(refresh: bool = Query(default=False), _: User = Depends
 def save_integration(provider: str, request: IntegrationPayload, user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
     if provider not in PROVIDERS:
         raise HTTPException(status_code=404, detail="Unknown provider")
-    return serialize_config(upsert_config(db, provider, request.payload, actor_user_id=user.id))
+    try:
+        row = upsert_config(db, provider, request.payload, actor_user_id=user.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return serialize_config(row)
 
 
 @router.post("/admin/integrations/{provider}/test")
 def test_integration(provider: str, request: IntegrationPayload | None = None, user: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
     if provider not in PROVIDERS:
         raise HTTPException(status_code=404, detail="Unknown provider")
-    row = upsert_config(db, provider, request.payload, actor_user_id=user.id, action="save_and_test") if request and request.payload else get_config(db, provider)
+    try:
+        row = upsert_config(db, provider, request.payload, actor_user_id=user.id, action="save_and_test") if request and request.payload else get_config(db, provider)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     test_trace_id = trace_id("CFGTEST")
     if provider == "tmdb":
         config = get_decrypted_config(db, provider) or {}
@@ -3529,7 +3528,7 @@ def test_integration(provider: str, request: IntegrationPayload | None = None, u
         except Exception as exc:
             result = classify_tmdb_test_error(exc, test_trace_id)
             result["detail"] = network_detail
-            if network_detail.get("network_mode") == "proxy" and result.get("error_type") in {"network_error", "timeout", "unknown_error"}:
+            if network_detail.get("proxy_enabled") and result.get("error_type") in {"network_error", "timeout", "unknown_error"}:
                 result["message"] = "无法通过 mihomo 代理连接 TMDB。"
                 result["explanation"] = "当前代理未能完成连接。"
                 result["next_step"] = "请检查高级设置中的代理地址后重试。"
@@ -4265,9 +4264,10 @@ def tmdb_image_proxy(size: str, image_path: str, db: Session = Depends(get_db)) 
 
     url = f"https://image.tmdb.org/t/p/{size}/{clean_path}"
     request = Request(url, headers={"Accept": "image/jpeg,image/png,image/webp,*/*", "User-Agent": "PT-Media-Hub"})
-    mode, proxy_url, timeout = _tmdb_image_network_config(db)
+    proxy_enabled, proxy_url, proxy_domains, timeout = _tmdb_image_network_config(db)
+    mode = "proxy" if proxy_enabled and "image.tmdb.org" in proxy_domains else "direct"
     try:
-        with open_tmdb_network_request(request, mode, proxy_url, timeout) as response:
+        with open_tmdb_network_request(request, proxy_enabled, proxy_url, proxy_domains, timeout) as response:
             content = response.read(TMDB_IMAGE_MAX_BYTES + 1)
             if len(content) > TMDB_IMAGE_MAX_BYTES:
                 logger.warning("TMDB image fetch rejected because it is too large: size=%s path=%s mode=%s", size, clean_path, mode)
@@ -4283,7 +4283,7 @@ def tmdb_image_proxy(size: str, image_path: str, db: Session = Depends(get_db)) 
             size,
             clean_path,
             mode,
-            urlparse(proxy_url if "://" in proxy_url else f"http://{proxy_url}").netloc if proxy_url else "",
+            tmdb_network_detail(proxy_enabled, proxy_url, proxy_domains).get("proxy_url", ""),
             reason,
         )
         return _tmdb_image_placeholder_response(reason)

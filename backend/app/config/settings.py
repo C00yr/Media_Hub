@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     snapshot_interval_minutes: int = 10
     static_dir: str = "static"
     tmdb_mode: str = "direct"
-    tmdb_proxy_url: str = "http://mihomo:7890"
+    tmdb_proxy_url: str = ""
     tmdb_image_cache_dir: str = "/data/image-cache/tmdb"
     tmdb_image_cache_max_mb: int = 512
 

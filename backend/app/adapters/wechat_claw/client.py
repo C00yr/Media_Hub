@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, build_opener
+from urllib.request import ProxyHandler, Request, build_opener
 
 
 class WechatClawConfigError(ValueError):
@@ -49,7 +49,7 @@ class WechatClawAdapter:
                 raise WechatClawConfigError("inbound_token is required")
         if self.webhook_url and not self.webhook_url.startswith(("http://", "https://")):
             raise WechatClawConfigError("webhook_url must start with http:// or https://")
-        self.opener = build_opener()
+        self.opener = build_opener(ProxyHandler({}))
 
     @staticmethod
     def _ok(payload: dict[str, Any]) -> bool:

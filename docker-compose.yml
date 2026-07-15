@@ -11,8 +11,10 @@ services:
       ENVIRONMENT: production
       STATIC_DIR: /app/static
       APP_RUNTIME_SECRETS_FILE: /data/runtime-secrets.json
-      TMDB_MODE: ${TMDB_MODE:-direct}
-      TMDB_PROXY_URL: ${TMDB_PROXY_URL:-http://mihomo:7890}
+    extra_hosts:
+      # Optional hostname users may enter for a proxy published by the NAS host.
+      # The proxy address and port are configured only in the Media Hub UI.
+      - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
     volumes:

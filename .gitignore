@@ -12,6 +12,7 @@ frontend/pnpm-workspace.yaml
 data/
 backend/data/
 backend/.pytest_cache/
+backend/.venv/
 backend/pytest-cache-files-*/
 pytest-cache-files-*/
 backend/**/__pycache__/

@@ -2,7 +2,7 @@ import json
 from datetime import datetime
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, build_opener
+from urllib.request import ProxyHandler, Request, build_opener
 
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -113,7 +113,7 @@ class DeepSeekChatAdapter:
             raise AIConfigError("DeepSeek base_url must start with http:// or https://")
         if not self.model:
             raise AIConfigError("DeepSeek model is missing")
-        self.opener = build_opener()
+        self.opener = build_opener(ProxyHandler({}))
 
     def parse_intent(self, text: str) -> dict[str, Any]:
         user_text = str(text or "").strip()

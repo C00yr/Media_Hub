@@ -1,12 +1,17 @@
 from socket import timeout as SocketTimeout
+from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
+from urllib.request import Request
 
+import pytest
 from fastapi.testclient import TestClient
 
+from app.adapters.ai.client import DeepSeekChatAdapter
 from app.adapters.mteam.client import MTeamAdapter
 from app.adapters.qbittorrent.client import QbittorrentWebAdapter
 from app.adapters.tmdb import client as tmdb_client
-from app.adapters.tmdb.client import TmdbAdapter, TmdbConfigError, TmdbDohError, TmdbImageError
+from app.adapters.tmdb.client import TmdbAdapter, TmdbConfigError, TmdbDohError, TmdbImageError, tmdb_request_uses_proxy
+from app.adapters.wechat_claw import WechatClawAdapter
 from app.api import routes
 from app.api.routes import classify_tmdb_gateway_test_error, classify_tmdb_test_error
 from app.db.session import SessionLocal
@@ -26,7 +31,7 @@ def test_tmdb_missing_credentials_feedback():
     assert result["success"] is False
     assert result["error_type"] == "missing_credentials"
     assert result["can_enable"] is False
-    assert "API Key" in result["next_step"]
+    assert "Bearer Token" in result["next_step"]
 
 
 def test_tmdb_http_error_feedback():
@@ -63,12 +68,13 @@ def test_tmdb_gateway_feedback_is_removed_compatibility():
     result = classify_tmdb_gateway_test_error(URLError("worker unreachable"), "CFGTEST-GW1", "health")
     assert result["success"] is False
     assert result["error_type"] == "gateway_removed"
-    assert "Cloudflare Worker" in result["message"]
+    assert "不再支持" in result["message"]
 
 
 def test_tmdb_gateway_payload_normalizes_to_direct():
     payload = normalize_payload("tmdb", {"mode": "gateway", "gateway_url": "https://example.workers.dev", "gateway_key": "secret", "bearer_token": "token"})
-    assert payload["mode"] == "direct"
+    assert payload["proxy_enabled"] is False
+    assert payload["proxy_domains"] == ["api.themoviedb.org", "image.tmdb.org"]
     assert "gateway_url" not in payload
     assert "gateway_key" not in payload
 
@@ -107,7 +113,116 @@ def test_tmdb_proxy_uses_proxy_opener(monkeypatch):
     monkeypatch.setattr(tmdb_client, "_urlopen_with_proxy", fake_proxy)
     result = TmdbAdapter({"mode": "proxy", "bearer_token": "token", "proxy_url": "http://mihomo:7890"}).test_connection()
     assert calls and calls[0][0] == "http://mihomo:7890"
-    assert result["network"]["network_mode"] == "proxy"
+    assert result["network"]["network_mode"] == "selective_proxy"
+    assert result["network"]["domain_routes"] == {
+        "api.themoviedb.org": "proxy",
+        "image.tmdb.org": "proxy",
+    }
+
+
+def test_tmdb_proxy_domain_policy_is_exact_and_selective():
+    api_only = {"api.themoviedb.org"}
+    assert tmdb_request_uses_proxy("https://api.themoviedb.org/3/movie/1", True, api_only) is True
+    assert tmdb_request_uses_proxy("https://API.THEMOVIEDB.ORG:443/3/movie/1", True, api_only) is True
+    assert tmdb_request_uses_proxy("https://image.tmdb.org/t/p/w92/a.jpg", True, api_only) is False
+    assert tmdb_request_uses_proxy("https://evil.api.themoviedb.org.example/", True, api_only) is False
+    assert tmdb_request_uses_proxy("https://api.themoviedb.org@evil.example/", True, api_only) is False
+    assert tmdb_request_uses_proxy("https://[invalid/", True, api_only) is False
+    assert tmdb_request_uses_proxy("https://api.themoviedb.org/3/movie/1", False, api_only) is False
+
+
+def test_tmdb_network_dispatch_only_calls_proxy_for_selected_exact_host(monkeypatch):
+    routes = []
+
+    def fake_proxy(request, timeout):
+        routes.append(("proxy", request.full_url, timeout))
+        return object()
+
+    def fake_direct(request, timeout):
+        routes.append(("direct", request.full_url, timeout))
+        return object()
+
+    monkeypatch.setattr(tmdb_client, "_urlopen_with_proxy", fake_proxy)
+    monkeypatch.setattr(tmdb_client, "_urlopen_with_doh_ipv4", fake_direct)
+    selected = frozenset({"api.themoviedb.org"})
+
+    tmdb_client.open_tmdb_network_request(Request("https://api.themoviedb.org/3/configuration"), True, "http://mihomo:7890", selected, 12)
+    tmdb_client.open_tmdb_network_request(Request("https://image.tmdb.org/t/p/w92/a.jpg"), True, "http://mihomo:7890", selected, 12)
+    tmdb_client.open_tmdb_network_request(Request("https://api.themoviedb.org.evil.example/"), True, "http://mihomo:7890", selected, 12)
+
+    assert [route[0] for route in routes] == ["proxy", "direct", "direct"]
+
+
+def test_tmdb_private_proxy_opener_has_a_second_policy_guard():
+    request = Request("https://example.com/private")
+    request.tmdb_proxy_url = "http://mihomo:7890"
+    request.tmdb_proxy_domains = frozenset({"api.themoviedb.org"})
+
+    with pytest.raises(URLError, match="proxy policy blocked host: example.com"):
+        tmdb_client._urlopen_with_proxy(request, timeout=12)
+
+
+def test_tmdb_proxy_payload_filters_unknown_domains_and_validates():
+    payload = normalize_payload("tmdb", {
+        "bearer_token": "token",
+        "proxy_enabled": True,
+        "proxy_url": "http://mihomo:7890",
+        "proxy_domains": ["image.tmdb.org", "example.com"],
+    })
+    assert payload["proxy_domains"] == ["image.tmdb.org"]
+
+    with pytest.raises(ValueError, match="至少选择一个"):
+        normalize_payload("tmdb", {"proxy_enabled": True, "proxy_url": "http://mihomo:7890", "proxy_domains": []})
+    with pytest.raises(ValueError, match="http://"):
+        normalize_payload("tmdb", {"proxy_enabled": True, "proxy_url": "socks5://mihomo:7890", "proxy_domains": ["api.themoviedb.org"]})
+    with pytest.raises(ValueError, match="http://"):
+        normalize_payload("tmdb", {"proxy_enabled": True, "proxy_domains": ["api.themoviedb.org"]})
+
+
+def test_tmdb_legacy_proxy_mode_selects_both_domains():
+    payload = normalize_payload("tmdb", {"mode": "proxy", "proxy_url": "http://mihomo:7890", "bearer_token": "token"})
+    assert payload["proxy_enabled"] is True
+    assert payload["proxy_domains"] == ["api.themoviedb.org", "image.tmdb.org"]
+
+
+def test_tmdb_environment_proxy_remains_a_fallback(monkeypatch):
+    monkeypatch.setattr(
+        tmdb_client,
+        "get_settings",
+        lambda: SimpleNamespace(tmdb_mode="proxy", tmdb_proxy_url="http://env-mihomo:7890"),
+    )
+    enabled, proxy_url, domains = tmdb_client.resolve_tmdb_proxy_settings({})
+    assert enabled is True
+    assert proxy_url == "http://env-mihomo:7890"
+    assert domains == {"api.themoviedb.org", "image.tmdb.org"}
+
+
+def test_tmdb_proxy_address_has_no_implicit_default(monkeypatch):
+    monkeypatch.setattr(
+        tmdb_client,
+        "get_settings",
+        lambda: SimpleNamespace(tmdb_mode="direct", tmdb_proxy_url=""),
+    )
+    enabled, proxy_url, domains = tmdb_client.resolve_tmdb_proxy_settings({})
+    assert enabled is False
+    assert proxy_url == ""
+    assert domains == {"api.themoviedb.org", "image.tmdb.org"}
+
+    with pytest.raises(TmdbConfigError, match="http://"):
+        tmdb_client.resolve_tmdb_proxy_settings({"proxy_enabled": True, "proxy_domains": ["api.themoviedb.org"]})
+
+
+def test_tmdb_proxy_blocks_cross_host_redirects():
+    handler = tmdb_client._SameHostProxyRedirectHandler("api.themoviedb.org")
+    with pytest.raises(URLError, match="Cross-host proxy redirect blocked"):
+        handler.redirect_request(
+            Request("https://api.themoviedb.org/3/configuration"),
+            None,
+            302,
+            "Found",
+            {},
+            "https://image.tmdb.org/t/p/w92/poster.jpg",
+        )
 
 
 def test_tmdb_test_connection_reports_image_host_failure(monkeypatch):
@@ -219,7 +334,8 @@ def test_tmdb_image_proxy_validates_and_caches(monkeypatch, tmp_path):
     monkeypatch.setattr(routes.settings, "tmdb_image_cache_dir", str(tmp_path))
     monkeypatch.setattr(routes.settings, "tmdb_image_cache_max_mb", 1)
 
-    def fake_open(request, mode, proxy_url, timeout):
+    def fake_open(request, proxy_enabled, proxy_url, proxy_domains, timeout):
+        mode = "proxy" if tmdb_request_uses_proxy(request.full_url, proxy_enabled, proxy_domains) else "direct"
         calls.append((request.full_url, mode))
         return FakeImageResponse()
 
@@ -245,7 +361,8 @@ def test_tmdb_image_proxy_discards_invalid_cached_file(monkeypatch, tmp_path):
     cache_file.parent.mkdir(parents=True, exist_ok=True)
     cache_file.write_bytes(b"<svg>No Image</svg>")
 
-    def fake_open(request, mode, proxy_url, timeout):
+    def fake_open(request, proxy_enabled, proxy_url, proxy_domains, timeout):
+        mode = "proxy" if tmdb_request_uses_proxy(request.full_url, proxy_enabled, proxy_domains) else "direct"
         calls.append((request.full_url, mode))
         return FakeImageResponse()
 
@@ -355,14 +472,16 @@ def test_discover_filter_without_tmdb_never_returns_mock_items(monkeypatch):
     assert result["next_page"] is None
 
 
-def test_qb_and_mteam_disable_environment_proxy(monkeypatch):
+def test_non_tmdb_adapters_disable_environment_proxy(monkeypatch):
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:7890")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:7890")
     qb = QbittorrentWebAdapter({"base_url": "http://qb.local:8080", "username": "u", "password": "p"})
     mteam = MTeamAdapter({"api_key": "mteam-key"})
-    qb_handler_names = [handler.__class__.__name__ for handler in qb.opener.handlers]
-    mteam_handler_names = [handler.__class__.__name__ for handler in mteam.opener.handlers]
-    assert "ProxyHandler" not in qb_handler_names
-    assert "ProxyHandler" not in mteam_handler_names
+    ai = DeepSeekChatAdapter({"api_key": "ai-key"})
+    wechat = WechatClawAdapter({})
+    for adapter in (qb, mteam, ai, wechat):
+        handler_names = [handler.__class__.__name__ for handler in adapter.opener.handlers]
+        assert "ProxyHandler" not in handler_names
 
 
 def test_tmdb_enable_requires_real_success():

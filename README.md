@@ -23,14 +23,7 @@ PT Media Hub is a NAS-first Docker Web App for media discovery, PT download moni
 
 The launcher always stores local development data in `data/local`, while NAS/Docker stores its data in the mounted `/data` directory. It refuses to replace an existing frontend on port 5173, automatically selects a backend port from 18001-18010, and does not use Uvicorn `--reload`. This prevents a local development process from sharing the NAS SQLite database or generating an uncontrolled Windows reload log.
 
-On the first run, install dependencies once:
-
-```bash
-cd backend
-py -m pip install -e ".[test]"
-cd frontend
-npm install
-```
+On the first run, the launcher creates `backend/.venv` and installs the backend and frontend dependencies automatically. If Python 3.12+ or Node.js LTS is missing, it uses Windows `winget` to install it and continues in the same launch. The first run therefore needs an internet connection. Windows 10/11 with App Installer (`winget`) is required only when the prerequisite is not already installed.
 
 For manual advanced startup, use the same `APP_RUNTIME_PROFILE=local`, `APP_DATA_DIR=<project>/data/local`, database, and secret-file values used by `scripts/start-dev.ps1`. Do not use the NAS `/data` path and do not add `--reload` on Windows.
 
@@ -51,12 +44,14 @@ Advanced users can still create `.env` from `.env.example` to override network/s
 
 Source-code development and NAS deployment are separate application instances. Do not copy the NAS database into `data/local`, and do not point local `DATABASE_URL` at a NAS share. The backend validates this at startup and rejects accidental cross-profile SQLite paths.
 
-## TMDB Network Modes
+## Media Search Proxy
 
-TMDB supports exactly two network modes:
+The Settings > Media Search page can connect TMDB to an existing HTTP/HTTPS proxy such as Mihomo. Use `http://mihomo:7890` for a private unauthenticated Docker-only endpoint, or an authenticated URL such as `http://mediahub:PASSWORD@mihomo:7890` with the bundled example. Proxy routing is controlled by a fixed application allowlist:
 
-- `direct`: default. The backend connects to TMDB directly and uses DoH + IPv4 fallback.
-- `proxy`: only TMDB requests use a proxy such as Mihomo, usually `http://mihomo:7890`.
+- `api.themoviedb.org`: search, discover, details, people, trends, and filters.
+- `image.tmdb.org`: posters, backdrops, profiles, and logos.
+
+Each domain can be enabled independently. Unselected domains connect directly with DoH + IPv4 fallback, even while the proxy switch is on.
 
 qBittorrent, M-Team, NAS storage checks, login, and all other app traffic are direct-only. Do not add global `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` variables to `pt-media-hub`.
 
@@ -67,7 +62,7 @@ TMDB_MODE=direct
 TMDB_PROXY_URL=http://mihomo:7890
 ```
 
-Values saved in the Settings page take priority over `.env`. The default `docker-compose.yml` does not start Mihomo, so direct mode works without proxy files. To use proxy mode, add a Mihomo service or point `TMDB_PROXY_URL` to an existing proxy.
+Values saved in the Settings page take priority over `.env`; legacy `TMDB_MODE=proxy` enables both allowed TMDB domains. The default `docker-compose.yml` does not start Mihomo. Direct mode needs no proxy files, while proxy mode requires an existing proxy that the Media Hub container can reach. Domain choices are managed in the Media Hub UI and do not need to be duplicated in Media Hub's Compose YAML.
 
 ## NAS Storage Mounts
 

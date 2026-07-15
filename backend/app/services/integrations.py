@@ -1,6 +1,7 @@
 import json
 from datetime import datetime
 from typing import Any
+from urllib.parse import urlparse
 
 from cryptography.fernet import InvalidToken
 from sqlalchemy.orm import Session
@@ -12,6 +13,7 @@ from app.utils.redaction import parse_raw_headers, redact_payload
 
 
 PROVIDERS = ["mteam", "qb1", "qb2", "qb3", "tmdb", "ai", "wechat_claw"]
+TMDB_PROXY_DOMAIN_ALLOWLIST = ("api.themoviedb.org", "image.tmdb.org")
 
 
 def decode_saved_payload(value: str | None) -> tuple[dict[str, Any], bool]:
@@ -58,10 +60,25 @@ def normalize_payload(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
                 normalized[key] = normalized[key].strip()
         for key in ["gateway_url", "gateway_key", "worker_name"]:
             normalized.pop(key, None)
-        if normalized.get("mode") not in {"direct", "proxy"}:
-            normalized["mode"] = "direct"
-        if not normalized.get("proxy_url"):
-            normalized["proxy_url"] = "http://mihomo:7890"
+        if "proxy_enabled" in normalized:
+            proxy_enabled = normalized.get("proxy_enabled") is True
+        else:
+            proxy_enabled = normalized.get("mode") == "proxy"
+        raw_proxy_domains = normalized.get("proxy_domains")
+        if raw_proxy_domains is None:
+            raw_proxy_domains = list(TMDB_PROXY_DOMAIN_ALLOWLIST)
+        if not isinstance(raw_proxy_domains, list):
+            raw_proxy_domains = []
+        proxy_domains = [domain for domain in TMDB_PROXY_DOMAIN_ALLOWLIST if domain in raw_proxy_domains]
+        normalized.pop("mode", None)
+        normalized["proxy_enabled"] = proxy_enabled
+        normalized["proxy_domains"] = proxy_domains
+        if proxy_enabled:
+            parsed_proxy = urlparse(str(normalized.get("proxy_url") or ""))
+            if parsed_proxy.scheme not in {"http", "https"} or not parsed_proxy.hostname:
+                raise ValueError("代理地址必须是有效的 http:// 或 https:// 地址")
+            if not proxy_domains:
+                raise ValueError("启用代理时至少选择一个需要代理的网站")
         if not normalized.get("language"):
             normalized["language"] = "zh-CN"
         if not normalized.get("region"):
