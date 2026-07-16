@@ -4,6 +4,7 @@ import json
 import socket
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -127,18 +128,21 @@ class TmdbAdapter(MetadataAdapter):
             return []
         payload = self._get("/search/multi", {"query": query, "include_adult": "false"})
         results = [item for item in payload.get("results", []) if item.get("media_type") in ("movie", "tv")]
-        items = [self._normalize_item(item) for item in results[:8]]
-        detailed: list[dict[str, Any]] = []
-        detail_errors: list[str] = []
-        for item in items:
+        items = [self._normalize_item(item) for item in results]
+        if not items:
+            return []
+
+        def hydrate(item: dict[str, Any]) -> dict[str, Any]:
             try:
-                detailed.append(self.get_media_details(str(item["tmdb_id"]), str(item["media_type"])))
-            except Exception as exc:
-                detail_errors.append(str(exc))
-        if items and not detailed:
-            detail = detail_errors[-1] if detail_errors else "unknown detail request error"
-            raise RuntimeError(f"TMDB 找到了候选作品，但详情查询全部失败（{len(items)} 项）：{detail}")
-        return detailed
+                return self.get_media_details(str(item["tmdb_id"]), str(item["media_type"]))
+            except Exception:
+                # Keep every candidate returned by TMDB even when an optional
+                # detail request fails; the compact search payload is still
+                # useful and should not disappear from the result list.
+                return item
+
+        with ThreadPoolExecutor(max_workers=min(4, len(items)), thread_name_prefix="tmdb-search-detail") as executor:
+            return list(executor.map(hydrate, items))
 
     def lookup_media(self, query: str, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Search by title when available, otherwise use TMDB Discover with natural-language filters."""

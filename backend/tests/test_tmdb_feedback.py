@@ -268,6 +268,35 @@ def test_tmdb_discover_lists_are_lightweight(monkeypatch):
     assert payload["trending"][0]["poster"].startswith("/api/tmdb/image/w342/")
     assert payload["trending"][0]["genres"] == ["Action"]
 
+
+def test_tmdb_search_returns_every_upstream_candidate_and_keeps_compact_fallback(monkeypatch):
+    upstream = [
+        {
+            "id": index,
+            "media_type": "tv" if index % 2 else "movie",
+            "name": f"Series {index}",
+            "title": f"Movie {index}",
+            "first_air_date": "2026-01-01",
+            "release_date": "2026-01-01",
+        }
+        for index in range(1, 13)
+    ]
+
+    monkeypatch.setattr(TmdbAdapter, "_get", lambda self, path, params: {"results": upstream})
+
+    def fake_details(self, media_id, media_type):
+        if media_id == "5":
+            raise RuntimeError("detail unavailable")
+        return {"tmdb_id": int(media_id), "media_type": media_type, "detailed": True}
+
+    monkeypatch.setattr(TmdbAdapter, "get_media_details", fake_details)
+    items = TmdbAdapter({"mode": "direct", "bearer_token": "token"}).search_media("test")
+
+    assert [item["tmdb_id"] for item in items] == list(range(1, 13))
+    assert items[4]["media_type"] == "tv"
+    assert items[4].get("detailed") is None
+
+
 def test_tmdb_discover_genres_use_chinese_overrides_and_hide_tv_movie(monkeypatch):
     def fake_get(self, path, params):
         if path == "/genre/tv/list":

@@ -30,7 +30,7 @@ Allowed JSON shape:
 }
 
 Rules:
-- Use tmdb_lookup for movie/TV information, recommendations, title lookup, or condition discovery. For vague "high score", set min_rating=8.0. Convert Korea to KR and Korean to ko when relevant. Treat 动画、动漫、番剧、动画剧集、季、集 as media_type="tv"; treat 电影、影片 as media_type="movie". For a title lookup with no format cue, use media_type="all" rather than guessing movie.
+- Use tmdb_lookup for movie/TV information, recommendations, title lookup, or condition discovery. For vague "high score", set min_rating=8.0. Convert Korea to KR and Korean to ko when relevant. Treat 动画、动漫、番剧、动画剧集、季、集 as media_type="tv"; treat 电影、影片 as media_type="movie". For a title lookup with no format cue, use media_type="all" rather than guessing movie. For any specific title lookup, leave region and language empty: a localized title's writing system does not reveal the work's production country or original language. Use region/language only for condition discovery with an empty query.
 - Use mteam_search only for private-tracker resource lookup. Set recommend=true when the user asks for a recommendation or gives no precise release constraints.
 - Use dashboard_query for dashboard, M-Team, NAS, qB, download task, stats, or diagnostic requests. A generic dashboard request uses ["overview"]. A request for M-Team or 馒头站 account/site data must use ["mteam"].
 - Use download_selected only when the user refers to a recent M-Team candidate and expresses an affirmative intent. Resolve "1", "the first", and "the recommended one" into selection_index/selection_reference when possible. Set download_confirmation=true only for clear confirmation.

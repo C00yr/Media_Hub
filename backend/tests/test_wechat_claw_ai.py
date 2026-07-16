@@ -456,6 +456,29 @@ def test_wechat_claw_binding_interactions_do_not_collide_with_legacy_global_key(
         assert db.query(Setting).filter(Setting.key == WECHAT_CLAW_INTERACTIONS_KEY).count() == 1
 
 
+def test_tmdb_title_lookup_discards_ai_guessed_language_and_region():
+    localized_title_filters = tmdb_filters_for_request(
+        {
+            "query": "\u975e\u81ea\u7136\u6b7b\u4ea1",
+            "tmdb_filters": {"media_type": "tv", "region": "CN", "language": "zh"},
+        },
+        "\u5e2e\u6211\u641c\u4e00\u4e0b\u975e\u81ea\u7136\u6b7b\u4ea1",
+    )
+    assert localized_title_filters["media_type"] == "all"
+    assert localized_title_filters["region"] == ""
+    assert localized_title_filters["language"] == ""
+
+    discovery_filters = tmdb_filters_for_request(
+        {
+            "query": "",
+            "tmdb_filters": {"media_type": "tv", "region": "KR", "language": "ko"},
+        },
+        "\u63a8\u8350\u51e0\u90e8\u97e9\u56fd\u7535\u89c6\u5267",
+    )
+    assert discovery_filters["region"] == "KR"
+    assert discovery_filters["language"] == "ko"
+
+
 def test_mobile_agent_intents_ranking_and_templates_are_stable():
     intent = normalize_assistant_intent(
         {

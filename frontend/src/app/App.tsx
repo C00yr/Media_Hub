@@ -1275,8 +1275,11 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
   const [query, setQuery] = useState("");
   const [media, setMedia] = useState<any[]>([]);
   const [torrents, setTorrents] = useState<any[]>([]);
-  const [searching, setSearching] = useState(false);
-  const [searchError, setSearchError] = useState("");
+  const [mediaSearching, setMediaSearching] = useState(false);
+  const [torrentSearching, setTorrentSearching] = useState(false);
+  const [mediaSearchError, setMediaSearchError] = useState("");
+  const [torrentSearchError, setTorrentSearchError] = useState("");
+  const searching = mediaSearching || torrentSearching;
   const [discoverMode, setDiscoverMode] = useState<DiscoverMode>("home");
   const [browseMode, setBrowseMode] = useState<DiscoverBrowseMode>("casual");
   const [searchHistory, setSearchHistory] = useState<string[]>(() => readSearchHistory());
@@ -1303,6 +1306,7 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
   const filterLoadingPageRef = useRef<number | null>(null);
   const detailReturnScrollRef = useRef<number | null>(null);
   const detailRequestId = useRef(0);
+  const searchRequestId = useRef(0);
   const lists = data ? [
     { title: "流行趋势", items: data.trending },
     { title: "热门电影", items: data.popular_movies },
@@ -1431,11 +1435,14 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
 
   function resetDiscoverHome() {
     detailRequestId.current += 1;
+    searchRequestId.current += 1;
     setQuery("");
     setMedia([]);
     setTorrents([]);
-    setSearching(false);
-    setSearchError("");
+    setMediaSearching(false);
+    setTorrentSearching(false);
+    setMediaSearchError("");
+    setTorrentSearchError("");
     setDiscoverMode("home");
     setBrowseMode("casual");
     setExpandedDiscoverTitle(null);
@@ -1449,11 +1456,15 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
 
   function switchBrowseMode(nextMode: DiscoverBrowseMode) {
     detailRequestId.current += 1;
+    searchRequestId.current += 1;
     setBrowseMode(nextMode);
     setDiscoverMode("home");
     setMedia([]);
     setTorrents([]);
-    setSearchError("");
+    setMediaSearching(false);
+    setTorrentSearching(false);
+    setMediaSearchError("");
+    setTorrentSearchError("");
     setExpandedDiscoverTitle(null);
     setSelectedMedia(null);
     setSelectedPerson(null);
@@ -1482,9 +1493,13 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
   async function runSearchKeyword(value: string) {
     const keyword = value.trim();
     if (!keyword) return;
+    const requestId = searchRequestId.current + 1;
+    searchRequestId.current = requestId;
     setQuery(keyword);
-    setSearching(true);
-    setSearchError("");
+    setMediaSearching(true);
+    setTorrentSearching(true);
+    setMediaSearchError("");
+    setTorrentSearchError("");
     setDiscoverMode("dual");
     detailRequestId.current += 1;
     setExpandedDiscoverTitle(null);
@@ -1495,19 +1510,33 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
     setMedia([]);
     setTorrents([]);
     setSearchHistory(writeSearchHistory(keyword));
-    const [mediaResult, torrentResult] = await Promise.allSettled([
-      api<{ items: any[] }>(`/api/search/media?q=${encodeURIComponent(keyword)}`),
-      api<{ items: any[] }>(`/api/search/mteam?q=${encodeURIComponent(keyword)}`)
-    ]);
-    if (mediaResult.status === "fulfilled") setMedia(mediaResult.value.items);
-    else setMedia([]);
-    if (torrentResult.status === "fulfilled") setTorrents(torrentResult.value.items);
-    else setTorrents([]);
-    const errors = [mediaResult, torrentResult]
-      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
-      .map((result) => (result.reason as Error).message);
-    setSearchError(errors.join("\n"));
-    setSearching(false);
+    const mediaRequest = api<{ items: any[] }>(`/api/search/media?q=${encodeURIComponent(keyword)}`)
+      .then((result) => {
+        if (searchRequestId.current === requestId) setMedia(Array.isArray(result.items) ? result.items : []);
+      })
+      .catch((err) => {
+        if (searchRequestId.current === requestId) {
+          setMedia([]);
+          setMediaSearchError((err as Error).message);
+        }
+      })
+      .finally(() => {
+        if (searchRequestId.current === requestId) setMediaSearching(false);
+      });
+    const torrentRequest = api<{ items: any[] }>(`/api/search/mteam?q=${encodeURIComponent(keyword)}`)
+      .then((result) => {
+        if (searchRequestId.current === requestId) setTorrents(Array.isArray(result.items) ? result.items : []);
+      })
+      .catch((err) => {
+        if (searchRequestId.current === requestId) {
+          setTorrents([]);
+          setTorrentSearchError((err as Error).message);
+        }
+      })
+      .finally(() => {
+        if (searchRequestId.current === requestId) setTorrentSearching(false);
+      });
+    await Promise.allSettled([mediaRequest, torrentRequest]);
   }
 
   async function openMediaDetail(item: any) {
@@ -1595,6 +1624,8 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
   async function searchMTeamFromMedia(item: any) {
     const keyword = String(item?.title || item?.original_title || "").trim();
     if (!keyword) return;
+    const requestId = searchRequestId.current + 1;
+    searchRequestId.current = requestId;
     setQuery(keyword);
     detailRequestId.current += 1;
     setSelectedMedia(null);
@@ -1606,16 +1637,18 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
     setTorrents([]);
     setBrowseMode("casual");
     setDiscoverMode("mteam");
-    setSearching(true);
-    setSearchError("");
+    setMediaSearching(false);
+    setTorrentSearching(true);
+    setMediaSearchError("");
+    setTorrentSearchError("");
     try {
       setSearchHistory(writeSearchHistory(keyword));
       const result = await api<{ items: any[] }>(`/api/search/mteam?q=${encodeURIComponent(keyword)}`);
-      setTorrents(result.items);
+      if (searchRequestId.current === requestId) setTorrents(Array.isArray(result.items) ? result.items : []);
     } catch (err) {
-      setSearchError((err as Error).message);
+      if (searchRequestId.current === requestId) setTorrentSearchError((err as Error).message);
     } finally {
-      setSearching(false);
+      if (searchRequestId.current === requestId) setTorrentSearching(false);
     }
   }
 
@@ -1727,26 +1760,32 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
       {!selectedPerson && !selectedMedia && !expandedDiscoverList && discoverMode !== "mteam" && (
         <DiscoverModeTabs mode={browseMode} onChange={switchBrowseMode} />
       )}
-      {searchError && <p className="error">{searchError}</p>}
       {selectedPerson ? (
         <PersonDetailPage person={selectedPerson} loading={detailLoading} error={detailError} canGoBack={detailHistory.length > 0} onBack={returnToPreviousDetail} onExit={closeMediaDetail} onMediaSelect={openMediaDetail} />
       ) : selectedMedia ? (
-        <MediaDetailPage item={selectedMedia} loading={detailLoading} error={detailError} canGoBack={detailHistory.length > 0} onBack={returnToPreviousDetail} onExit={closeMediaDetail} onPersonSelect={openPersonDetail} onMediaSelect={openMediaDetail} onMTeamSearch={searchMTeamFromMedia} mteamSearching={searching} />
+        <MediaDetailPage item={selectedMedia} loading={detailLoading} error={detailError} canGoBack={detailHistory.length > 0} onBack={returnToPreviousDetail} onExit={closeMediaDetail} onPersonSelect={openPersonDetail} onMediaSelect={openMediaDetail} onMTeamSearch={searchMTeamFromMedia} mteamSearching={torrentSearching} />
       ) : expandedDiscoverList ? (
         <DiscoverCollectionPage title={expandedDiscoverList.title} items={expandedDiscoverList.items} onBack={() => setExpandedDiscoverTitle(null)} onSelect={openMediaDetail} />
       ) : (
         <>
           {discoverMode === "dual" || discoverMode === "mteam" ? (
             <div className="discover-search-results">
-              {discoverMode === "dual" && <MediaSearchResults items={media} onSelect={openMediaDetail} loading={searching} />}
+              {discoverMode === "dual" && (
+                <div className="search-results-toolbar">
+                  <button type="button" onClick={resetDiscoverHome}><ArrowLeft size={17} />返回发现</button>
+                  {query && <span>{searching ? `正在搜索“${query}”` : `“${query}”的搜索结果`}</span>}
+                </div>
+              )}
+              {discoverMode === "dual" && <MediaSearchResults items={media} onSelect={openMediaDetail} loading={mediaSearching} error={mediaSearchError} />}
               <MTeamResourceResults
                 items={sortedTorrents}
-                loading={searching}
+                loading={torrentSearching}
+                error={torrentSearchError}
                 sortBy={resourceSort}
                 sortDirection={resourceSortDirection}
                 onSortBy={setResourceSort}
                 onSortDirection={setResourceSortDirection}
-                onBack={resetDiscoverHome}
+                onBack={discoverMode === "mteam" ? resetDiscoverHome : undefined}
               />
             </div>
           ) : null}
@@ -4474,30 +4513,44 @@ function LockedCard({ title, message, onOpen }: { title: string; message: string
   return <button className="downloader-node locked" type="button" onClick={onOpen}><div className="downloader-node-head"><div className="downloader-node-title"><h3>{title}</h3></div><Lock size={16} /></div><p>{message}</p><small className="downloader-node-helper">需要管理员验证</small></button>;
 }
 
-function MediaSearchResults({ items = [], onSelect, loading }: { items: any[]; onSelect: (item: any) => void; loading?: boolean }) {
+function MediaSearchResults({ items = [], onSelect, loading, error }: { items: any[]; onSelect: (item: any) => void; loading?: boolean; error?: string }) {
   return (
-    <Panel title="TMDB 媒体结果">
-      <div className="media-result-grid">
-        {loading && <SearchLoadingState title="正在搜索 TMDB 媒体" detail="正在匹配影视条目、评分、海报和演职员信息" />}
-        {items.map((item) => <MediaResultCard item={item} onSelect={onSelect} key={item.id} />)}
-        {!loading && !items.length && <p className="muted">没有搜索到 TMDB 媒体，或 TMDB 尚未启用。</p>}
+    <section className="panel search-result-panel">
+      <div className="search-result-header">
+        <div className="search-result-heading">
+          <h2>TMDB 媒体结果</h2>
+          <small>{loading ? "正在读取 TMDB" : error ? "读取失败" : `共 ${items.length} 条`}</small>
+        </div>
       </div>
-    </Panel>
+      {loading && !items.length ? <SearchLoadingState title="正在搜索 TMDB 媒体" detail="正在匹配影视条目、评分、海报和演职员信息" /> : (
+        <div className="media-result-grid">
+        {items.map((item) => <MediaResultCard item={item} onSelect={onSelect} key={item.id} />)}
+          {!loading && !items.length && !error && <p className="muted">没有搜索到 TMDB 媒体，或 TMDB 尚未启用。</p>}
+        </div>
+      )}
+      {error && <p className="search-result-error">{error}</p>}
+    </section>
   );
 }
 
 function MediaResultCard({ item, onSelect }: { item: any; onSelect: (item: any) => void }) {
   const genres = (item.genres ?? []).slice(0, 4);
   const seasonEpisode = tvSeasonEpisodeLabel(item);
-  const latestSeason = tvLatestSeasonLabel(item);
-  const latestEpisode = tvEpisodeAirLabel(item.last_episode_to_air, "已播至");
-  const meta = [
-    item.media_type === "tv" ? "剧集" : "电影",
-    item.year,
+  const latestSeason = tvLatestSeasonLabel(item, false);
+  const latestEpisode = tvEpisodeAirLabel(item.last_episode_to_air, "");
+  const mediaTypeLabel = item.media_type === "tv" ? "剧集" : "电影";
+  const countryLabel = mediaCountryLabel(item);
+  const rating = Number(item.rating ?? 0);
+  const voteCount = Number(item.vote_count ?? 0);
+  const popularity = Number(item.popularity ?? 0);
+  const overview = String(item.overview ?? "").trim();
+  const facts = [
+    mediaTypeLabel,
+    item.year && item.year !== "未知" ? String(item.year) : "年份未知",
     item.runtime ? `${item.runtime} 分钟` : "",
     seasonEpisode,
-    mediaCountryLabel(item)
-  ].filter(Boolean).join(" / ");
+    countryLabel
+  ].filter(Boolean);
 
   return (
     <article
@@ -4511,23 +4564,60 @@ function MediaResultCard({ item, onSelect }: { item: any; onSelect: (item: any) 
     >
       {item.backdrop && <img className="media-backdrop" src={item.backdrop} alt="" loading="lazy" decoding="async" onError={handleImageError} />}
       <div className="media-card-shade" />
-      <img className="media-poster" src={item.poster} alt="" loading="lazy" decoding="async" onError={handleImageError} />
+      <div className="media-poster-shell">
+        <img className="media-poster" src={item.poster} alt="" loading="lazy" decoding="async" onError={handleImageError} />
+      </div>
       <div className="media-card-body">
         <div className="media-card-heading">
-          <div>
+          <div className="media-card-title-copy">
             <h3>{item.title}</h3>
-            <span>{item.original_title && item.original_title !== item.title ? item.original_title : meta}</span>
+            {item.original_title && item.original_title !== item.title ? <span>{item.original_title}</span> : null}
           </div>
-          <span className="rating-badge"><Star size={15} /> {numberLabel(item.rating ?? 0, 1)}</span>
+          <span className={rating > 0 ? "rating-badge" : "rating-badge unrated"}>
+            <Star size={15} />
+            {rating > 0 ? numberLabel(rating, 1) : "暂无评分"}
+          </span>
         </div>
-        <div className="media-meta-row">
-          <InfoPill icon={Film} text={meta} />
-          {latestSeason ? <InfoPill icon={CalendarDays} text={latestSeason} /> : null}
-          {latestEpisode ? <InfoPill icon={Clock3} text={latestEpisode} /> : null}
-          <InfoPill icon={Users} text={`${item.vote_count ?? 0} 票`} />
-          {item.popularity ? <InfoPill icon={Activity} text={`热度 ${item.popularity}`} /> : null}
+        {facts.length > 0 && (
+          <div className="media-card-facts">
+            {facts.map((fact) => <span key={fact}>{fact}</span>)}
+          </div>
+        )}
+        {(latestSeason || latestEpisode) && (
+          <div className="media-card-updates">
+            {latestSeason && (
+              <div className="media-card-update">
+                <span className="media-card-update-icon"><CalendarDays size={15} /></span>
+                <div>
+                  <small>最新季度</small>
+                  <span>{latestSeason}</span>
+                </div>
+              </div>
+            )}
+            {latestEpisode && (
+              <div className="media-card-update">
+                <span className="media-card-update-icon"><Clock3 size={15} /></span>
+                <div>
+                  <small>最近播出</small>
+                  <span>{latestEpisode}</span>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        {item.media_type === "movie" && overview && (
+          <div className="media-card-overview">
+            <small>剧情简介</small>
+            <p>{overview}</p>
+          </div>
+        )}
+        <div className="media-card-footer">
+          {genres.length > 0 && <div className="chip-row">{genres.map((genre: string) => <span className="soft-chip" key={genre}>{genre}</span>)}</div>}
+          <div className="media-card-stats">
+            <span><Users size={14} />{numberLabel(voteCount)} 票</span>
+            {popularity > 0 ? <span><Activity size={14} />热度 {numberLabel(popularity, 1)}</span> : null}
+          </div>
         </div>
-        {genres.length > 0 && <div className="chip-row">{genres.map((genre: string) => <span className="soft-chip" key={genre}>{genre}</span>)}</div>}
       </div>
     </article>
   );
@@ -4536,6 +4626,7 @@ function MediaResultCard({ item, onSelect }: { item: any; onSelect: (item: any) 
 function MTeamResourceResults({
   items = [],
   loading,
+  error,
   sortBy,
   sortDirection,
   onSortBy,
@@ -4544,18 +4635,22 @@ function MTeamResourceResults({
 }: {
   items: any[];
   loading?: boolean;
+  error?: string;
   sortBy: string;
   sortDirection: "asc" | "desc";
   onSortBy: (value: string) => void;
   onSortDirection: (value: "asc" | "desc") => void;
-  onBack: () => void;
+  onBack?: () => void;
 }) {
   return (
-    <section className="panel">
-      <div className="resource-panel-header">
-        <div className="resource-panel-title">
-          <button type="button" onClick={onBack}>返回发现</button>
-          <h2>M-Team 资源结果</h2>
+    <section className="panel search-result-panel">
+      <div className="search-result-header">
+        <div className="search-result-title-row">
+          {onBack && <button type="button" onClick={onBack}><ArrowLeft size={17} />返回发现</button>}
+          <div className="search-result-heading">
+            <h2>M-Team 资源结果</h2>
+            <small>{loading ? "正在读取 M-Team" : error ? "读取失败" : `共 ${items.length} 条`}</small>
+          </div>
         </div>
         <div className="resource-sort-tools">
           <label>
@@ -4572,11 +4667,13 @@ function MTeamResourceResults({
           </div>
         </div>
       </div>
-      <div className="mteam-resource-list">
-        {loading && <SearchLoadingState title="正在搜索 M-Team 资源" detail="正在读取资源、体积、做种、促销和评分字段" />}
-        {items.map((item) => <MTeamResourceCard item={item} key={item.id} />)}
-        {!loading && !items.length && <p className="muted">没有搜索到 M-Team 资源，或 M-Team 尚未启用。</p>}
-      </div>
+      {loading && !items.length ? <SearchLoadingState title="正在搜索 M-Team 资源" detail="正在读取资源、体积、做种、促销和评分字段" /> : (
+        <div className="mteam-resource-list">
+          {items.map((item) => <MTeamResourceCard item={item} key={item.id} />)}
+          {!loading && !items.length && !error && <p className="muted">没有搜索到 M-Team 资源，或 M-Team 尚未启用。</p>}
+        </div>
+      )}
+      {error && <p className="search-result-error">{error}</p>}
     </section>
   );
 }

@@ -1954,7 +1954,7 @@ TMDB_MOVIE_REQUEST_HINTS = ("电影", "電影", "影片")
 
 
 def tmdb_filters_for_request(intent: dict[str, Any], message: str) -> dict[str, Any]:
-    """Keep AI title lookup compatible with the discover page when the model guesses a medium."""
+    """Keep AI title lookup compatible with direct TMDB search when the model guesses filters."""
     filters = dict(intent.get("tmdb_filters") or {})
     text = str(message or "").lower()
     query = str(intent.get("query") or "").strip()
@@ -1965,6 +1965,12 @@ def tmdb_filters_for_request(intent: dict[str, Any], message: str) -> dict[str, 
     elif query and str(filters.get("media_type") or "all").lower() in {"movie", "tv"}:
         # An unqualified title should search both types, exactly like Discover.
         filters["media_type"] = "all"
+    if query:
+        # The language used to write a localized title is not the work's
+        # original language, and its translated name does not imply a production
+        # country. Keeping AI-guessed values here can discard an exact TMDB hit.
+        filters["language"] = ""
+        filters["region"] = ""
     return filters
 
 
