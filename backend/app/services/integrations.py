@@ -10,6 +10,7 @@ from app.models.entities import ConfigAuditLog, IntegrationConfig
 from app.services.crypto import decrypt_text, encrypt_text
 from app.utils.ids import trace_id
 from app.utils.redaction import parse_raw_headers, redact_payload
+from app.utils.time import utc_iso, utc_now_naive
 
 
 PROVIDERS = ["mteam", "qb1", "qb2", "qb3", "tmdb", "ai", "wechat_claw"]
@@ -183,9 +184,9 @@ def upsert_config(
     row.redacted_summary = redact_payload(normalized)
     row.last_tested_at = None
     row.last_test_result = None
-    row.updated_at = datetime.utcnow()
+    row.updated_at = utc_now_naive()
     row.updated_by = actor_user_id
-    row.enabled = row.enabled if normalized else False
+    row.enabled = False if provider == "tmdb" else (row.enabled if normalized else False)
     audit = ConfigAuditLog(
         provider=provider,
         config_version=row.config_version,
@@ -210,7 +211,7 @@ def record_test_result(
     if row is None:
         row = IntegrationConfig(provider=provider, config_version=1, redacted_summary={})
         db.add(row)
-    row.last_tested_at = datetime.utcnow()
+    row.last_tested_at = utc_now_naive()
     row.last_test_result = redact_payload(result)
     db.add(
         ConfigAuditLog(
@@ -233,7 +234,7 @@ def set_enabled(db: Session, provider: str, enabled: bool, actor_user_id: int) -
         row = IntegrationConfig(provider=provider, config_version=1, redacted_summary={})
         db.add(row)
     row.enabled = enabled
-    row.updated_at = datetime.utcnow()
+    row.updated_at = utc_now_naive()
     row.updated_by = actor_user_id
     db.add(
         ConfigAuditLog(
@@ -256,9 +257,9 @@ def serialize_config(row: IntegrationConfig, include_plain_payload: bool = False
         "config_version": row.config_version,
         "enabled": row.enabled,
         "redacted_summary": row.redacted_summary or {},
-        "last_tested_at": row.last_tested_at.isoformat() if row.last_tested_at else None,
+        "last_tested_at": utc_iso(row.last_tested_at) if row.last_tested_at else None,
         "last_test_result": row.last_test_result,
-        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "updated_at": utc_iso(row.updated_at) if row.updated_at else None,
     }
     if include_plain_payload:
         saved_payload, unreadable = decode_saved_payload(row.encrypted_payload)

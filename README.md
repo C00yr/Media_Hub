@@ -42,6 +42,9 @@ The app generates its runtime encryption/JWT secrets on first start and stores t
 `data/runtime-secrets.json`. Keep the `data` folder when upgrading or recreating containers.
 Advanced users can still create `.env` from `.env.example` to override network/storage defaults.
 
+Browser timestamps and request-time calendar labels use the viewer device's current system timezone. Background jobs and WeChat replies without a browser context use `APP_TIMEZONE` (an IANA name such as `Asia/Shanghai`); the bundled Compose file defaults to `Asia/Shanghai`. Set this value in `.env` when the NAS uses another timezone. Timestamps remain stored in UTC so changing the display timezone does not rewrite historical data.
+
+
 Source-code development and NAS deployment are separate application instances. Do not copy the NAS database into `data/local`, and do not point local `DATABASE_URL` at a NAS share. The backend validates this at startup and rejects accidental cross-profile SQLite paths.
 
 ## Media Search Proxy

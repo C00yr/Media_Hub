@@ -2,7 +2,7 @@ import logging
 import secrets
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import inspect, text
@@ -14,6 +14,7 @@ from app.db.session import Base, SessionLocal, engine
 from app.models import entities  # noqa: F401
 from app.models.entities import Setting, User
 from app.tasks.scheduler import build_scheduler, capture_snapshots, start_wechat_claw_polling, stop_wechat_claw_polling
+from app.utils.time import reset_client_timezone, set_client_timezone
 
 
 settings = get_settings()
@@ -81,6 +82,14 @@ def create_app() -> FastAPI:
     ensure_default_admin()
     ensure_super_password()
     app = FastAPI(title=settings.app_name, version=settings.app_version)
+
+    @app.middleware("http")
+    async def apply_client_timezone(request: Request, call_next):
+        token = set_client_timezone(request.headers.get("X-Client-Timezone"))
+        try:
+            return await call_next(request)
+        finally:
+            reset_client_timezone(token)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list,

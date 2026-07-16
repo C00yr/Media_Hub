@@ -74,6 +74,7 @@ class Settings(BaseSettings):
     debug_trace_retention_days: int = 7
     snapshot_interval_minutes: int = 10
     static_dir: str = "static"
+    app_timezone: str = Field(default_factory=lambda: (os.getenv("APP_TIMEZONE") or os.getenv("TZ") or "").strip())
     tmdb_mode: str = "direct"
     tmdb_proxy_url: str = ""
     tmdb_image_cache_dir: str = "/data/image-cache/tmdb"

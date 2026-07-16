@@ -4,6 +4,8 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
 
+from app.utils.time import utc_iso
+
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"
@@ -215,7 +217,7 @@ class DeepSeekChatAdapter:
             "success": bool(isinstance(payload, dict) and payload.get("ok") is True),
             "model": self.model,
             "base_url": self.base_url,
-            "checked_at": datetime.utcnow().isoformat(),
+            "checked_at": utc_iso(),
         }
 
     def _chat(self, messages: list[dict[str, str]], json_mode: bool, max_tokens: int) -> str:

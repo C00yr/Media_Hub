@@ -12,7 +12,8 @@ dependencies = [
   "cryptography>=44.0.0",
   "python-jose[cryptography]>=3.3.0",
   "bcrypt>=4.2.1",
-  "apscheduler>=3.11.0"
+  "apscheduler>=3.11.0",
+  "tzdata>=2025.2"
 ]
 
 [project.optional-dependencies]

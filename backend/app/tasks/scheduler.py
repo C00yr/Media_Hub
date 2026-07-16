@@ -12,6 +12,7 @@ from app.adapters.tmdb import TmdbAdapter
 from app.db.session import SessionLocal
 from app.models.entities import MTeamSnapshot, QbSnapshot
 from app.services.integrations import get_config, get_decrypted_config
+from app.utils.time import system_now
 
 
 logger = logging.getLogger(__name__)
@@ -187,6 +188,6 @@ def stop_wechat_claw_polling() -> None:
 def build_scheduler(interval_minutes: int) -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(capture_snapshots, "interval", minutes=interval_minutes, id="app_snapshots", replace_existing=True)
-    scheduler.add_job(check_external_module_health, "interval", hours=1, id="external_module_health", replace_existing=True, next_run_time=datetime.utcnow())
-    scheduler.add_job(refresh_preload_caches, "interval", hours=1, id="preload_caches", replace_existing=True, next_run_time=datetime.utcnow())
+    scheduler.add_job(check_external_module_health, "interval", hours=1, id="external_module_health", replace_existing=True, next_run_time=system_now())
+    scheduler.add_job(refresh_preload_caches, "interval", hours=1, id="preload_caches", replace_existing=True, next_run_time=system_now())
     return scheduler

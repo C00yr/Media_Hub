@@ -1,6 +1,6 @@
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from http.cookiejar import CookieJar
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -9,6 +9,7 @@ from urllib.request import HTTPCookieProcessor, ProxyHandler, Request, build_ope
 
 from app.adapters.base import QbittorrentAdapter
 from app.utils.ids import trace_id
+from app.utils.time import utc_iso
 
 
 class QbittorrentConfigError(ValueError):
@@ -65,7 +66,7 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
             "total_space": _float(state.get("total_space") or state.get("total_disk_space")),
             "connection_status": state.get("connection_status"),
             "source": "qB Web API 原始数据（Real）",
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": utc_iso(),
         }
 
     def get_torrents(self, downloader_id: str, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -99,7 +100,7 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
             "files": [self._normalize_file(index, item) for index, item in enumerate(files) if isinstance(item, dict)],
             "trackers": [self._normalize_tracker(item) for item in trackers if isinstance(item, dict)],
             "source": "qB Web API 原始数据（Real）",
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": utc_iso(),
         }
 
     def set_file_priority(self, downloader_id: str, torrent_hash: str, file_id: int, priority: int) -> dict[str, Any]:
@@ -187,7 +188,7 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
             "version": version,
             "download_speed": state["download_speed"],
             "upload_speed": state["upload_speed"],
-            "checked_at": datetime.utcnow().isoformat(),
+            "checked_at": utc_iso(),
         }
 
     def _normalize_torrent(self, item: dict[str, Any]) -> dict[str, Any]:
@@ -421,7 +422,7 @@ def _timestamp_label(value: Any) -> str | None:
     seconds = _float(value)
     if seconds <= 0:
         return None
-    return datetime.utcfromtimestamp(seconds).isoformat()
+    return utc_iso(datetime.fromtimestamp(seconds, timezone.utc))
 
 
 def _first_text(payload: dict[str, Any], *keys: str) -> str:

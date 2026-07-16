@@ -8,6 +8,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import ProxyHandler, Request, build_opener
 
+from app.utils.time import epoch_milliseconds, utc_iso
+
 
 class WechatClawConfigError(ValueError):
     pass
@@ -149,7 +151,7 @@ class WechatClawAdapter:
                     "connected": False,
                     "base_url": self.base_url,
                     "message": "微信连接已就绪，等待扫码。",
-                    "checked_at": datetime.utcnow().isoformat(),
+                    "checked_at": utc_iso(),
                 }
             payload = self._json_request("POST", f"{self.base_url}/ilink/bot/getconfig", {}, timeout=max(self.timeout, 20))
             ok = self._ok(payload) or "ilink_user_id required" in str(payload.get("message") or payload.get("errmsg") or "").lower()
@@ -159,7 +161,7 @@ class WechatClawAdapter:
                 "connected": ok,
                 "base_url": self.base_url,
                 "message": "微信已连接。" if ok else "微信登录状态暂不可用。",
-                "checked_at": datetime.utcnow().isoformat(),
+                "checked_at": utc_iso(),
             }
         return {
             "success": True,
@@ -169,7 +171,7 @@ class WechatClawAdapter:
             "mobile_app_url": self.public_base_url,
             "mobile_chat_url": f"{self.public_base_url}/api/wechat-claw/message",
             "capabilities_url": f"{self.public_base_url}/api/wechat-claw/capabilities",
-            "checked_at": datetime.utcnow().isoformat(),
+            "checked_at": utc_iso(),
         }
 
     def get_qrcode(self) -> dict[str, Any]:
@@ -265,7 +267,7 @@ class WechatClawAdapter:
         message = {
             "from_user_id": self.account_id,
             "to_user_id": to_user,
-            "client_id": f"pt-media-hub:{int(datetime.utcnow().timestamp() * 1000)}:{secrets.token_hex(4)}",
+            "client_id": f"pt-media-hub:{epoch_milliseconds()}:{secrets.token_hex(4)}",
             "message_type": 2,
             "message_state": 2,
             "context_token": context_token,

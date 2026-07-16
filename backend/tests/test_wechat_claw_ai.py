@@ -129,6 +129,78 @@ def test_wechat_claw_provider_and_notification_preferences():
     assert monitored.status_code == 200
     assert monitored.json()["result"]["monitoring"] is True
 
+def test_disabled_wechat_claw_session_is_not_reported_as_operational():
+    token = admin_token()
+    headers = auth_headers(token)
+    tested = client.post(
+        "/api/admin/integrations/wechat_claw/test",
+        headers=headers,
+        json={"payload": {"mode": "ilink", "poll_timeout": 25, "default_downloader_id": "all"}},
+    )
+    assert tested.status_code == 200
+    assert client.post("/api/admin/integrations/wechat_claw/enable", headers=headers).status_code == 200
+
+    listed = client.get("/api/admin/wechat-claw/bindings", headers=headers)
+    assert listed.status_code == 200
+    member = listed.json()["items"][0]
+    binding_id = member["id"]
+
+    enabled_member = client.patch(
+        f"/api/admin/wechat-claw/bindings/{binding_id}",
+        headers=headers,
+        json={
+            "display_name": member["display_name"],
+            "role_name": member["role_name"],
+            "enabled": True,
+            "notification_preferences": member["notification_preferences"],
+        },
+    )
+    assert enabled_member.status_code == 200
+    with SessionLocal() as db:
+        update_wechat_claw_ilink_state(db, binding_id, bot_token="preserved-token", account_id="wx-preserved")
+
+    health = client.get("/api/diagnostics/health", headers=headers)
+    active_member = next(item for item in health.json()["wechat_members"] if item["id"] == binding_id)
+    assert active_member["connected"] is True
+    assert active_member["module_enabled"] is True
+    assert active_member["operational"] is True
+
+    assert client.post("/api/admin/integrations/wechat_claw/disable", headers=headers).status_code == 200
+    health = client.get("/api/diagnostics/health", headers=headers)
+    disabled_module_member = next(item for item in health.json()["wechat_members"] if item["id"] == binding_id)
+    assert disabled_module_member["connected"] is True
+    assert disabled_module_member["module_enabled"] is False
+    assert disabled_module_member["operational"] is False
+
+    assert client.post("/api/admin/integrations/wechat_claw/enable", headers=headers).status_code == 200
+    disabled_member = client.patch(
+        f"/api/admin/wechat-claw/bindings/{binding_id}",
+        headers=headers,
+        json={
+            "display_name": member["display_name"],
+            "role_name": member["role_name"],
+            "enabled": False,
+            "notification_preferences": member["notification_preferences"],
+        },
+    )
+    assert disabled_member.status_code == 200
+    health = client.get("/api/diagnostics/health", headers=headers)
+    inactive_member = next(item for item in health.json()["wechat_members"] if item["id"] == binding_id)
+    assert inactive_member["connected"] is True
+    assert inactive_member["enabled"] is False
+    assert inactive_member["operational"] is False
+
+    restore_member = client.patch(
+        f"/api/admin/wechat-claw/bindings/{binding_id}",
+        headers=headers,
+        json={
+            "display_name": member["display_name"],
+            "role_name": member["role_name"],
+            "enabled": True,
+            "notification_preferences": member["notification_preferences"],
+        },
+    )
+    assert restore_member.status_code == 200
 
 def test_mobile_reply_renderer_has_stable_sections():
     rendered = render_mobile_reply(

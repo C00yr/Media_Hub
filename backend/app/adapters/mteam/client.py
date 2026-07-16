@@ -8,6 +8,7 @@ from urllib.parse import urlencode, urlparse
 from urllib.request import ProxyHandler, Request, build_opener
 
 from app.adapters.base import TrackerAdapter
+from app.utils.time import system_timezone, utc_iso
 
 
 MTEAM_API_BASE = "https://api.m-team.cc"
@@ -151,7 +152,7 @@ class MTeamAdapter(TrackerAdapter):
             "warned": bool(member_status.get("warned")),
             "bonus_per_hour_label": "M-Team 原始数据",
             "source": "M-Team 原始数据（Real API）",
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": utc_iso(),
             "traffic_history": _traffic_history(data),
             "seeding_info": seeding_stats["items"],
             "raw_summary": _compact_raw_summary(data),
@@ -170,7 +171,7 @@ class MTeamAdapter(TrackerAdapter):
             "user_level": _mteam_role_label(data.get("role")) or "User",
             "upload_total": _bytes_from_any(member_count.get("uploaded")),
             "download_total": _bytes_from_any(member_count.get("downloaded")),
-            "checked_at": datetime.utcnow().isoformat(),
+            "checked_at": utc_iso(),
         }
 
     def search_torrents(self, query: str, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -763,7 +764,7 @@ def _parse_datetime(value: Any) -> datetime | None:
         else:
             try:
                 parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-                return parsed if parsed.tzinfo else parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=system_timezone())
             except ValueError:
                 return None
     if seconds > 10_000_000_000:

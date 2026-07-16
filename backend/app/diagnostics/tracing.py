@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.models.entities import DebugTrace
 from app.utils.ids import trace_id as make_trace_id
 from app.utils.redaction import redact_payload
+from app.utils.time import utc_iso
 
 
 class TraceRecorder:
@@ -21,7 +22,7 @@ class TraceRecorder:
     def add(self, message: str, data: dict[str, Any] | None = None) -> None:
         self.timeline.append(
             {
-                "at": datetime.utcnow().isoformat(),
+                "at": utc_iso(),
                 "message": message,
                 "data": redact_payload(data or {}),
             }

@@ -65,6 +65,7 @@ from app.services.integrations import (
 )
 from app.utils.ids import trace_id
 from app.utils.redaction import redact_payload
+from app.utils.time import format_system_datetime, parse_datetime, system_datetime, system_timezone_name, utc_iso, utc_now, utc_now_naive
 
 
 router = APIRouter()
@@ -241,18 +242,25 @@ def serialize_wechat_claw_binding(binding: WechatClawBinding) -> dict[str, Any]:
         "avatar_key": binding.avatar_key or "mint",
         "enabled": binding.enabled,
         "notification_preferences": normalized_wechat_claw_binding_preferences(binding.notification_preferences),
-        "created_at": binding.created_at.isoformat() if binding.created_at else None,
-        "updated_at": binding.updated_at.isoformat() if binding.updated_at else None,
+        "created_at": utc_iso(binding.created_at) if binding.created_at else None,
+        "updated_at": utc_iso(binding.updated_at) if binding.updated_at else None,
     }
 
 
 def wechat_claw_binding_status(db: Session, binding: WechatClawBinding) -> dict[str, Any]:
     state = get_wechat_claw_ilink_state(db, binding.id)
     last_poll = get_wechat_claw_last_poll(db, binding.id)
+    provider = get_config(db, "wechat_claw")
+    configured = bool(provider and provider.encrypted_payload)
+    module_enabled = bool(provider and provider.enabled)
+    member_enabled = bool(binding.enabled)
+    connected = bool(state.get("bot_token"))
     return {
         **serialize_wechat_claw_binding(binding),
-        "configured": bool(get_config(db, "wechat_claw") and get_config(db, "wechat_claw").encrypted_payload),
-        "connected": bool(state.get("bot_token")),
+        "configured": configured,
+        "module_enabled": module_enabled,
+        "connected": connected,
+        "operational": module_enabled and member_enabled and connected,
         "account_id": state.get("account_id") or "",
         "qrcode_status": (state.get("qrcode") or {}).get("status") if isinstance(state.get("qrcode"), dict) else "",
         "last_poll": last_poll,
@@ -337,7 +345,7 @@ def normalized_mteam_task_metadata(item: dict[str, Any] | None) -> dict[str, Any
         "audio_codec": str(source.get("audio_codec") or "").strip()[:80],
         "imdb_rating": str(source.get("imdb_rating") or "").strip()[:40],
         "douban_rating": str(source.get("douban_rating") or "").strip()[:40],
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": utc_iso(),
     }
 
 
@@ -360,12 +368,12 @@ def save_qb_task_metadata(
         for info_hash in info_hashes:
             tasks[info_hash.lower()] = metadata
         tasks = dict(list(tasks.items())[-200:])
-        payload = {"tasks": tasks, "updated_at": datetime.utcnow().isoformat()}
+        payload = {"tasks": tasks, "updated_at": utc_iso()}
         if row is None:
             db.add(Setting(key=key, value=payload))
         else:
             row.value = payload
-            row.updated_at = datetime.utcnow()
+            row.updated_at = utc_now_naive()
         db.commit()
     return info_hashes
 
@@ -512,12 +520,12 @@ def record_qb_task_transitions(db: Session, downloader_id: str, tasks: list[dict
         elif not bool(before.get("error")) and current["error"]:
             transitions.append(("error", task))
 
-    state = {"initialized": True, "updated_at": datetime.utcnow().isoformat(), "tasks": current_tasks}
+    state = {"initialized": True, "updated_at": utc_iso(), "tasks": current_tasks}
     if row is None:
         db.add(Setting(key=key, value=state))
     else:
         row.value = state
-        row.updated_at = datetime.utcnow()
+        row.updated_at = utc_now_naive()
     db.commit()
 
     emitted: list[str] = []
@@ -572,15 +580,15 @@ def record_module_collection_result(db: Session, module: str, success: bool, err
     key = module_health_setting_key(module)
     row = db.query(Setting).filter(Setting.key == key).one_or_none()
     state = dict(row.value) if row and isinstance(row.value, dict) else {}
-    now = datetime.utcnow()
+    now = utc_now_naive()
     hour = now.strftime("%Y-%m-%dT%H")
     if success:
-        state.update({"consecutive_failed_hours": 0, "last_failure_hour": "", "last_success_at": now.isoformat(), "last_error": "", "last_checked_at": now.isoformat()})
+        state.update({"consecutive_failed_hours": 0, "last_failure_hour": "", "last_success_at": utc_iso(now), "last_error": "", "last_checked_at": utc_iso(now)})
     else:
         if state.get("last_failure_hour") != hour:
             state["consecutive_failed_hours"] = int(state.get("consecutive_failed_hours") or 0) + 1
             state["last_failure_hour"] = hour
-        state.update({"last_error": str(error)[:300], "last_checked_at": now.isoformat()})
+        state.update({"last_error": str(error)[:300], "last_checked_at": utc_iso(now)})
     if row is None:
         row = Setting(key=key, value=state)
         db.add(row)
@@ -714,7 +722,7 @@ def signed_int_delta(value: int) -> str:
 
 
 def apply_mteam_five_hour_deltas(db: Session, mteam: dict[str, Any]) -> dict[str, Any]:
-    cutoff = datetime.utcnow() - timedelta(hours=5)
+    cutoff = utc_now_naive() - timedelta(hours=5)
     previous = (
         db.query(MTeamSnapshot)
         .filter(MTeamSnapshot.source != "mock", MTeamSnapshot.captured_at <= cutoff)
@@ -759,7 +767,7 @@ def set_preload_cache(
     context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     row = db.query(Setting).filter(Setting.key == preload_cache_key(name)).one_or_none()
-    value = {"payload": payload, "cached_at": datetime.utcnow().isoformat(), "name": name}
+    value = {"payload": payload, "cached_at": utc_iso(), "name": name}
     if context is not None:
         value["context"] = context
     if row is None:
@@ -767,7 +775,7 @@ def set_preload_cache(
         db.add(row)
     else:
         row.value = value
-        row.updated_at = datetime.utcnow()
+        row.updated_at = utc_now_naive()
     db.commit()
     return value
 
@@ -849,7 +857,7 @@ def serialize_media_favorite(favorite: MediaFavorite) -> dict[str, Any]:
             "favorite_id": favorite.id,
             "tmdb_id": favorite.tmdb_id,
             "media_type": favorite.media_type,
-            "favorited_at": favorite.created_at.isoformat(),
+            "favorited_at": utc_iso(favorite.created_at),
         }
     )
     return rewrite_tmdb_image_urls(payload)
@@ -997,7 +1005,10 @@ def _prune_tmdb_image_cache(cache_dir: Path) -> None:
 
 def _tmdb_image_network_config(db: Session) -> tuple[bool, str, frozenset[str], int]:
     row = get_config(db, "tmdb")
-    config = get_decrypted_config(db, "tmdb") if row and row.encrypted_payload else {}
+    if row and not row.enabled:
+        config = {"proxy_enabled": False}
+    else:
+        config = get_decrypted_config(db, "tmdb") if row and row.encrypted_payload else {}
     proxy_enabled, proxy_url, proxy_domains = resolve_tmdb_proxy_settings(config or {})
     timeout = int((config or {}).get("timeout") or 12)
     return proxy_enabled, proxy_url, proxy_domains, timeout
@@ -1312,7 +1323,7 @@ def mteam_connection_payload(row: IntegrationConfig | None) -> dict[str, Any]:
         "enabled": enabled,
         "last_test_success": last_test_success,
         "config_version": row.config_version if row else 0,
-        "last_tested_at": row.last_tested_at.isoformat() if row and row.last_tested_at else None,
+        "last_tested_at": utc_iso(row.last_tested_at) if row and row.last_tested_at else None,
         "last_test_result": result,
         "data_source": "M-Team 原始数据（Real API）",
         "message": message,
@@ -1476,7 +1487,7 @@ def save_notification_preferences(db: Session, preferences: dict[str, bool]) -> 
         db.add(row)
     else:
         row.value = normalized
-        row.updated_at = datetime.utcnow()
+        row.updated_at = utc_now_naive()
     db.commit()
     return normalized
 
@@ -1547,7 +1558,7 @@ def save_wechat_claw_ilink_state(db: Session, state: dict[str, Any], user_id: in
         db.add(row)
     else:
         row.value = state
-        row.updated_at = datetime.utcnow()
+        row.updated_at = utc_now_naive()
     db.commit()
     return state
 
@@ -1599,7 +1610,7 @@ def save_wechat_claw_mobile_candidates(
         if str(item.get("id") or "").strip()
     ]
     selections[selection_key] = {
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": utc_iso(),
         "context_token": str(request.context_token or ""),
         "query": str(query or "").strip()[:160],
         "recommended_index": int(recommended_index or 0),
@@ -1614,11 +1625,8 @@ def get_wechat_claw_mobile_search_result(db: Session, request: WechatClawMessage
     selections = state.get("mobile_selections") if isinstance(state.get("mobile_selections"), dict) else {}
     selection_key = wechat_claw_mobile_key(request)
     selection = selections.get(selection_key) if isinstance(selections.get(selection_key), dict) else {}
-    try:
-        created_at = datetime.fromisoformat(str(selection.get("created_at") or ""))
-    except ValueError:
-        created_at = datetime.min
-    if (datetime.utcnow() - created_at).total_seconds() > WECHAT_CLAW_MOBILE_SELECTION_TTL_SECONDS:
+    created_at = parse_datetime(selection.get("created_at"))
+    if created_at is None or (utc_now() - created_at).total_seconds() > WECHAT_CLAW_MOBILE_SELECTION_TTL_SECONDS:
         if selection:
             selections.pop(selection_key, None)
             update_wechat_claw_ilink_state(db, mobile_selections=selections)
@@ -1643,11 +1651,8 @@ def get_wechat_claw_mobile_candidate(db: Session, request: WechatClawMessageRequ
     selections = state.get("mobile_selections") if isinstance(state.get("mobile_selections"), dict) else {}
     selection_key = str(request.user_id or request.conversation_id or "default").strip() or "default"
     selection = selections.get(selection_key) if isinstance(selections.get(selection_key), dict) else {}
-    try:
-        created_at = datetime.fromisoformat(str(selection.get("created_at") or ""))
-    except ValueError:
-        created_at = datetime.min
-    if (datetime.utcnow() - created_at).total_seconds() > WECHAT_CLAW_MOBILE_SELECTION_TTL_SECONDS:
+    created_at = parse_datetime(selection.get("created_at"))
+    if created_at is None or (utc_now() - created_at).total_seconds() > WECHAT_CLAW_MOBILE_SELECTION_TTL_SECONDS:
         selections.pop(selection_key, None)
         update_wechat_claw_ilink_state(db, mobile_selections=selections)
         return None
@@ -1663,7 +1668,7 @@ def wechat_claw_mobile_key(request: WechatClawMessageRequest) -> str:
 def save_wechat_claw_pending_download(db: Session, request: WechatClawMessageRequest, candidate: dict[str, Any]) -> None:
     state = get_wechat_claw_ilink_state(db)
     pending = state.get("mobile_pending_downloads") if isinstance(state.get("mobile_pending_downloads"), dict) else {}
-    pending[wechat_claw_mobile_key(request)] = {"created_at": datetime.utcnow().isoformat(), "candidate": candidate}
+    pending[wechat_claw_mobile_key(request)] = {"created_at": utc_iso(), "candidate": candidate}
     update_wechat_claw_ilink_state(db, mobile_pending_downloads=pending)
 
 
@@ -1671,10 +1676,8 @@ def get_wechat_claw_pending_download(db: Session, request: WechatClawMessageRequ
     state = get_wechat_claw_ilink_state(db)
     pending = state.get("mobile_pending_downloads") if isinstance(state.get("mobile_pending_downloads"), dict) else {}
     item = pending.get(wechat_claw_mobile_key(request)) if isinstance(pending.get(wechat_claw_mobile_key(request)), dict) else {}
-    try:
-        fresh = (datetime.utcnow() - datetime.fromisoformat(str(item.get("created_at") or ""))).total_seconds() <= WECHAT_CLAW_MOBILE_SELECTION_TTL_SECONDS
-    except ValueError:
-        fresh = False
+    created_at = parse_datetime(item.get("created_at"))
+    fresh = bool(created_at and (utc_now() - created_at).total_seconds() <= WECHAT_CLAW_MOBILE_SELECTION_TTL_SECONDS)
     candidate = item.get("candidate") if isinstance(item.get("candidate"), dict) else None
     if fresh and candidate:
         return dict(candidate)
@@ -1694,7 +1697,7 @@ def clear_wechat_claw_pending_download(db: Session, request: WechatClawMessageRe
 def grant_wechat_claw_privacy_access(db: Session, request: WechatClawMessageRequest) -> None:
     state = get_wechat_claw_ilink_state(db)
     grants = state.get("mobile_privacy_grants") if isinstance(state.get("mobile_privacy_grants"), dict) else {}
-    grants[wechat_claw_mobile_key(request)] = {"expires_at": (datetime.utcnow() + timedelta(seconds=WECHAT_CLAW_PRIVACY_GRANT_SECONDS)).isoformat()}
+    grants[wechat_claw_mobile_key(request)] = {"expires_at": utc_iso(utc_now() + timedelta(seconds=WECHAT_CLAW_PRIVACY_GRANT_SECONDS))}
     update_wechat_claw_ilink_state(db, mobile_privacy_grants=grants)
 
 
@@ -1702,10 +1705,8 @@ def has_wechat_claw_privacy_access(db: Session, request: WechatClawMessageReques
     state = get_wechat_claw_ilink_state(db)
     grants = state.get("mobile_privacy_grants") if isinstance(state.get("mobile_privacy_grants"), dict) else {}
     entry = grants.get(wechat_claw_mobile_key(request)) if isinstance(grants.get(wechat_claw_mobile_key(request)), dict) else {}
-    try:
-        return datetime.fromisoformat(str(entry.get("expires_at") or "")) > datetime.utcnow()
-    except ValueError:
-        return False
+    expires_at = parse_datetime(entry.get("expires_at"))
+    return bool(expires_at and expires_at > utc_now())
 
 
 def redact_wechat_claw_message(message: str) -> str:
@@ -2056,7 +2057,7 @@ def save_wechat_claw_last_poll(db: Session, payload: dict[str, Any], user_id: in
         "reply_sent_count": int(payload.get("reply_sent_count") or 0),
         "pending_count": int(payload.get("pending_count") or 0),
         "message": trim_wechat_claw_text(payload.get("message"), 360),
-        "updated_at": datetime.utcnow().isoformat(),
+        "updated_at": utc_iso(),
     }
     key = wechat_claw_setting_key(WECHAT_CLAW_LAST_POLL_KEY, user_id)
     row = db.query(Setting).filter(Setting.key == key).one_or_none()
@@ -2065,7 +2066,7 @@ def save_wechat_claw_last_poll(db: Session, payload: dict[str, Any], user_id: in
         db.add(row)
     else:
         row.value = safe_payload
-        row.updated_at = datetime.utcnow()
+        row.updated_at = utc_now_naive()
     db.commit()
     return safe_payload
 
@@ -2081,7 +2082,7 @@ def refresh_wechat_claw_login_state(db: Session) -> dict[str, Any]:
         result = adapter.get_qrcode_status(str(qrcode.get("qrcode")))
         updated_qrcode = dict(qrcode)
         updated_qrcode["status"] = result.get("status") or updated_qrcode.get("status") or "waiting"
-        updated_qrcode["updated_at"] = int(datetime.utcnow().timestamp())
+        updated_qrcode["updated_at"] = int(utc_now().timestamp())
         if result.get("qrcode_url"):
             updated_qrcode["qrcode_url"] = result.get("qrcode_url")
         update_payload: dict[str, Any] = {"qrcode": updated_qrcode}
@@ -2108,7 +2109,7 @@ def clear_wechat_claw_session(db: Session, qrcode_status: str | None = None) -> 
     state = get_wechat_claw_ilink_state(db)
     qrcode = state.get("qrcode") if isinstance(state.get("qrcode"), dict) else {}
     if qrcode_status and qrcode:
-        qrcode = {**qrcode, "status": qrcode_status, "updated_at": int(datetime.utcnow().timestamp())}
+        qrcode = {**qrcode, "status": qrcode_status, "updated_at": int(utc_now().timestamp())}
     return update_wechat_claw_ilink_state(
         db,
         bot_token="",
@@ -2184,7 +2185,7 @@ def queue_wechat_claw_messages(db: Session, messages: list[dict[str, Any]], sync
                 "user_id": user_id,
                 "conversation_id": str(item.get("message_id") or "").strip(),
                 "context_token": context_token,
-                "received_at": datetime.utcnow().isoformat(),
+                "received_at": utc_iso(),
                 "attempts": 0,
             }
         )
@@ -2211,7 +2212,7 @@ def remove_wechat_claw_pending_message(db: Session, pending_id: str) -> None:
 
 
 def wechat_claw_retry_after_seconds(pending: list[dict[str, Any]]) -> float | None:
-    now = datetime.utcnow().timestamp()
+    now = utc_now().timestamp()
     retry_times = [float(item.get("next_retry_at") or 0) for item in pending if item.get("next_retry_at")]
     if not retry_times:
         return None
@@ -2226,7 +2227,7 @@ def retry_wechat_claw_pending_message(db: Session, pending: dict[str, Any], erro
         str(pending["id"]),
         attempts=attempts,
         last_error=trim_wechat_claw_text(error, 240),
-        next_retry_at=int(datetime.utcnow().timestamp()) + delay_seconds,
+        next_retry_at=int(utc_now().timestamp()) + delay_seconds,
     )
     return float(delay_seconds)
 
@@ -2234,7 +2235,7 @@ def retry_wechat_claw_pending_message(db: Session, pending: dict[str, Any], erro
 def process_wechat_claw_pending_messages(db: Session, adapter: WechatClawAdapter) -> dict[str, Any]:
     state = get_wechat_claw_ilink_state(db)
     pending = get_wechat_claw_pending_messages(state)
-    now = datetime.utcnow().timestamp()
+    now = utc_now().timestamp()
     handled: list[dict[str, Any]] = []
     reply_sent_count = 0
 
@@ -2272,7 +2273,7 @@ def process_wechat_claw_pending_messages(db: Session, adapter: WechatClawAdapter
                     pending_id,
                     reply=reply,
                     interaction_trace_id=interaction_trace_id,
-                    handled_at=datetime.utcnow().isoformat(),
+                    handled_at=utc_iso(),
                 )
             delivery_started = time.perf_counter()
             delivery = adapter.send_text(str(item.get("user_id") or ""), reply, str(item.get("context_token") or ""))
@@ -2442,7 +2443,7 @@ def record_wechat_claw_interaction(
         "target": target,
         "status": status,
         **diagnostics,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": utc_iso(),
     }
     current = get_wechat_claw_recent_interactions(db)
     interaction_key = wechat_claw_setting_key(WECHAT_CLAW_INTERACTIONS_KEY)
@@ -2453,14 +2454,14 @@ def record_wechat_claw_interaction(
         db.add(row)
     else:
         row.value = value
-        row.updated_at = datetime.utcnow()
+        row.updated_at = utc_now_naive()
     db.commit()
     state = get_wechat_claw_ilink_state(db)
     known_targets = state.get("known_targets") if isinstance(state.get("known_targets"), dict) else {}
     if item["user_id"] and item["user_id"] != "unknown":
         known_targets[item["user_id"]] = {
             "username": item["user_id"],
-            "last_active": int(datetime.utcnow().timestamp()),
+            "last_active": int(utc_now().timestamp()),
             "context_token": request.context_token,
         }
         update_wechat_claw_ilink_state(db, known_targets=known_targets)
@@ -2497,7 +2498,7 @@ def update_wechat_claw_interaction_delivery(
     else:
         return
     row.value = {"items": items[:WECHAT_CLAW_INTERACTION_LIMIT]}
-    row.updated_at = datetime.utcnow()
+    row.updated_at = utc_now_naive()
     db.commit()
 
 
@@ -2551,7 +2552,7 @@ def push_wechat_claw_notification(db: Session, notification: Notification, actio
                 "level": notification.level,
                 "source": notification.source,
                 "notification_id": notification.id,
-                "created_at": notification.created_at.isoformat() if notification.created_at else None,
+                "created_at": utc_iso(notification.created_at) if notification.created_at else None,
             }
         )
     except (WechatClawConfigError, WechatClawApiError) as exc:
@@ -2658,7 +2659,14 @@ def latest_mteam_traffic_label(mteam: dict[str, Any], dimension: str, field: str
     points = traffic_series.get(dimension) if isinstance(traffic_series.get(dimension), list) else []
     if not points:
         return "暂无快照"
-    latest = points[-1] if isinstance(points[-1], dict) else {}
+    current_label = traffic_period_label(traffic_period_start(utc_now(), dimension), dimension)
+    labeled_points = [point for point in points if isinstance(point, dict) and point.get("label")]
+    if labeled_points:
+        latest = next((point for point in reversed(labeled_points) if point.get("label") == current_label), None)
+        if latest is None:
+            return "暂无快照"
+    else:
+        latest = points[-1] if isinstance(points[-1], dict) else {}
     return bytes_label(float(latest.get(field) or 0), 2)
 
 
@@ -2730,7 +2738,7 @@ def format_mteam_station_reply(mteam: dict[str, Any]) -> str:
     account_status = ["VIP" if mteam.get("vip") else "非 VIP", "允许下载" if mteam.get("allow_download", True) else "禁止下载", "有警告" if mteam.get("warned") else "无警告"]
     username = str(mteam.get("username") or "-").strip() or "-"
     source = str(mteam.get("source") or "M-Team 原始数据").strip()
-    updated_at = str(mteam.get("updated_at") or "").replace("T", " ")[:16]
+    updated_at = format_system_datetime(mteam.get("updated_at"))
     active_delta = str(mteam.get("active_delta_label") or "").strip()
     active_delta_suffix = f"（{window} {active_delta}）" if active_delta else ""
     lines = [
@@ -2942,7 +2950,7 @@ def attach_optional_assistant_notification(db: Session, intent: dict[str, Any], 
         "message": row.message,
         "level": row.level,
         "source": row.source,
-        "created_at": row.created_at.isoformat(),
+        "created_at": utc_iso(row.created_at),
     }
     updated["wechat_claw_push"] = push_wechat_claw_notification(db, row, action)
     return updated
@@ -3047,7 +3055,7 @@ def qb_placeholder_state_from_meta(downloader_id: str, configured: bool, enabled
         "free_space": 0,
         "total_space": 0,
         "source": "qB Web API 未启用",
-        "updated_at": datetime.utcnow().isoformat(),
+        "updated_at": utc_iso(),
         "message": message or ("配置已保存，请在设置中测试并启用。" if configured else "请先在设置中配置 qB WebUI。"),
     }
 
@@ -3209,7 +3217,7 @@ def storage_status_from_setup_check(db: Session, refresh: bool = False) -> dict[
     if success:
         value = {
             "verified": True,
-            "verified_at": datetime.utcnow().isoformat(),
+            "verified_at": utc_iso(),
             "paths": status.get("nas_storage_detected_paths") or [],
             "pool_count": status.get("nas_storage_pool_count") or 0,
             "folder_count": status.get("nas_storage_folder_count") or 0,
@@ -3226,11 +3234,11 @@ def storage_status_from_setup_check(db: Session, refresh: bool = False) -> dict[
             db.add(Setting(key=NAS_STORAGE_SETUP_STATUS_KEY, value=value))
         else:
             row.value = value
-            row.updated_at = datetime.utcnow()
+            row.updated_at = utc_now_naive()
         db.commit()
     elif refresh and row is not None:
-        row.value = {"verified": False, "checked_at": datetime.utcnow().isoformat()}
-        row.updated_at = datetime.utcnow()
+        row.value = {"verified": False, "checked_at": utc_iso()}
+        row.updated_at = utc_now_naive()
         db.commit()
 
     return {
@@ -3300,20 +3308,21 @@ def aggregate_traffic_points(points: list[dict[str, Any]], dimension: str) -> li
 
 
 def traffic_period_start(value: datetime, dimension: str) -> datetime:
+    local_value = system_datetime(value)
     if dimension == "hour":
-        return datetime(value.year, value.month, value.day, value.hour)
-    day = datetime(value.year, value.month, value.day)
+        return local_value.replace(minute=0, second=0, microsecond=0)
+    day = local_value.replace(hour=0, minute=0, second=0, microsecond=0)
     if dimension == "week":
         return day - timedelta(days=day.weekday())
     if dimension == "month":
-        return datetime(value.year, value.month, 1)
+        return day.replace(day=1)
     if dimension == "year":
-        return datetime(value.year, 1, 1)
+        return day.replace(month=1, day=1)
     return day
 
 
 def traffic_period_label(value: datetime, dimension: str) -> str:
-    display_value = value + timedelta(hours=8)
+    display_value = value.astimezone(system_datetime().tzinfo) if value.tzinfo else system_datetime(value)
     if dimension == "hour":
         return display_value.strftime("%m/%d %H:00")
     if dimension == "year":
@@ -3426,12 +3435,12 @@ def update_account(request: AccountUpdateRequest, user: User = Depends(get_curre
     username_changed = username != account.username
     account.username = username
     account.password_hash = hash_password(request.new_password)
-    account.updated_at = datetime.utcnow()
+    account.updated_at = utc_now_naive()
     db.query(UserSession).filter(UserSession.user_id == account.id).delete(synchronize_session=False)
     pending = db.query(Setting).filter(Setting.key == DEFAULT_CREDENTIALS_PENDING_KEY).one_or_none()
     if pending is not None:
         pending.value = {"required": False}
-        pending.updated_at = datetime.utcnow()
+        pending.updated_at = utc_now_naive()
     db.commit()
     db.refresh(account)
     token = create_access_token(db, account)
@@ -3456,13 +3465,13 @@ def admin_verify(request: AdminVerifyRequest, authorization: str | None = Header
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
     payload = decode_token(authorization.split(" ", 1)[1])
     session = db.query(UserSession).filter(UserSession.token_id == payload["jti"]).one()
-    expires = datetime.utcnow() + timedelta(minutes=settings.qb2_grant_minutes)
+    expires = utc_now_naive() + timedelta(minutes=settings.qb2_grant_minutes)
     session.qb2_grant_expires_at = expires
     db.commit()
     trace = TraceRecorder(db, "admin_verify", "ADMIN")
-    trace.add("qB2 grant issued", {"actor": user.username, "admin": admin.username, "expires_at": expires.isoformat()})
+    trace.add("qB2 grant issued", {"actor": user.username, "admin": admin.username, "expires_at": utc_iso(expires)})
     trace.finish()
-    return {"qb2_granted": True, "expires_at": expires.isoformat()}
+    return {"qb2_granted": True, "expires_at": utc_iso(expires)}
 
 
 @router.post("/auth/qb2-grant/revoke")
@@ -3669,7 +3678,7 @@ def disable_integration(provider: str, user: User = Depends(require_admin), db: 
 @router.get("/admin/integrations/{provider}/audit")
 def integration_audit(provider: str, _: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
     rows = db.query(ConfigAuditLog).filter(ConfigAuditLog.provider == provider).order_by(ConfigAuditLog.created_at.desc()).limit(30).all()
-    return {"items": [{"action": row.action, "config_version": row.config_version, "test_success": row.test_success, "trace_id": row.trace_id, "created_at": row.created_at.isoformat()} for row in rows]}
+    return {"items": [{"action": row.action, "config_version": row.config_version, "test_success": row.test_success, "trace_id": row.trace_id, "created_at": utc_iso(row.created_at)} for row in rows]}
 
 
 def build_dashboard_payload(db: Session) -> dict[str, Any]:
@@ -3723,13 +3732,13 @@ def build_dashboard_payload(db: Session) -> dict[str, Any]:
         "mteam_connection": connection,
         "mteam": mteam,
         "qbs": qbs,
-        "updated_at": datetime.utcnow().isoformat(),
+        "updated_at": utc_iso(),
     }
 
 
 def refresh_dashboard_preload(db: Session) -> dict[str, Any]:
     payload = build_dashboard_payload(db)
-    set_preload_cache(db, "dashboard", payload)
+    set_preload_cache(db, "dashboard", payload, context={"timezone": system_timezone_name()})
     return payload
 
 
@@ -3771,7 +3780,7 @@ def build_dashboard_qbs_payload(db: Session) -> dict[str, Any]:
             "download_tasks": sum(item.get("active_downloads", 0) for item in qbs),
             "upload_tasks": sum(item.get("active_uploads", 0) for item in qbs),
         },
-        "updated_at": datetime.utcnow().isoformat(),
+        "updated_at": utc_iso(),
     }
 
 
@@ -3785,7 +3794,7 @@ def build_download_payload(db: Session, downloader_id: str) -> dict[str, Any]:
         "summary": summary,
         "items": items,
         "source": "qB Web API 原始数据（Real）",
-        "updated_at": datetime.utcnow().isoformat(),
+        "updated_at": utc_iso(),
     }
 
 
@@ -3805,7 +3814,7 @@ def dashboard(
 ) -> dict[str, Any]:
     if cached and not refresh:
         cache = get_preload_cache(db, "dashboard")
-        if cache:
+        if cache and (cache.get("context") or {}).get("timezone") == system_timezone_name():
             return with_preload_meta(cache["payload"], cache, True)
     payload = refresh_dashboard_preload(db)
     return with_preload_meta(payload, get_preload_cache(db, "dashboard"), False)
@@ -3892,7 +3901,7 @@ def qb_test_connection(downloader_id: str, user: User = Depends(get_current_user
         "explanation": result.get("explanation"),
         "next_step": result.get("next_step"),
         "trace_id": test_trace_id,
-        "updated_at": datetime.utcnow().isoformat(),
+        "updated_at": utc_iso(),
     }
 
 
@@ -4146,7 +4155,7 @@ def add_favorite(request: FavoritePayload, user: User = Depends(get_current_user
         db.add(row)
     else:
         row.media_payload = payload
-        row.updated_at = datetime.utcnow()
+        row.updated_at = utc_now_naive()
     db.commit()
     db.refresh(row)
     return {"item": serialize_media_favorite(row), "created": created}
@@ -4343,7 +4352,7 @@ def search_mteam(q: str = Query(default=""), db: Session = Depends(get_db), _: U
 @router.get("/stats")
 def stats(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     snapshots = db.query(QbSnapshot).order_by(QbSnapshot.captured_at.desc()).limit(18).all()
-    series = [{"downloader_id": row.downloader_id, "download_speed": row.download_speed, "upload_speed": row.upload_speed, "captured_at": row.captured_at.isoformat(), "source": row.source, "completeness": row.completeness} for row in reversed(snapshots)]
+    series = [{"downloader_id": row.downloader_id, "download_speed": row.download_speed, "upload_speed": row.upload_speed, "captured_at": utc_iso(row.captured_at), "source": row.source, "completeness": row.completeness} for row in reversed(snapshots)]
     return {
         "ranges": ["24h", "7d", "30d", "custom"],
         "series": series,
@@ -4360,7 +4369,7 @@ def assistant_execute(request: AssistantExecuteRequest, user: User = Depends(get
         "result": result,
         "reply": format_assistant_result_v2(intent, result),
         "source": "structured_json",
-        "handled_at": datetime.utcnow().isoformat(),
+        "handled_at": utc_iso(),
     }
 
 
@@ -4376,7 +4385,7 @@ def assistant_chat(request: AssistantChatRequest, user: User = Depends(get_curre
             "result": result,
             "reply": format_mobile_agent_reply(intent, result),
             "source": "mteam_cached_results",
-            "handled_at": datetime.utcnow().isoformat(),
+            "handled_at": utc_iso(),
         }
     try:
         intent = adapter.parse_intent(request.message)
@@ -4409,7 +4418,7 @@ def assistant_chat(request: AssistantChatRequest, user: User = Depends(get_curre
         "result": result,
         "reply": reply,
         "source": "deepseek",
-        "handled_at": datetime.utcnow().isoformat(),
+        "handled_at": utc_iso(),
     }
 
 
@@ -4470,7 +4479,7 @@ def update_wechat_claw_binding(
     binding.role_name = request.role_name.strip() or binding.role_name
     binding.enabled = request.enabled
     binding.notification_preferences = normalized_wechat_claw_binding_preferences(request.notification_preferences)
-    binding.updated_at = datetime.utcnow()
+    binding.updated_at = utc_now_naive()
     db.commit()
     db.refresh(binding)
     return serialize_wechat_claw_binding(binding)
@@ -4569,7 +4578,7 @@ def _refresh_wechat_claw_qrcode(db: Session, binding_id: int) -> dict[str, Any]:
         "qrcode": result.get("qrcode"),
         "qrcode_url": result.get("qrcode_url"),
         "status": result.get("status") or "waiting",
-        "updated_at": int(datetime.utcnow().timestamp()),
+        "updated_at": int(utc_now().timestamp()),
     }
     # A fresh QR code starts a new iLink session. Retaining the old token here
     # would prevent the background worker from polling the new QR status.
@@ -4634,7 +4643,7 @@ def handle_wechat_claw_text(
             result = {"intent_type": "dashboard_query", "privacy_granted": False}
             reply = "【管理员验证失败】\n密码不正确，未授予 qB2 隐私详情权限。"
         interaction = record_wechat_claw_interaction(db, request, parsed_intent, result, reply, telemetry)
-        return {"reply": reply, "intent": parsed_intent, "result": result, "interaction": interaction, "source": "wechat_claw", "conversation_id": request.conversation_id, "handled_at": datetime.utcnow().isoformat()}
+        return {"reply": reply, "intent": parsed_intent, "result": result, "interaction": interaction, "source": "wechat_claw", "conversation_id": request.conversation_id, "handled_at": utc_iso()}
 
     if MTEAM_SHOW_ALL_RESULTS_RE.search(request.message or ""):
         parsed_intent = {"intent_type": "mteam_search", "action": "mteam_search", "show_all": True}
@@ -4643,7 +4652,7 @@ def handle_wechat_claw_text(
         reply = format_mobile_agent_reply(parsed_intent, result)
         record_wechat_claw_stage(telemetry, "mteam_show_all", render_started)
         interaction = record_wechat_claw_interaction(db, request, parsed_intent, result, reply, telemetry)
-        return {"reply": reply, "intent": parsed_intent, "result": result, "interaction": interaction, "source": "wechat_claw", "conversation_id": request.conversation_id, "handled_at": datetime.utcnow().isoformat()}
+        return {"reply": reply, "intent": parsed_intent, "result": result, "interaction": interaction, "source": "wechat_claw", "conversation_id": request.conversation_id, "handled_at": utc_iso()}
 
     adapter_started = time.perf_counter()
     try:
@@ -4670,7 +4679,7 @@ def handle_wechat_claw_text(
         reply = format_mobile_agent_reply(parsed_intent, result)
         record_wechat_claw_stage(telemetry, "reply_render", render_started)
         interaction = record_wechat_claw_interaction(db, request, parsed_intent, result, reply, telemetry)
-        return {"reply": reply, "intent": parsed_intent, "result": result, "interaction": interaction, "source": "wechat_claw", "conversation_id": request.conversation_id, "handled_at": datetime.utcnow().isoformat()}
+        return {"reply": reply, "intent": parsed_intent, "result": result, "interaction": interaction, "source": "wechat_claw", "conversation_id": request.conversation_id, "handled_at": utc_iso()}
 
     if selection_index:
         stage_started = time.perf_counter()
@@ -4686,7 +4695,7 @@ def handle_wechat_claw_text(
         reply = format_mobile_agent_reply(parsed_intent, result)
         record_wechat_claw_stage(telemetry, "reply_render", render_started)
         interaction = record_wechat_claw_interaction(db, request, parsed_intent, result, reply, telemetry)
-        return {"reply": reply, "intent": parsed_intent, "result": result, "interaction": interaction, "source": "wechat_claw", "conversation_id": request.conversation_id, "handled_at": datetime.utcnow().isoformat()}
+        return {"reply": reply, "intent": parsed_intent, "result": result, "interaction": interaction, "source": "wechat_claw", "conversation_id": request.conversation_id, "handled_at": utc_iso()}
 
     intent_started = time.perf_counter()
     try:
@@ -4753,7 +4762,7 @@ def handle_wechat_claw_text(
         "interaction": interaction,
         "source": "wechat_claw",
         "conversation_id": request.conversation_id,
-        "handled_at": datetime.utcnow().isoformat(),
+        "handled_at": utc_iso(),
     }
 
 
@@ -4927,7 +4936,8 @@ def wechat_claw_capabilities(
 def diagnostics_health(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
     integrations = {row.provider: row for row in db.query(IntegrationConfig).all()}
     bindings = ensure_wechat_claw_bindings(db)
-    wechat_claw_connected = any(wechat_claw_binding_status(db, binding)["connected"] for binding in bindings)
+    member_statuses = [wechat_claw_binding_status(db, binding) for binding in bindings]
+    wechat_claw_connected = any(member["operational"] for member in member_statuses)
     storage = storage_status_from_setup_check(db)
     modules = []
     for provider in PROVIDERS + ["nas_disk"]:
@@ -4947,11 +4957,11 @@ def diagnostics_health(_: User = Depends(require_admin), db: Session = Depends(g
         else:
             status = "not_tested"
         collection = get_module_health(db, provider)
-        modules.append({"module": provider, "status": status, "enabled": bool(row.enabled) if row else provider in ["nas_disk", "stats_engine"], "last_success_at": collection.get("last_success_at") or (row.last_tested_at.isoformat() if row and row.last_tested_at else None), "duration_ms": result.get("duration_ms") if result else None, "last_error": collection.get("last_error") or (result.get("message") if isinstance(result, dict) else None), "consecutive_failed_hours": int(collection.get("consecutive_failed_hours") or 0)})
-    return {"modules": modules, "wechat_members": [wechat_claw_binding_status(db, binding) for binding in bindings]}
+        modules.append({"module": provider, "status": status, "enabled": bool(row.enabled) if row else provider in ["nas_disk", "stats_engine"], "last_success_at": collection.get("last_success_at") or (utc_iso(row.last_tested_at) if row and row.last_tested_at else None), "duration_ms": result.get("duration_ms") if result else None, "last_error": collection.get("last_error") or (result.get("message") if isinstance(result, dict) else None), "consecutive_failed_hours": int(collection.get("consecutive_failed_hours") or 0)})
+    return {"modules": modules, "wechat_members": member_statuses}
 
 
 @router.get("/diagnostics/traces")
 def diagnostics_traces(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
     rows = db.query(DebugTrace).order_by(DebugTrace.created_at.desc()).limit(50).all()
-    return {"items": [{"trace_id": row.trace_id, "event_type": row.event_type, "status": row.status, "timeline": row.timeline, "duration_ms": row.duration_ms, "config_version": row.config_version, "error_summary": row.error_summary, "created_at": row.created_at.isoformat()} for row in rows]}
+    return {"items": [{"trace_id": row.trace_id, "event_type": row.event_type, "status": row.status, "timeline": row.timeline, "duration_ms": row.duration_ms, "config_version": row.config_version, "error_summary": row.error_summary, "created_at": utc_iso(row.created_at)} for row in rows]}

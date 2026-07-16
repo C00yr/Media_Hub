@@ -1,8 +1,9 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from app.adapters.base import AIAdapter, MetadataAdapter, NotificationAdapter, QbittorrentAdapter, TrackerAdapter
 from app.utils.ids import trace_id
+from app.utils.time import system_now, utc_iso, utc_now
 
 
 POSTERS = [
@@ -35,14 +36,14 @@ class MockTrackerAdapter(TrackerAdapter):
             "active_downloads": 0,
             "bonus_per_hour_label": "最近 1 小时魔力增量（应用计算）",
             "source": "M-Team 原始数据（Mock）",
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": utc_iso(),
             "traffic_history": [
                 {
-                    "date": f"2026-06-{day:02d}",
+                    "date": (system_now().date() - timedelta(days=15 - index)).isoformat(),
                     "upload_total": (8.74 + max(day - 26, 0) * 0.08 + index * 0.01) * 1024**4,
                     "download_total": (0.48 + max(day - 28, 0) * 0.08 + index * 0.01) * 1024**4,
                 }
-                for index, day in enumerate(range(15, 31))
+                for index in range(16)
             ],
         }
 
@@ -59,7 +60,7 @@ class MockTrackerAdapter(TrackerAdapter):
                 "group": "PTMH",
                 "seeders": 35 - index * 6,
                 "downloads": 120 + index * 14,
-                "published_at": "2026-06-29T08:00:00Z",
+                "published_at": utc_iso(utc_now() - timedelta(hours=index + 1)),
             }
             for index, quality in enumerate(["2160p", "1080p", "720p"])
         ]
@@ -84,7 +85,7 @@ class MockQbittorrentAdapter(QbittorrentAdapter):
             "free_space": 3.8 * 1024**4 - index * 100 * 1024**3,
             "total_space": 8 * 1024**4,
             "source": "qB Web API 原始数据（Mock）",
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": utc_iso(),
         }
 
     def get_torrents(self, downloader_id: str, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -102,7 +103,7 @@ class MockQbittorrentAdapter(QbittorrentAdapter):
                 "category": "media",
                 "tags": ["mock", "manual-ok"],
                 "save_path": "/downloads/media/[redacted]",
-                "added_at": "2026-06-29T07:30:00Z",
+                "added_at": utc_iso(utc_now() - timedelta(hours=index + 2)),
                 "completed_at": None,
                 "state": "downloading" if index < 2 else "uploading",
             }

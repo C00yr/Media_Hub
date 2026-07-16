@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.auth.security import decode_token
 from app.db.session import get_db
 from app.models.entities import User, UserSession
+from app.utils.time import utc_now_naive
 
 
 def get_current_user(
@@ -23,7 +24,7 @@ def get_current_user(
     session = db.query(UserSession).filter(UserSession.token_id == payload["jti"]).one_or_none()
     if not user or user.role != "admin" or not user.is_active or not session:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Inactive session")
-    session.last_seen_at = datetime.utcnow()
+    session.last_seen_at = utc_now_naive()
     db.commit()
     return user
 
@@ -42,4 +43,4 @@ def has_qb2_grant(db: Session, authorization: str | None) -> bool:
     except ValueError:
         return False
     session = db.query(UserSession).filter(UserSession.token_id == payload["jti"]).one_or_none()
-    return bool(session and session.qb2_grant_expires_at and session.qb2_grant_expires_at > datetime.utcnow())
+    return bool(session and session.qb2_grant_expires_at and session.qb2_grant_expires_at > utc_now_naive())

@@ -6,10 +6,11 @@ from sqlalchemy.dialects.sqlite import JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
+from app.utils.time import utc_now_naive
 
 
 def utcnow() -> datetime:
-    return datetime.utcnow()
+    return utc_now_naive()
 
 
 class User(Base):

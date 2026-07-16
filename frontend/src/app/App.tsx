@@ -5,6 +5,7 @@ import {
   Bell,
   CalendarDays,
   Check,
+  ChevronDown,
   CircleAlert,
   Clock3,
   Coins,
@@ -1193,7 +1194,7 @@ function trafficPointLabel(point: any): string {
   if (point?.label) return String(point.label);
   const raw = String(point?.date ?? point?.captured_at ?? "");
   if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
-  const date = new Date(raw);
+  const date = parseSystemDate(raw);
   if (Number.isNaN(date.getTime())) return raw;
   return date.toLocaleString(undefined, { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
@@ -1233,7 +1234,7 @@ function mteamDeltaLabels(mteam: any): Record<string, string | undefined> {
 
 function joinedDurationLabel(value: string): string | undefined {
   if (!value || value === "-") return undefined;
-  const date = new Date(value);
+  const date = parseSystemDate(value);
   if (Number.isNaN(date.getTime())) return undefined;
   const days = Math.max(0, Math.floor((Date.now() - date.getTime()) / 86400000));
   return `已加入 ${days} 天`;
@@ -2648,7 +2649,7 @@ function MemberManagementCard({ onNavigate }: { onNavigate?: (key: NavKey) => vo
                   <p>{item.message || "（已脱敏消息）"}</p>
                   <small>{(item.stages ?? []).map((stage, stageIndex) => `${wechatClawStageLabel(stage.stage)} ${stage.duration_ms ?? 0}ms${stage.status === "failed" ? `（失败：${stage.error || "请求失败"}）` : ""}`).join(" · ") || "尚未采集阶段数据"}</small>
                   {item.error && <small className="error">失败原因：{item.error}</small>}
-                  <small>{item.created_at ? new Date(item.created_at).toLocaleString() : ""}</small>
+                  <small>{item.created_at ? formatSystemDateTime(item.created_at) : ""}</small>
                 </div>
               ))}
               {!selectedInteractions.length && <p className="muted">手机端发起交互后，这里会保留最近 5 条的耗时与失败阶段。</p>}
@@ -3289,8 +3290,19 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
   const qrText = String(setup.data?.qr_text || "");
   const qrcode = setup.data?.qrcode ?? {};
   const qrReady = Boolean(qrcode.qrcode_url || setupPayload.qrcode_url);
-  const loginStatus = setup.data?.connected ? "已登录" : provider.enabled ? "等待扫码" : "未启用";
   const selectedBinding = (bindings.data?.items ?? []).find((item: any) => item.id === selectedBindingId);
+  const sessionConnected = Boolean(setup.data?.connected);
+  const selectedMemberEnabled = selectedBinding?.enabled !== false;
+  const loginStatus = !provider.enabled
+    ? "未启用"
+    : !selectedMemberEnabled
+      ? "成员已停用"
+      : sessionConnected
+        ? "已登录"
+        : "等待扫码";
+  const preservedLoginNote = sessionConnected && (!provider.enabled || !selectedMemberEnabled)
+    ? "微信登录状态已保留，重新启用后通常无需再次扫码。"
+    : "";
 
   async function refreshQrcode() {
     setBusy("refresh");
@@ -3382,6 +3394,7 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
               <span>绑定状态</span>
               <strong>{loginStatus}</strong>
             </div>
+            {preservedLoginNote && <p className="field-note">{preservedLoginNote}</p>}
             {qrReady ? <WechatClawQrCode value={qrText} /> : (
               <div className="wechat-qr-placeholder">
                 <Lock size={24} />
@@ -3806,25 +3819,37 @@ function MediaSearchSettingsCard({ provider, onChanged }: { provider: any; onCha
   const savedProxyDomains = Array.isArray(saved.proxy_domains)
     ? saved.proxy_domains.filter((domain: string) => TMDB_PROXY_DOMAINS.includes(domain as typeof TMDB_PROXY_DOMAINS[number]))
     : [...TMDB_PROXY_DOMAINS];
+  const savedProxyEnabled = typeof saved.proxy_enabled === "boolean" ? saved.proxy_enabled : saved.mode === "proxy";
+  const savedProxyUrl = String(saved.proxy_url ?? "http://host.docker.internal:7890");
   const [form, setForm] = useState<TmdbForm>({
     api_key: String(saved.api_key ?? ""),
     bearer_token: String(saved.bearer_token ?? ""),
-    proxy_enabled: typeof saved.proxy_enabled === "boolean" ? saved.proxy_enabled : saved.mode === "proxy",
-    proxy_url: String(saved.proxy_url ?? "http://host.docker.internal:7890"),
+    proxy_enabled: savedProxyEnabled,
+    proxy_url: savedProxyUrl,
     proxy_domains: savedProxyDomains,
     language: String(saved.language ?? "zh-CN"),
     region: String(saved.region ?? "CN"),
     timeout: String(saved.timeout ?? "12"),
   });
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showProxyDetails, setShowProxyDetails] = useState(false);
   const [busy, setBusy] = useState("");
   const [localResult, setLocalResult] = useState<IntegrationTestResult | null>(provider.last_test_result);
   const [localError, setLocalError] = useState("");
+  const [enabled, setEnabled] = useState(Boolean(provider.enabled));
+  useEffect(() => setEnabled(Boolean(provider.enabled)), [provider.enabled]);
   const result = localResult ?? provider.last_test_result;
   const canEnable = result?.provider === "tmdb" && result?.mode === "real" && result?.can_enable === true;
 
   function updateField<K extends keyof TmdbForm>(key: K, value: TmdbForm[K]) {
     setForm((current) => ({ ...current, [key]: value }));
+  }
+
+  function updateProxyEnabled(value: boolean) {
+    updateField("proxy_enabled", value);
+    if (value) {
+      setShowProxyDetails(true);
+    }
   }
 
   function toggleProxyDomain(domain: string) {
@@ -3854,6 +3879,7 @@ function MediaSearchSettingsCard({ provider, onChanged }: { provider: any; onCha
     setLocalError("");
     try {
       await api(`/api/admin/integrations/tmdb`, { method: "PUT", body: JSON.stringify({ payload: payload() }) });
+      setEnabled(false);
       setLocalResult({
         success: false,
         state: "draft",
@@ -3879,6 +3905,7 @@ function MediaSearchSettingsCard({ provider, onChanged }: { provider: any; onCha
       const updated = await api<any>(`/api/admin/integrations/tmdb/test`, { method: "POST", body: JSON.stringify({ payload: payload() }) });
       const testResult = updated.last_test_result as IntegrationTestResult;
       setLocalResult(testResult);
+      setEnabled(false);
       onChanged();
     } catch (err) {
       const message = (err as Error).message;
@@ -3892,7 +3919,8 @@ function MediaSearchSettingsCard({ provider, onChanged }: { provider: any; onCha
     setBusy("enable");
     setLocalError("");
     try {
-      await api(`/api/admin/integrations/tmdb${provider.enabled ? "/disable" : "/enable"}`, { method: "POST" });
+      await api(`/api/admin/integrations/tmdb${enabled ? "/disable" : "/enable"}`, { method: "POST" });
+      setEnabled(!enabled);
       onChanged();
     } catch (err) {
       setLocalError((err as Error).message);
@@ -3911,10 +3939,19 @@ function MediaSearchSettingsCard({ provider, onChanged }: { provider: any; onCha
     }
     if (!form.proxy_domains.length) proxyValidationMessage = "启用代理时至少选择一个需要代理的网站。";
   }
+  const routingHasChanges = form.proxy_enabled !== savedProxyEnabled
+    || form.proxy_url.trim() !== savedProxyUrl.trim()
+    || [...form.proxy_domains].sort().join("|") !== [...savedProxyDomains].sort().join("|");
+  const configurationHasChanges = routingHasChanges
+    || form.api_key.trim() !== String(saved.api_key ?? "").trim()
+    || form.bearer_token.trim() !== String(saved.bearer_token ?? "").trim()
+    || form.language.trim() !== String(saved.language ?? "zh-CN").trim()
+    || form.region.trim() !== String(saved.region ?? "CN").trim()
+    || (Number(form.timeout) || 12) !== (Number(saved.timeout) || 12);
 
   return (
     <div className="media-search-settings">
-      <Panel title="媒体源">
+      <Panel title="媒体搜索来源">
         <div className="integration media-source-selector">
           <label>当前媒体源
             <select value="tmdb" onChange={() => undefined}>
@@ -3922,86 +3959,191 @@ function MediaSearchSettingsCard({ provider, onChanged }: { provider: any; onCha
             </select>
           </label>
           <div className="field-help compact-help">
-            <strong>媒体搜索来源</strong>
-            <span>当前由 TMDB 提供电影、剧集、演员、趋势和图片信息；后续可以在这里继续增加其他媒体源。</span>
+            <strong>TMDB 影视资料库</strong>
+            <span>为发现页和 AI 助手提供电影、剧集、演员、趋势、筛选和图片信息。</span>
           </div>
         </div>
       </Panel>
 
-      <Panel title="TMDB 配置">
+      <Panel title="TMDB 数据源">
         <div className="integration tmdb-editor">
-        <div className="notice info">
-          <strong>影视资料库</strong>
-          <span>配置后，可在发现页和 AI 助手中查询电影、剧集和演员信息。</span>
-        </div>
-        <div className="settings-grid">
-          <label>TMDB Bearer Token
-            <SecretInput value={form.bearer_token} onChange={(value) => updateField("bearer_token", value)} placeholder="从 TMDB 账号设置中复制" autoComplete="off" />
-          </label>
-          <label>语言
-            <select value={form.language} onChange={(event) => updateField("language", event.target.value)}>
-              {TMDB_LANGUAGE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-            </select>
-          </label>
-          <label>地区
-            <select value={form.region} onChange={(event) => updateField("region", event.target.value)}>
-              {TMDB_REGION_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-            </select>
-          </label>
-        </div>
-        <button className="inline-tool" type="button" onClick={() => setShowAdvanced((value) => !value)}>
-          <SlidersHorizontal size={16} /> {showAdvanced ? "隐藏高级设置" : "高级设置"}
-        </button>
-        {showAdvanced && <div className="settings-grid advanced-settings">
-          <label>TMDB API Key（备用凭据）
-            <SecretInput value={form.api_key} onChange={(value) => updateField("api_key", value)} placeholder="可替代 Bearer Token 使用" autoComplete="off" />
-          </label>
-          <label>超时时间（秒）
-            <CopyableInput value={form.timeout} onChange={(value) => updateField("timeout", value)} inputMode="numeric" placeholder="12" />
-          </label>
-        </div>}
+          <div className="notice info">
+            <strong>访问凭据与内容偏好</strong>
+            <span>这里仅配置 TMDB 身份凭据、返回语言和默认地区；网络代理在下方“网络连接”板块单独管理。</span>
+          </div>
+          <div className="settings-grid">
+            <label>TMDB Bearer Token
+              <SecretInput value={form.bearer_token} onChange={(value) => updateField("bearer_token", value)} placeholder="从 TMDB 账号设置中复制" autoComplete="off" />
+            </label>
+            <label>语言
+              <select value={form.language} onChange={(event) => updateField("language", event.target.value)}>
+                {TMDB_LANGUAGE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+              </select>
+            </label>
+            <label>地区
+              <select value={form.region} onChange={(event) => updateField("region", event.target.value)}>
+                {TMDB_REGION_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+              </select>
+            </label>
+          </div>
+          <button className="inline-tool" type="button" onClick={() => setShowAdvanced((value) => !value)}>
+            <SlidersHorizontal size={16} /> {showAdvanced ? "隐藏高级设置" : "高级设置"}
+          </button>
+          {showAdvanced && <div className="settings-grid advanced-settings">
+            <label>TMDB API Key（备用凭据）
+              <SecretInput value={form.api_key} onChange={(value) => updateField("api_key", value)} placeholder="可替代 Bearer Token 使用" autoComplete="off" />
+            </label>
+            <label>超时时间（秒）
+              <CopyableInput value={form.timeout} onChange={(value) => updateField("timeout", value)} inputMode="numeric" placeholder="12" />
+            </label>
+          </div>}
         </div>
       </Panel>
 
-      <Panel title="代理配置">
-        <div className="integration tmdb-editor proxy-settings-card">
-          <div className="notice info">
-            <strong>按网站精细使用代理</strong>
-            <span>只有下方勾选网站对应的 Media Hub 请求会交给代理。M-Team、qBittorrent、NAS 存储、本地接口和其他请求始终直连。</span>
+      <Panel title="网络连接">
+        <div className="integration network-settings-card">
+          <div className="direct-network-summary">
+            <span className="direct-network-icon"><Activity size={19} /></span>
+            <span>
+              <strong>默认连接：DoH 直连</strong>
+              <small>推荐保持默认。对大多数用户来说无需额外代理，TMDB 数据和图片会通过 DoH 解析后直接访问。</small>
+            </span>
+            <b className={`network-mode-pill ${form.proxy_enabled ? "proxy" : "direct"}`}>{form.proxy_enabled ? (routingHasChanges ? "代理待保存" : enabled ? "代理已启用" : "代理待启用") : "DoH 直连"}</b>
           </div>
-          <label className="proxy-toggle-row">
-            <span><ShieldCheck size={17} /><strong>使用已有 Mihomo / HTTP 代理</strong></span>
-            <input type="checkbox" checked={form.proxy_enabled} onChange={(event) => updateField("proxy_enabled", event.target.checked)} />
-          </label>
-          {form.proxy_enabled && <label>代理地址
-            <CopyableInput value={form.proxy_url} onChange={(value) => updateField("proxy_url", value)} placeholder="http://代理服务器地址:端口" inputMode="url" />
-            <span className="field-note">填写 Media Hub 容器能够访问的 HTTP/HTTPS 代理地址，例如同一 Docker 网络中的 http://mihomo:7890。</span>
-          </label>}
-          <div className="proxy-domain-list" aria-label="需要使用代理的网站">
-            {TMDB_PROXY_DOMAIN_OPTIONS.map((option) => (
-              <label className={form.proxy_enabled ? "proxy-domain-option" : "proxy-domain-option disabled"} key={option.domain}>
-                <input type="checkbox" checked={form.proxy_domains.includes(option.domain)} disabled={!form.proxy_enabled} onChange={() => toggleProxyDomain(option.domain)} />
-                <span>
-                  <strong>{option.label}</strong>
-                  <code>{option.domain}</code>
-                  <small>{option.description}</small>
+
+          <div className={`proxy-collapsible-card ${form.proxy_enabled ? "enabled" : ""}`}>
+            <div className="proxy-collapse-header">
+              <button className="proxy-collapse-trigger" type="button" aria-expanded={showProxyDetails} onClick={() => setShowProxyDetails((value) => !value)}>
+                <span className="proxy-collapse-copy">
+                  <span className="proxy-collapse-icon"><ShieldCheck size={19} /></span>
+                  <span>
+                    <strong>可选：Mihomo / HTTP 代理</strong>
+                    <small>{form.proxy_enabled ? "代理开关已打开；展开后可填写地址并选择需要代理的网站。" : "可选网络连接方式，默认收起；需要通过 Mihomo 或 HTTP 代理访问 TMDB 时可启用。"}</small>
+                  </span>
                 </span>
+                <span className="proxy-collapse-action">{showProxyDetails ? "收起" : "配置详情"}<ChevronDown className={showProxyDetails ? "expanded" : ""} size={17} /></span>
+              </button>
+              <label className="proxy-collapse-switch">
+                <span>代理开关</span>
+                <input className="proxy-toggle-switch" type="checkbox" role="switch" aria-label="使用已有 Mihomo 或 HTTP 代理" checked={form.proxy_enabled} onChange={(event) => updateProxyEnabled(event.target.checked)} />
               </label>
-            ))}
+            </div>
+
+            {showProxyDetails && <div className="proxy-collapse-body">
+              <div className="field-help proxy-scope-help">
+                <strong>仅代理 TMDB 白名单</strong>
+                <span>M-Team、qBittorrent、NAS 存储、本地接口和其他应用请求始终直连，不受这里影响。</span>
+              </div>
+              <label className="proxy-address-field">Mihomo / HTTP 代理地址
+                <CopyableInput value={form.proxy_url} onChange={(value) => updateField("proxy_url", value)} placeholder="例如 http://mihomo:7890" inputMode="url" />
+                <span className="field-note">填写 Media Hub 容器能够访问的 HTTP/HTTPS 地址。同一 Docker 网络可使用 http://mihomo:7890；带认证时可填写 http://用户名:密码@mihomo:7890。</span>
+                <span className="field-note">该地址只有在打开代理、完成“保存并测试”并再次“启用”后才会生效。</span>
+              </label>
+              {!form.proxy_enabled && <p className="muted proxy-disabled-note">代理当前关闭。你可以预先填写地址，但测试和运行仍会使用 DoH 直连；打开开关后才可选择代理网站。</p>}
+              <div className="proxy-domain-section">
+                <div className="proxy-domain-heading">
+                  <strong>选择需要代理的网站</strong>
+                  <span>未选中的网站继续使用 DoH 直连</span>
+                </div>
+                <div className="proxy-domain-list" aria-label="需要使用代理的网站">
+                  {TMDB_PROXY_DOMAIN_OPTIONS.map((option) => (
+                    <label className={form.proxy_enabled ? "proxy-domain-option" : "proxy-domain-option disabled"} key={option.domain}>
+                      <input type="checkbox" checked={form.proxy_domains.includes(option.domain)} disabled={!form.proxy_enabled} onChange={() => toggleProxyDomain(option.domain)} />
+                      <span><strong>{option.label}</strong><code>{option.domain}</code><small>{option.description}</small></span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <TmdbRouteFeedback form={form} result={result} enabled={enabled} hasUnsavedChanges={routingHasChanges} />
+              {proxyValidationMessage && <p className="error">{proxyValidationMessage}</p>}
+            </div>}
           </div>
-          {!form.proxy_enabled && <p className="muted">代理当前关闭，TMDB 数据和图片请求都会通过直连与 DoH 尝试访问。</p>}
-          {proxyValidationMessage && <p className="error">{proxyValidationMessage}</p>}
-        <div className="actions">
-          <button onClick={saveDraft} disabled={busy !== "" || Boolean(proxyValidationMessage)}>{busy === "draft" ? "正在保存..." : "保存媒体搜索设置"}</button>
-          <button className="primary" onClick={saveAndTest} disabled={busy !== "" || Boolean(proxyValidationMessage)}>{busy === "test" ? "正在测试..." : "保存并测试"}</button>
-          <button onClick={toggleEnabled} disabled={busy !== "" || (!provider.enabled && !canEnable)}>{provider.enabled ? "停用" : "启用"}</button>
-        </div>
-        {!provider.enabled && !canEnable && <p className="muted">请先“保存并测试”，测试成功后才能启用 TMDB。</p>}
-        {localError && <p className="error">{localError}</p>}
-        <TestResultCard result={result} emptyProvider="媒体搜索" />
+          {proxyValidationMessage && !showProxyDetails && <p className="error">代理配置需要完善，请展开“可选：Mihomo / HTTP 代理”查看。</p>}
         </div>
       </Panel>
+
+      <Panel title="连接测试与启用">
+        <div className="integration media-search-activation">
+          <div className="connection-workflow" aria-label="TMDB 配置生效步骤">
+            <div className={!configurationHasChanges ? "ready" : ""}><b>1</b><span><strong>保存配置</strong><small>记录凭据和网络选择</small></span></div>
+            <div className={!configurationHasChanges && result?.success ? "ready" : ""}><b>2</b><span><strong>测试连接</strong><small>验证数据接口和图片资源</small></span></div>
+            <div className={enabled ? "ready" : ""}><b>3</b><span><strong>启用生效</strong><small>测试通过后手动启用</small></span></div>
+          </div>
+          <div className="actions">
+            <button onClick={saveDraft} disabled={busy !== "" || Boolean(proxyValidationMessage)}>{busy === "draft" ? "正在保存..." : "仅保存草稿"}</button>
+            <button className="primary" onClick={saveAndTest} disabled={busy !== "" || Boolean(proxyValidationMessage)}>{busy === "test" ? "正在测试..." : "保存并测试"}</button>
+            <button onClick={toggleEnabled} disabled={busy !== "" || (!enabled && (!canEnable || configurationHasChanges))}>{enabled ? "停用" : "启用"}</button>
+          </div>
+          {!enabled && (!canEnable || configurationHasChanges) && <p className="muted">{configurationHasChanges ? "当前有尚未保存或测试的改动，请重新点击“保存并测试”。" : "请先点击“保存并测试”；连接成功后才能启用 TMDB。"}</p>}
+          {!enabled && canEnable && !configurationHasChanges && <p className="field-note proxy-enable-ready">连接测试已通过，请点击“启用”，当前 TMDB 配置和网络路线才会正式生效。</p>}
+          {localError && <p className="error">{localError}</p>}
+          <div className="connection-result-section">
+            <div className="connection-result-heading">
+              <span><Activity size={17} /><strong>TMDB 整体连接测试结果</strong></span>
+              <small>反馈数据 API、图片资源和凭据的整体测试结果；代理白名单路线请在“网络连接”的折叠卡中查看。</small>
+            </div>
+            {configurationHasChanges && result?.success && <p className="stale-test-note">当前表单已有新改动；下方绿色结果属于上一次已保存配置，请重新“保存并测试”。</p>}
+            <TestResultCard result={result} emptyProvider="TMDB" />
+          </div>
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+function TmdbRouteFeedback({ form, result, enabled, hasUnsavedChanges }: {
+  form: TmdbForm;
+  result?: IntegrationTestResult | null;
+  enabled: boolean;
+  hasUnsavedChanges: boolean;
+}) {
+  const previewRoutes = Object.fromEntries(TMDB_PROXY_DOMAIN_OPTIONS.map((option) => [
+    option.domain,
+    form.proxy_enabled && form.proxy_domains.includes(option.domain) ? "proxy" : "direct",
+  ])) as Record<string, "proxy" | "direct">;
+  const testedRoutes = result?.detail?.domain_routes ?? {};
+  const testMatchesPreview = result?.success === true
+    && TMDB_PROXY_DOMAIN_OPTIONS.every((option) => testedRoutes[option.domain] === previewRoutes[option.domain]);
+  const status = hasUnsavedChanges
+    ? { label: "尚未保存", tone: "pending", help: "开关仅是草稿；请依次点击“保存并测试”和“启用”，完成前不会生效。" }
+    : testMatchesPreview && enabled
+      ? { label: "已生效", tone: "verified", help: "这套路由已通过连接测试并启用，当前请求会按下方方式访问 TMDB。" }
+      : testMatchesPreview
+        ? { label: "待启用", tone: "ready", help: "连接测试已经通过；点击“启用”后，这套路由才会正式生效。" }
+      : result?.success === false && result?.state !== "draft"
+        ? { label: "测试失败", tone: "failed", help: "路由已经保存，但最近一次连接测试未通过。" }
+        : { label: "待测试", tone: "saved", help: "路由已经保存；点击“保存并测试”可验证实际连通性。" };
+  let proxyEndpoint = "已配置的代理";
+  try {
+    const parsed = new URL(form.proxy_url);
+    proxyEndpoint = parsed.hostname ? `${parsed.hostname}${parsed.port ? `:${parsed.port}` : ""}` : proxyEndpoint;
+  } catch {
+    proxyEndpoint = "待完善的代理地址";
+  }
+
+  return (
+    <section className="tmdb-route-feedback" aria-label="TMDB 白名单路由状态">
+      <div className="tmdb-route-feedback-head">
+        <span><Activity size={17} /><strong>当前白名单路由</strong></span>
+        <b className={`tmdb-route-feedback-state ${status.tone}`}>{status.label}</b>
       </div>
+      <div className="tmdb-route-feedback-list">
+        {TMDB_PROXY_DOMAIN_OPTIONS.map((option) => {
+          const usesProxy = previewRoutes[option.domain] === "proxy";
+          return (
+            <div className={`tmdb-route-feedback-item ${usesProxy ? "proxy" : "direct"}`} key={option.domain}>
+              <span>
+                <strong>{option.label}</strong>
+                <code>{option.domain}</code>
+                <small>{usesProxy ? `请求交给 ${proxyEndpoint} 转发` : "绕过代理，通过 DoH 解析后直连"}</small>
+              </span>
+              <b>{usesProxy ? "Mihomo" : "DoH 直连"}</b>
+            </div>
+          );
+        })}
+      </div>
+      <small className="tmdb-route-feedback-help">{status.help}</small>
+    </section>
   );
 }
 
@@ -4025,7 +4167,7 @@ function TestResultCard({ result, emptyProvider }: { result?: IntegrationTestRes
       {Object.keys(domainRoutes).length > 0 && <div className="proxy-route-summary">
         {TMDB_PROXY_DOMAIN_OPTIONS.map((option) => domainRoutes[option.domain] && <span key={option.domain}>
           <code>{option.domain}</code>
-          <b className={domainRoutes[option.domain] === "proxy" ? "proxy" : "direct"}>{domainRoutes[option.domain] === "proxy" ? "代理" : "直连"}</b>
+          <b className={domainRoutes[option.domain] === "proxy" ? "proxy" : "direct"}>{domainRoutes[option.domain] === "proxy" ? "Mihomo" : "DoH 直连"}</b>
         </span>)}
       </div>}
       {result.trace_id && <small>诊断编号：{result.trace_id}</small>}
@@ -4176,16 +4318,28 @@ function DiagnosticsPage() {
         <div className="diagnostics-member-list">
           {members.map((member: any) => {
             const connected = Boolean(member.connected);
-            const tone = connected ? "success" : member.configured ? "failed" : "neutral";
+            const moduleEnabled = member.module_enabled !== false;
+            const memberEnabled = member.enabled !== false;
+            const operational = Boolean(member.operational ?? (moduleEnabled && memberEnabled && connected));
+            const tone = operational ? "success" : "neutral";
+            const statusLabel = !moduleEnabled
+              ? "未启用"
+              : !memberEnabled
+                ? "成员已停用"
+                : connected
+                  ? "已连接"
+                  : member.configured
+                    ? "等待扫码"
+                    : "未配置";
             const lastPoll = member.last_poll ?? {};
             return (
               <article className={`diagnostic-card diagnostic-member-card ${tone}`} key={member.id}>
                 <div>
                   <span className="diagnostic-member-title"><MemberAvatar member={member} size="small" /><strong>{member.display_name}</strong></span>
-                  <span className="diagnostic-status-pill">{connected ? "已连接" : member.configured ? "等待扫码" : "未配置"}</span>
+                  <span className="diagnostic-status-pill">{statusLabel}</span>
                 </div>
-                <small>微信：{member.account_id || member.qrcode_status || "尚未绑定"}</small>
-                <small>最近同步：{lastPoll.updated_at ? new Date(lastPoll.updated_at).toLocaleString() : "尚未同步"}{lastPoll.message ? ` · ${lastPoll.message}` : ""}</small>
+                <small>微信：{member.account_id || member.qrcode_status || "尚未绑定"}{connected && !operational ? " · 登录状态已保留" : ""}</small>
+                <small>最近同步：{lastPoll.updated_at ? formatSystemDateTime(lastPoll.updated_at) : "尚未同步"}{lastPoll.message ? ` · ${lastPoll.message}` : ""}</small>
               </article>
             );
           })}
@@ -5082,10 +5236,22 @@ function formatBytesFixed(value: number, digits: number): string {
   return `${current.toFixed(digits)} PB`;
 }
 
+function parseSystemDate(value: string | number | Date): Date {
+  if (value instanceof Date) return value;
+  const raw = String(value ?? "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return new Date(`${raw}T00:00:00`);
+  const normalized = /T/.test(raw) && !/(Z|[+-]\d{2}:?\d{2})$/.test(raw) ? `${raw}Z` : raw;
+  return new Date(normalized);
+}
+
+function formatSystemDateTime(value: string | number | Date): string {
+  const date = parseSystemDate(value);
+  return Number.isNaN(date.getTime()) ? "-" : date.toLocaleString();
+}
+
 function formatDateLabel(value: string): string {
   if (!value) return "-";
-  const normalized = /T/.test(value) && !/(Z|[+-]\d{2}:?\d{2})$/.test(value) ? `${value}Z` : value;
-  const date = new Date(normalized);
+  const date = parseSystemDate(value);
   if (Number.isNaN(date.getTime())) return String(value).slice(0, 10);
   const pad = (part: number) => String(part).padStart(2, "0");
   return `${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
@@ -5251,8 +5417,7 @@ function mediaTmdbId(item: any): string {
 }
 
 function favoriteMonthKey(value: string): string {
-  const normalized = /T/.test(value) && !/(Z|[+-]\d{2}:?\d{2})$/.test(value) ? `${value}Z` : value;
-  const date = new Date(normalized);
+  const date = parseSystemDate(value);
   if (Number.isNaN(date.getTime())) return "unknown";
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
 }

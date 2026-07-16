@@ -329,6 +329,19 @@ class FakeImageResponse:
         return b"\xff\xd8\xff\xe0valid-jpeg-bytes"
 
 
+def test_disabled_tmdb_config_keeps_image_requests_direct(monkeypatch):
+    monkeypatch.setattr(routes, "get_config", lambda _db, _provider: SimpleNamespace(enabled=False, encrypted_payload="saved"))
+    monkeypatch.setattr(
+        routes,
+        "get_decrypted_config",
+        lambda _db, _provider: {"proxy_enabled": True, "proxy_url": "http://mihomo:7890", "proxy_domains": ["image.tmdb.org"]},
+    )
+
+    proxy_enabled, _proxy_url, _proxy_domains, _timeout = routes._tmdb_image_network_config(object())
+
+    assert proxy_enabled is False
+
+
 def test_tmdb_image_proxy_validates_and_caches(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(routes.settings, "tmdb_image_cache_dir", str(tmp_path))
@@ -501,6 +514,7 @@ def test_tmdb_enable_requires_real_success():
     )
     assert saved.status_code == 200
     assert saved.json()["last_test_result"] is None
+    assert saved.json()["enabled"] is False
 
     enabled = client.post("/api/admin/integrations/tmdb/enable", headers=auth_headers(token))
     assert enabled.status_code == 409
