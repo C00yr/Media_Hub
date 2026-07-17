@@ -122,6 +122,22 @@ class MTeamSnapshot(Base):
     captured_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class MTeamTrafficRollup(Base):
+    __tablename__ = "mteam_traffic_rollups"
+    __table_args__ = (
+        UniqueConstraint("period_type", "period_start", "timezone", name="uq_mteam_traffic_rollup_period"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    period_type: Mapped[str] = mapped_column(String(16), index=True)
+    period_start: Mapped[datetime] = mapped_column(DateTime, index=True)
+    timezone: Mapped[str] = mapped_column(String(64), default="UTC")
+    upload_total: Mapped[float] = mapped_column(Float, default=0)
+    download_total: Mapped[float] = mapped_column(Float, default=0)
+    source: Mapped[str] = mapped_column(String(64), default="app_rollup")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class QbSnapshot(Base):
     __tablename__ = "qb_snapshots"
 

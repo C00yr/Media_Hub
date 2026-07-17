@@ -22,38 +22,63 @@ _wechat_claw_stop_event = Event()
 
 
 def capture_snapshots() -> None:
+    from app.api.routes import (
+        cleanup_debug_traces,
+        compact_mteam_snapshots,
+        qb_placeholder_state,
+        record_module_collection_result,
+        record_qb_task_transitions,
+        refresh_collected_preload_caches,
+    )
+
     db: Session = SessionLocal()
+    mteam_stats: dict | None = None
+    mteam_error: str | None = None
+    qbs: list[dict] = []
+    downloads: dict[str, dict] = {}
     try:
         mteam_row = get_config(db, "mteam")
         if mteam_row and mteam_row.enabled:
             try:
-                stats = MTeamAdapter(get_decrypted_config(db, "mteam") or {}).get_user_stats()
+                mteam_stats = MTeamAdapter(get_decrypted_config(db, "mteam") or {}).get_user_stats()
                 db.add(
                     MTeamSnapshot(
-                        user_level=stats.get("user_level") or "",
-                        upload_total=stats["upload_total"],
-                        download_total=stats["download_total"],
-                        bonus=stats["bonus"],
-                        ratio=stats["ratio"],
-                        seed_size=stats.get("seed_size", 0),
-                        active_uploads=stats["active_uploads"],
-                        active_downloads=stats["active_downloads"],
+                        user_level=mteam_stats.get("user_level") or "",
+                        upload_total=mteam_stats["upload_total"],
+                        download_total=mteam_stats["download_total"],
+                        bonus=mteam_stats["bonus"],
+                        ratio=mteam_stats["ratio"],
+                        seed_size=mteam_stats.get("seed_size", 0),
+                        active_uploads=mteam_stats["active_uploads"],
+                        active_downloads=mteam_stats["active_downloads"],
                         source="real",
                     )
                 )
-                from app.api.routes import record_module_collection_result
                 record_module_collection_result(db, "mteam", True)
             except Exception as exc:
-                from app.api.routes import record_module_collection_result
-                record_module_collection_result(db, "mteam", False, str(exc))
+                mteam_error = str(exc)
+                record_module_collection_result(db, "mteam", False, mteam_error)
+
         for downloader_id in ["qb1", "qb2", "qb3"]:
             row = get_config(db, downloader_id)
             if not row or not row.enabled or not row.encrypted_payload:
+                qbs.append(qb_placeholder_state(downloader_id, row))
                 continue
             try:
                 adapter = QbittorrentWebAdapter(get_decrypted_config(db, downloader_id) or {})
                 state = adapter.get_server_state(downloader_id)
+                state.update({"configured": True, "enabled": True})
                 tasks = adapter.get_torrents(downloader_id)
+                summary = dict(state)
+                summary.update(adapter.summarize_torrents(tasks))
+                downloads[downloader_id] = {
+                    "downloader_id": downloader_id,
+                    "summary": summary,
+                    "items": tasks,
+                    "source": "qB Web API raw data (Real)",
+                    "updated_at": state.get("updated_at"),
+                }
+                qbs.append(state)
                 db.add(
                     QbSnapshot(
                         downloader_id=downloader_id,
@@ -66,13 +91,25 @@ def capture_snapshots() -> None:
                         source="real",
                     )
                 )
-                from app.api.routes import record_module_collection_result, record_qb_task_transitions
                 record_module_collection_result(db, downloader_id, True)
                 record_qb_task_transitions(db, downloader_id, tasks)
             except Exception as exc:
-                from app.api.routes import record_module_collection_result
                 record_module_collection_result(db, downloader_id, False, str(exc))
+                qbs.append(qb_placeholder_state(downloader_id, row, str(exc)))
+
         db.commit()
+        compact_mteam_snapshots(db)
+        cleanup_debug_traces(db)
+        refresh_collected_preload_caches(
+            db,
+            mteam=mteam_stats,
+            mteam_error=mteam_error,
+            qbs=qbs,
+            downloads=downloads,
+        )
+    except Exception:
+        db.rollback()
+        logger.exception("Scheduled snapshot collection failed")
     finally:
         db.close()
 
@@ -96,21 +133,16 @@ def check_external_module_health() -> None:
         db.close()
 
 
-def refresh_preload_caches() -> None:
-    from app.api.routes import refresh_dashboard_preload, refresh_discover_preload, refresh_download_preload
+def refresh_content_preload_caches() -> None:
+    """Refresh TMDB content only; M-Team/qB caches are refreshed by capture_snapshots."""
+    from app.api.routes import refresh_discover_preload
 
     db: Session = SessionLocal()
     try:
-        for refresh in (refresh_dashboard_preload, refresh_discover_preload):
-            try:
-                refresh(db)
-            except Exception:
-                db.rollback()
-        for downloader_id in ["qb1", "qb2", "qb3"]:
-            try:
-                refresh_download_preload(db, downloader_id)
-            except Exception:
-                db.rollback()
+        refresh_discover_preload(db)
+    except Exception:
+        db.rollback()
+        logger.exception("Scheduled TMDB preload refresh failed")
     finally:
         db.close()
 
@@ -189,5 +221,5 @@ def build_scheduler(interval_minutes: int) -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(capture_snapshots, "interval", minutes=interval_minutes, id="app_snapshots", replace_existing=True)
     scheduler.add_job(check_external_module_health, "interval", hours=1, id="external_module_health", replace_existing=True, next_run_time=system_now())
-    scheduler.add_job(refresh_preload_caches, "interval", hours=1, id="preload_caches", replace_existing=True, next_run_time=system_now())
+    scheduler.add_job(refresh_content_preload_caches, "interval", hours=1, id="content_preload_caches", replace_existing=True, next_run_time=system_now())
     return scheduler

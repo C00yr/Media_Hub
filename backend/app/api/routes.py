@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.adapters.ai import AIConfigError, AIServiceError, DeepSeekChatAdapter
+from app.adapters.ai import AIConfigError, AIServiceError, DeepSeekChatAdapter, redact_ai_user_text
 from app.adapters.mock import MockMetadataAdapter
 from app.adapters.mteam import MTeamAdapter, MTeamApiError, MTeamConfigError
 from app.adapters.qbittorrent import QbittorrentApiError, QbittorrentConfigError, QbittorrentWebAdapter
@@ -46,6 +46,7 @@ from app.models.entities import (
     DownloadAction,
     IntegrationConfig,
     MTeamSnapshot,
+    MTeamTrafficRollup,
     MediaFavorite,
     Notification,
     QbSnapshot,
@@ -65,7 +66,7 @@ from app.services.integrations import (
 )
 from app.utils.ids import trace_id
 from app.utils.redaction import redact_payload
-from app.utils.time import format_system_datetime, parse_datetime, system_datetime, system_timezone_name, utc_iso, utc_now, utc_now_naive
+from app.utils.time import format_system_datetime, parse_datetime, system_datetime, system_time_context, system_timezone_name, utc_datetime, utc_iso, utc_now, utc_now_naive
 
 
 router = APIRouter()
@@ -119,7 +120,12 @@ class QbActionPayload(BaseModel):
     confirm_token: str | None = None
 
 
+class DefaultDownloaderPayload(BaseModel):
+    downloader_id: str = Field(min_length=3, max_length=3)
+
+
 class AssistantChatRequest(BaseModel):
+    conversation_id: str = Field(default="", max_length=160)
     message: str = Field(min_length=1, max_length=2000)
 
 
@@ -174,6 +180,8 @@ DEFAULT_WECHAT_CLAW_BINDING_PREFERENCES: dict[str, bool] = {
 WECHAT_CLAW_AVATAR_KEYS = ("mint", "violet", "coral", "sky", "amber", "rose", "indigo", "lime")
 
 NOTIFICATION_PREFERENCES_KEY = "notification.preferences"
+DEFAULT_DOWNLOADER_SETTING_KEY = "downloads.default_downloader"
+DOWNLOADER_IDS = ("qb1", "qb2", "qb3")
 WECHAT_CLAW_INTERACTIONS_KEY = "wechat_claw.interactions"
 WECHAT_CLAW_ILINK_STATE_KEY = "wechat_claw.ilink_state"
 WECHAT_CLAW_LAST_POLL_KEY = "wechat_claw.last_poll"
@@ -181,20 +189,84 @@ WECHAT_CLAW_MEMBER_LIMIT = 5
 WECHAT_CLAW_INTERACTION_LIMIT = 5
 WECHAT_CLAW_PENDING_LIMIT = 100
 MODULE_HEALTH_PREFIX = "module.health."
+LIVE_DIAGNOSTIC_MODULES = tuple(PROVIDERS) + ("nas_disk",)
 QB_TASK_STATE_PREFIX = "qb.task_state."
 QB_TASK_METADATA_PREFIX = "qb.task_metadata."
 WECHAT_CLAW_MOBILE_SELECTION_LIMIT = 10
 WECHAT_CLAW_MOBILE_SELECTION_TTL_SECONDS = 30 * 60
+ASSISTANT_AGENT_SESSIONS_KEY = "assistant.agent_sessions"
+ASSISTANT_AGENT_SESSION_TTL_SECONDS = 24 * 60 * 60
+ASSISTANT_AGENT_HISTORY_LIMIT = 12
+ASSISTANT_AGENT_MAX_TOOL_STEPS = 6
 MTEAM_INITIAL_DISPLAY_LIMIT = 5
 MTEAM_SHOW_ALL_RESULTS_RE = re.compile(r"(?:查看|显示|展示|给我).*(?:全部|完整)(?:资源|结果|列表|信息)?|(?:全部|完整).*(?:资源|结果|列表|信息)", re.IGNORECASE)
 MTEAM_SITE_DATA_RE = re.compile(r"(?:馒头|m[-\s]?team).*(?:站点|账号|数据|信息|状态)|(?:站点|账号|数据|信息|状态).*(?:馒头|m[-\s]?team)", re.IGNORECASE)
 WECHAT_CLAW_DOWNLOAD_SELECTION_RE = re.compile(r"^\s*(?:下载|选择|选)\s*(?:第)?\s*(\d+)\s*$", re.IGNORECASE)
 WECHAT_CLAW_ADMIN_VERIFY_RE = re.compile(r"^\s*(?:验证管理员密码|管理员验证|验证密码)\s*[:： ]\s*(.+?)\s*$", re.IGNORECASE)
 WECHAT_CLAW_DOWNLOAD_CONFIRM_RE = re.compile(r"(?:确认|就它|就这个|就下载|可以下载|开始下载|下吧|下载吧)", re.IGNORECASE)
+WECHAT_CLAW_EXPLICIT_DOWNLOAD_CONFIRM_RE = re.compile(
+    r"^\s*(?:\u786e\u8ba4(?:\u4e0b\u8f7d)?|\u5c31\u5b83|\u5c31\u8fd9\u4e2a|\u5c31\u4e0b\u8f7d|\u5f00\u59cb\u4e0b\u8f7d|\u4e0b\u8f7d\u5427|\u4e0b\u5427|\u53ef\u4ee5\u4e0b\u8f7d)\s*[.!\u3002\uff01]*$"
+    r"|(?:\u786e\u8ba4|\u53ef\u4ee5|\u5f00\u59cb|\u7acb\u5373).{0,8}(?:\u4e0b\u8f7d|\u63a8\u9001|\u6dfb\u52a0)"
+)
 WECHAT_CLAW_SELECTION_WORDS = {"第一个": 1, "第一部": 1, "第1个": 1, "推荐的": -1, "推荐那个": -1, "推荐的那个": -1}
 WECHAT_CLAW_PRIVACY_GRANT_SECONDS = 15 * 60
 DEFAULT_CREDENTIALS_PENDING_KEY = "account.default_credentials_pending"
 SUPER_PASSWORD_SETTING_KEY = "auth.super_password"
+
+
+AGENT_TOOL_CATALOG: list[dict[str, Any]] = [
+    {
+        "name": "tmdb_lookup",
+        "description": "Find movies or TV shows by title, or discover them by type, region, language, genre, year, rating and sort order. This is the former TMDB intent template.",
+        "arguments": {"query": "title or keywords; may be empty for discovery", "media_type": "movie|tv|all", "region": "two-letter region code", "language": "language code", "genre": "genre", "year": "year or decade", "min_rating": "0-10", "sort_by": "vote_average.desc|popularity.desc|release_date.desc", "limit": "1-10"},
+    },
+    {
+        "name": "tmdb_media_details",
+        "description": "Fetch the complete overview, credits, seasons, episodes, similar and recommended titles for a TMDB result. Prefer result_index for a recent result.",
+        "arguments": {"result_index": "one-based index in recent TMDB results", "media_id": "explicit TMDB ID", "media_type": "movie|tv"},
+    },
+    {
+        "name": "tmdb_person_details",
+        "description": "Fetch biography and known works for an explicit TMDB person_id.",
+        "arguments": {"person_id": "TMDB person ID"},
+    },
+    {
+        "name": "mteam_search",
+        "description": "Search M-Team releases and rank by resolution, size, promotion and recommendation preferences. This is the former M-Team intent template.",
+        "arguments": {"query": "movie or release keywords", "resolution": "2160p|1080p|empty", "min_size_gb": "minimum size", "max_size_gb": "maximum size", "promotion": "free|discount|any", "recommend": "boolean", "limit": "1-10"},
+    },
+    {
+        "name": "mteam_result_details",
+        "description": "Call M-Team again for current details of a numbered recent result, including promotion deadline, remaining time, seeders and release data.",
+        "arguments": {"result_index": "one-based index in recent M-Team results"},
+    },
+    {
+        "name": "dashboard_query",
+        "description": "Read app dashboard, M-Team account, NAS, downloader summaries, statistics or diagnostics. This is the former dashboard intent template.",
+        "arguments": {"sections": "array of overview|mteam|nas|qb1|qb2|qb3|downloads|stats|diagnostics"},
+    },
+    {
+        "name": "qb_list_torrents",
+        "description": "List tasks from a qB downloader, optionally filtered by task name. qB2 requires an active privacy grant.",
+        "arguments": {"downloader_id": "qb1|qb2|qb3", "query": "optional task-name keyword", "limit": "1-10"},
+    },
+    {
+        "name": "qb_torrent_details",
+        "description": "Read progress, files and connection properties for a numbered recent qB task without exposing paths, hashes or tracker URLs.",
+        "arguments": {"downloader_id": "qb1|qb2|qb3", "result_index": "one-based index in recent results for that downloader"},
+    },
+    {
+        "name": "prepare_mteam_download",
+        "description": "Select a numbered recent M-Team result and ask for confirmation. This never starts a download.",
+        "arguments": {"result_index": "one-based index in recent M-Team results"},
+    },
+    {
+        "name": "confirm_mteam_download",
+        "description": "Send the prepared M-Team release to the default qB downloader. Use only when the current user message explicitly confirms.",
+        "arguments": {},
+    },
+]
+AGENT_TOOL_NAMES = frozenset(item["name"] for item in AGENT_TOOL_CATALOG)
 
 
 def wechat_claw_setting_key(key: str, user_id: int | None = None) -> str:
@@ -1574,6 +1646,128 @@ def get_wechat_claw_last_poll(db: Session, user_id: int | None = None) -> dict[s
     return row.value if row and isinstance(row.value, dict) else {}
 
 
+AGENT_HIDDEN_RESULT_KEYS = frozenset({
+    "api_key", "apikey", "authorization", "bearer_token", "cookie", "password", "passkey",
+    "token", "secret", "webhook_secret", "raw_headers", "raw_summary", "download_url",
+    "save_path", "content_path", "path", "hash", "tracker", "trackers", "context_token",
+    "credential", "credentials", "username", "user_id", "account_id", "email", "phone",
+    "base_url", "endpoint", "host", "ip", "session_id",
+})
+
+
+def agent_safe_payload(value: Any, depth: int = 0) -> Any:
+    """Bound and redact every value before it is persisted in or sent to the model context."""
+    if depth > 6:
+        return "[content truncated]"
+    if isinstance(value, bytes):
+        return "[binary content hidden]"
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in list(value.items())[:80]:
+            normalized_key = str(key).strip().lower().replace("-", "_")
+            if normalized_key in AGENT_HIDDEN_RESULT_KEYS or any(
+                word in normalized_key for word in ("password", "passkey", "api_key", "apikey", "authorization", "cookie", "secret", "_token")
+            ) or normalized_key.endswith(("_key", "_credential", "_credentials")):
+                continue
+            result[str(key)] = agent_safe_payload(item, depth + 1)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [agent_safe_payload(item, depth + 1) for item in list(value)[:20]]
+    if isinstance(value, str):
+        return redact_ai_user_text(redact_payload(value))[:1800]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return str(redact_payload(str(value)))[:500]
+
+
+def assistant_agent_session_key(request: WechatClawMessageRequest) -> str:
+    user_key = str(request.user_id or request.conversation_id or "default").strip() or "default"
+    channel = "web" if user_key.startswith("web-") else f"wechat-{_WECHAT_CLAW_ACTIVE_USER_ID.get() or 0}"
+    conversation_key = str(request.conversation_id or "").strip()
+    identity = f"{user_key}:{conversation_key}" if channel == "web" and conversation_key else user_key
+    digest = hashlib.sha256(f"{channel}:{identity}".encode("utf-8")).hexdigest()[:24]
+    return f"{channel}:{digest}"
+
+
+def get_assistant_agent_session(db: Session, request: WechatClawMessageRequest) -> dict[str, Any]:
+    row = db.query(Setting).filter(Setting.key == ASSISTANT_AGENT_SESSIONS_KEY).one_or_none()
+    sessions = row.value if row and isinstance(row.value, dict) else {}
+    entry = sessions.get(assistant_agent_session_key(request))
+    session = dict(entry) if isinstance(entry, dict) else {}
+    updated_at = parse_datetime(session.get("updated_at"))
+    if updated_at is None or (utc_now() - updated_at).total_seconds() > ASSISTANT_AGENT_SESSION_TTL_SECONDS:
+        return {"history": [], "recent_results": {}, "references": {}}
+    session["history"] = session.get("history") if isinstance(session.get("history"), list) else []
+    session["recent_results"] = session.get("recent_results") if isinstance(session.get("recent_results"), dict) else {}
+    session["references"] = session.get("references") if isinstance(session.get("references"), dict) else {}
+    return session
+
+
+def save_assistant_agent_session(db: Session, request: WechatClawMessageRequest, session: dict[str, Any]) -> None:
+    row = db.query(Setting).filter(Setting.key == ASSISTANT_AGENT_SESSIONS_KEY).one_or_none()
+    sessions = dict(row.value) if row and isinstance(row.value, dict) else {}
+    cutoff = utc_now() - timedelta(seconds=ASSISTANT_AGENT_SESSION_TTL_SECONDS)
+    sessions = {
+        key: value
+        for key, value in sessions.items()
+        if isinstance(value, dict) and (parse_datetime(value.get("updated_at")) or cutoff) >= cutoff
+    }
+    stored = {
+        "updated_at": utc_iso(),
+        "history": list(session.get("history") or [])[-ASSISTANT_AGENT_HISTORY_LIMIT:],
+        "recent_results": dict(session.get("recent_results") or {}),
+        "references": dict(session.get("references") or {}),
+    }
+    sessions[assistant_agent_session_key(request)] = stored
+    if len(sessions) > 100:
+        sessions = dict(sorted(sessions.items(), key=lambda item: str(item[1].get("updated_at") or ""))[-100:])
+    if row is None:
+        db.add(Setting(key=ASSISTANT_AGENT_SESSIONS_KEY, value=sessions))
+    else:
+        row.value = sessions
+        row.updated_at = utc_now_naive()
+    db.commit()
+
+
+def remember_assistant_agent_result(session: dict[str, Any], tool: str, result: dict[str, Any], arguments: dict[str, Any]) -> None:
+    recent_results = dict(session.get("recent_results") or {})
+    references = dict(session.get("references") or {})
+    result_key = f"qb_list_torrents:{arguments.get('downloader_id')}" if tool == "qb_list_torrents" else tool
+    if tool not in {"tmdb_media_details", "tmdb_person_details", "mteam_result_details", "qb_torrent_details", "prepare_mteam_download", "confirm_mteam_download"}:
+        recent_results[result_key] = agent_safe_payload(result)
+    items = result.get("items") if isinstance(result.get("items"), list) else []
+    if tool == "tmdb_lookup":
+        references["tmdb_lookup"] = [
+            {"tmdb_id": str(item.get("tmdb_id") or item.get("id") or ""), "media_type": str(item.get("media_type") or "")}
+            for item in items[:10] if isinstance(item, dict)
+        ]
+    elif tool == "mteam_search":
+        references["mteam_search"] = {
+            "query": str(result.get("query") or ""),
+            "recommended_index": int(result.get("recommended_index") or 0),
+            "items": [{"id": str(item.get("id") or ""), "title": str(item.get("title") or "")[:240]} for item in items[:10] if isinstance(item, dict)],
+        }
+    elif tool == "qb_list_torrents":
+        downloader_id = str(arguments.get("downloader_id") or "")
+        references[result_key] = [
+            {"hash": str(item.get("hash") or ""), "name": str(item.get("name") or "")[:240]}
+            for item in items[:10] if isinstance(item, dict)
+        ]
+    session["recent_results"] = recent_results
+    session["references"] = references
+
+
+def append_assistant_agent_turn(session: dict[str, Any], message: str, reply: str) -> None:
+    history = list(session.get("history") or [])
+    history.extend(
+        [
+            {"role": "user", "content": redact_ai_user_text(redact_payload(message))[:2000]},
+            {"role": "assistant", "content": redact_ai_user_text(redact_payload(reply))[:6000]},
+        ]
+    )
+    session["history"] = history[-ASSISTANT_AGENT_HISTORY_LIMIT:]
+
+
 def save_wechat_claw_mobile_candidates(
     db: Session,
     request: WechatClawMessageRequest,
@@ -1598,6 +1792,8 @@ def save_wechat_claw_mobile_candidates(
             "seeders": int(item.get("seeders") or 0),
             "promotion_label": str(item.get("promotion_label") or "普通").strip(),
             "promotion_type": str(item.get("promotion_type") or "").strip(),
+            "promotion_until": str(item.get("promotion_until") or "").strip(),
+            "promotion_remaining": str(item.get("promotion_remaining") or "").strip(),
             "codec": str(item.get("codec") or "").strip(),
             "hdr": str(item.get("hdr") or "").strip(),
             "audio_codec": str(item.get("audio_codec") or "").strip(),
@@ -1713,16 +1909,57 @@ def redact_wechat_claw_message(message: str) -> str:
     return "[管理员密码验证已脱敏]" if WECHAT_CLAW_ADMIN_VERIFY_RE.match(message or "") else message
 
 
-def resolve_wechat_claw_default_downloader(db: Session) -> str:
-    config = get_decrypted_config(db, "wechat_claw") or {}
-    configured = str(config.get("default_downloader_id") or "all").strip().lower()
-    if configured in {"qb1", "qb2", "qb3"}:
+def configured_default_downloader_id(db: Session) -> str:
+    row = db.query(Setting).filter(Setting.key == DEFAULT_DOWNLOADER_SETTING_KEY).one_or_none()
+    value = row.value if row and isinstance(row.value, dict) else {}
+    configured = str(value.get("downloader_id") or "").strip().lower()
+    if configured in DOWNLOADER_IDS:
         return configured
-    for downloader_id in ("qb1", "qb2", "qb3"):
-        row = get_config(db, downloader_id)
-        if row and row.enabled and row.encrypted_payload:
-            return downloader_id
-    raise HTTPException(status_code=409, detail="未找到可用的默认 qB 下载器，请先在设置中启用 qB1、qB2 或 qB3。")
+    legacy_config = get_decrypted_config(db, "wechat_claw") or {}
+    legacy = str(legacy_config.get("default_downloader_id") or "").strip().lower()
+    return legacy if legacy in DOWNLOADER_IDS else ""
+
+
+def default_downloader_status(db: Session) -> dict[str, Any]:
+    downloader_id = configured_default_downloader_id(db)
+    source = "configured" if downloader_id else "automatic"
+    if not downloader_id:
+        for candidate in DOWNLOADER_IDS:
+            row = get_config(db, candidate)
+            if row and row.enabled and row.encrypted_payload:
+                downloader_id = candidate
+                break
+    row = get_config(db, downloader_id) if downloader_id else None
+    ready = bool(row and row.enabled and row.encrypted_payload)
+    return {"downloader_id": downloader_id or None, "ready": ready, "source": source}
+
+
+def resolve_default_downloader(db: Session) -> str:
+    status = default_downloader_status(db)
+    downloader_id = str(status.get("downloader_id") or "")
+    if not downloader_id:
+        raise HTTPException(status_code=409, detail="\u8bf7\u5148\u5728\u4e0b\u8f7d\u5668\u914d\u7f6e\u4e2d\u6d4b\u8bd5\u5e76\u542f\u7528\u81f3\u5c11\u4e00\u4e2a qB \u4e0b\u8f7d\u5668\u3002")
+    if not status.get("ready"):
+        raise HTTPException(status_code=409, detail=f"\u9ed8\u8ba4\u4e0b\u8f7d\u5668 {downloader_label(downloader_id)} \u5f53\u524d\u672a\u542f\u7528\uff0c\u8bf7\u542f\u7528\u5b83\u6216\u9009\u62e9\u5176\u4ed6\u9ed8\u8ba4\u4e0b\u8f7d\u5668\u3002")
+    return downloader_id
+
+
+def save_default_downloader(db: Session, downloader_id: str) -> dict[str, Any]:
+    normalized = str(downloader_id or "").strip().lower()
+    if normalized not in DOWNLOADER_IDS:
+        raise HTTPException(status_code=400, detail="\u9ed8\u8ba4\u4e0b\u8f7d\u5668\u5fc5\u987b\u662f qB1\u3001qB2 \u6216 qB3\u3002")
+    provider = get_config(db, normalized)
+    if not provider or not provider.enabled or not provider.encrypted_payload:
+        raise HTTPException(status_code=409, detail=f"\u8bf7\u5148\u6d4b\u8bd5\u5e76\u542f\u7528 {downloader_label(normalized)}\uff0c\u518d\u5c06\u5b83\u8bbe\u4e3a\u9ed8\u8ba4\u4e0b\u8f7d\u5668\u3002")
+    row = db.query(Setting).filter(Setting.key == DEFAULT_DOWNLOADER_SETTING_KEY).one_or_none()
+    value = {"downloader_id": normalized, "updated_at": utc_iso()}
+    if row is None:
+        db.add(Setting(key=DEFAULT_DOWNLOADER_SETTING_KEY, value=value))
+    else:
+        row.value = value
+        row.updated_at = utc_now_naive()
+    db.commit()
+    return default_downloader_status(db)
 
 
 def download_wechat_claw_selected_torrent(
@@ -1731,7 +1968,7 @@ def download_wechat_claw_selected_torrent(
     actor: User,
     candidate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    downloader_id = resolve_wechat_claw_default_downloader(db)
+    downloader_id = resolve_default_downloader(db)
     stage = "mteam_download_torrent"
     try:
         torrent_file = get_mteam_adapter_or_error(db).download_torrent_file(torrent_id)
@@ -2051,6 +2288,284 @@ def build_mobile_dashboard_result(db: Session, request: WechatClawMessageRequest
     if "diagnostics" in selected:
         result["diagnostics"] = diagnostics_health(assistant_actor_for_wechat_claw(db), db)
     return result
+
+
+def agent_int_argument(arguments: dict[str, Any], key: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(arguments.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def agent_cached_result_item(session: dict[str, Any], result_key: str, index: int) -> dict[str, Any] | None:
+    recent = session.get("recent_results") if isinstance(session.get("recent_results"), dict) else {}
+    result = recent.get(result_key) if isinstance(recent.get(result_key), dict) else {}
+    items = result.get("items") if isinstance(result.get("items"), list) else []
+    item = items[index - 1] if 1 <= index <= len(items) and isinstance(items[index - 1], dict) else None
+    return dict(item) if item else None
+
+
+def execute_media_hub_agent_tool(
+    db: Session,
+    ai_adapter: DeepSeekChatAdapter,
+    tool: str,
+    arguments: dict[str, Any],
+    request: WechatClawMessageRequest,
+    user: User,
+    session: dict[str, Any],
+) -> dict[str, Any]:
+    if tool == "tmdb_lookup":
+        filters = {
+            "media_type": str(arguments.get("media_type") or "all").lower(),
+            "region": str(arguments.get("region") or "").upper()[:2],
+            "language": str(arguments.get("language") or "").lower()[:8],
+            "genre": str(arguments.get("genre") or "").strip()[:40],
+            "year": str(arguments.get("year") or "").strip()[:12],
+            "min_rating": max(0.0, min(10.0, float(arguments.get("min_rating") or 0))),
+            "sort_by": str(arguments.get("sort_by") or "").strip(),
+        }
+        intent = {"intent_type": "tmdb_lookup", "query": str(arguments.get("query") or "").strip(), "tmdb_filters": filters}
+        result = execute_mobile_agent_intent(db, intent, request, user)
+        limit = agent_int_argument(arguments, "limit", 5, 1, 10)
+        result["items"] = list(result.get("items") or [])[:limit]
+        result["count"] = len(result["items"])
+        return result
+
+    if tool == "tmdb_media_details":
+        index = agent_int_argument(arguments, "result_index", 0, 0, 10)
+        media_id = str(arguments.get("media_id") or "").strip()
+        media_type = str(arguments.get("media_type") or "").strip().lower()
+        references = session.get("references") if isinstance(session.get("references"), dict) else {}
+        candidates = references.get("tmdb_lookup") if isinstance(references.get("tmdb_lookup"), list) else []
+        if index and index <= len(candidates) and isinstance(candidates[index - 1], dict):
+            media_id = str(candidates[index - 1].get("tmdb_id") or "")
+            media_type = str(candidates[index - 1].get("media_type") or "")
+        if not media_id or media_type not in {"movie", "tv"}:
+            raise HTTPException(status_code=400, detail="No matching TMDB result. Search first or provide a valid result reference.")
+        row = get_config(db, "tmdb")
+        if not row or not row.enabled:
+            raise HTTPException(status_code=409, detail="TMDB is not enabled.")
+        item = TmdbAdapter(get_decrypted_config(db, "tmdb") or {}).get_media_details(media_id, media_type)
+        return {"state": "success", "result_index": index or None, "item": item, "source": "tmdb"}
+
+    if tool == "tmdb_person_details":
+        person_id = str(arguments.get("person_id") or "").strip()
+        if not person_id:
+            raise HTTPException(status_code=400, detail="A TMDB person ID is required.")
+        row = get_config(db, "tmdb")
+        if not row or not row.enabled:
+            raise HTTPException(status_code=409, detail="TMDB is not enabled.")
+        item = TmdbAdapter(get_decrypted_config(db, "tmdb") or {}).get_person_details(person_id)
+        return {"state": "success", "item": item, "source": "tmdb"}
+
+    if tool == "mteam_search":
+        filters = {
+            "resolution": str(arguments.get("resolution") or "").lower(),
+            "min_size_gb": max(0.0, float(arguments.get("min_size_gb") or 0)),
+            "max_size_gb": max(0.0, float(arguments.get("max_size_gb") or 0)),
+            "promotion": str(arguments.get("promotion") or "any").lower(),
+            "recommend": bool(arguments.get("recommend")),
+        }
+        intent = {"intent_type": "mteam_search", "query": str(arguments.get("query") or "").strip(), "mteam_filters": filters}
+        result = execute_mobile_agent_intent(db, intent, request, user)
+        limit = agent_int_argument(arguments, "limit", 5, 1, 10)
+        result["items"] = list(result.get("items") or [])[:limit]
+        result["count"] = len(result["items"])
+        result["presentation"] = mteam_model_rows(result["items"])
+        result["mobile_selection"] = save_wechat_claw_mobile_candidates(
+            db, request, result["items"], query=str(result.get("query") or ""),
+            recommended_index=result.get("recommended_index"), presentation=result["presentation"],
+        )
+        return result
+
+    if tool == "mteam_result_details":
+        index = agent_int_argument(arguments, "result_index", 0, 1, 10)
+        references = session.get("references") if isinstance(session.get("references"), dict) else {}
+        search_ref = references.get("mteam_search") if isinstance(references.get("mteam_search"), dict) else {}
+        candidates = search_ref.get("items") if isinstance(search_ref.get("items"), list) else []
+        if index > len(candidates) or not isinstance(candidates[index - 1], dict):
+            raise HTTPException(status_code=400, detail="No matching recent M-Team result. Search resources first.")
+        candidate_id = str(candidates[index - 1].get("id") or "")
+        query = str(search_ref.get("query") or "").strip()
+        if not query:
+            raise HTTPException(status_code=400, detail="The recent M-Team search expired. Search again.")
+        fresh_items = get_mteam_adapter_or_error(db).search_torrents(query)[:50]
+        item = next((value for value in fresh_items if str(value.get("id") or "") == candidate_id), None)
+        if item is None:
+            item = agent_cached_result_item(session, "mteam_search", index)
+        if item is None:
+            raise HTTPException(status_code=404, detail="M-Team no longer returns this resource.")
+        return {"state": "success", "result_index": index, "item": item, "refreshed": True, "source": "mteam"}
+
+    if tool == "dashboard_query":
+        requested = arguments.get("sections") if isinstance(arguments.get("sections"), list) else ["overview"]
+        valid = {"overview", "mteam", "nas", "qb1", "qb2", "qb3", "downloads", "stats", "diagnostics"}
+        sections = [str(item).lower() for item in requested if str(item).lower() in valid] or ["overview"]
+        return build_mobile_dashboard_result(db, request, sections)
+
+    if tool == "qb_list_torrents":
+        downloader_id = str(arguments.get("downloader_id") or "qb1").lower()
+        if downloader_id not in {"qb1", "qb2", "qb3"}:
+            raise HTTPException(status_code=400, detail="downloader_id must be qb1, qb2, or qb3.")
+        if downloader_id == "qb2" and not has_wechat_claw_privacy_access(db, request):
+            return {"state": "privacy_required", "downloader_id": downloader_id, "message": "qB2 private tasks require an active administrator privacy grant."}
+        items = get_qb_adapter_or_error(db, downloader_id).get_torrents(downloader_id)
+        query = str(arguments.get("query") or "").strip().casefold()
+        if query:
+            items = [item for item in items if query in str(item.get("name") or "").casefold()]
+        limit = agent_int_argument(arguments, "limit", 5, 1, 10)
+        items = items[:limit]
+        return {"state": "success", "downloader_id": downloader_id, "items": items, "count": len(items), "source": "qb_web_api"}
+
+    if tool == "qb_torrent_details":
+        downloader_id = str(arguments.get("downloader_id") or "qb1").lower()
+        index = agent_int_argument(arguments, "result_index", 0, 1, 10)
+        if downloader_id not in {"qb1", "qb2", "qb3"}:
+            raise HTTPException(status_code=400, detail="downloader_id must be qb1, qb2, or qb3.")
+        if downloader_id == "qb2" and not has_wechat_claw_privacy_access(db, request):
+            return {"state": "privacy_required", "downloader_id": downloader_id, "message": "qB2 private tasks require an active administrator privacy grant."}
+        references = session.get("references") if isinstance(session.get("references"), dict) else {}
+        ref_key = f"qb_list_torrents:{downloader_id}"
+        candidates = references.get(ref_key) if isinstance(references.get(ref_key), list) else []
+        if index > len(candidates) or not isinstance(candidates[index - 1], dict):
+            raise HTTPException(status_code=400, detail="No matching recent qB task. List tasks first.")
+        torrent_hash = str(candidates[index - 1].get("hash") or "")
+        detail = get_qb_adapter_or_error(db, downloader_id).get_torrent_detail(downloader_id, torrent_hash)
+        return {"state": "success", "downloader_id": downloader_id, "result_index": index, "name": candidates[index - 1].get("name"), "detail": detail}
+
+    if tool == "prepare_mteam_download":
+        index = agent_int_argument(arguments, "result_index", 0, 1, 10)
+        candidate = get_wechat_claw_mobile_candidate(db, request, index)
+        if candidate is None:
+            candidate = agent_cached_result_item(session, "mteam_search", index)
+        if candidate is None or not str(candidate.get("id") or ""):
+            return {"intent_type": "download_selected", "state": "selection_missing"}
+        save_wechat_claw_pending_download(db, request, candidate)
+        return {"intent_type": "download_selected", "state": "awaiting_confirmation", "candidate": candidate}
+
+    if tool == "confirm_mteam_download":
+        candidate = get_wechat_claw_pending_download(db, request)
+        if candidate is None:
+            return {"intent_type": "download_selected", "state": "selection_missing"}
+        if not WECHAT_CLAW_EXPLICIT_DOWNLOAD_CONFIRM_RE.search(request.message or ""):
+            return {"intent_type": "download_selected", "state": "confirmation_required", "candidate": candidate}
+        dispatch = download_wechat_claw_selected_torrent(db, str(candidate.get("id") or ""), user, candidate)
+        clear_wechat_claw_pending_download(db, request)
+        return {"intent_type": "download_selected", "state": "accepted", "candidate": candidate, **dispatch}
+
+    raise HTTPException(status_code=400, detail=f"Agent requested an unknown tool: {tool}")
+
+
+def fallback_media_hub_agent_reply(tool: str, result: dict[str, Any]) -> str:
+    if tool == "tmdb_lookup":
+        return format_mobile_agent_reply({"intent_type": "tmdb_lookup"}, result)
+    if tool == "mteam_search":
+        return format_mobile_agent_reply({"intent_type": "mteam_search"}, result)
+    if tool == "dashboard_query":
+        return format_mobile_agent_reply({"intent_type": "dashboard_query"}, result)
+    if tool in {"prepare_mteam_download", "confirm_mteam_download"}:
+        return format_mobile_agent_reply({"intent_type": "download_selected"}, result)
+    if tool == "tmdb_media_details":
+        item = result.get("item") if isinstance(result.get("item"), dict) else {}
+        title = item.get("title") or item.get("name") or "\u5f71\u7247\u8be6\u60c5"
+        overview = str(item.get("overview") or "\u6682\u65f6\u6ca1\u6709\u7b80\u4ecb\u3002").strip()
+        return f"{title}\n{overview}"
+    if tool == "mteam_result_details":
+        item = result.get("item") if isinstance(result.get("item"), dict) else {}
+        return f"{item.get('title') or '\u8d44\u6e90\u8be6\u60c5'}\n{item.get('promotion_label') or '\u666e\u901a'} \u00b7 \u5269\u4f59 {item.get('promotion_remaining') or '-'} \u00b7 {item.get('size') or '-'} \u00b7 {item.get('seeders') or 0} \u4eba\u505a\u79cd"
+    if tool == "qb_list_torrents":
+        items = result.get("items") if isinstance(result.get("items"), list) else []
+        if result.get("state") == "privacy_required":
+            return str(result.get("message") or "\u5f53\u524d\u4f1a\u8bdd\u65e0\u6743\u67e5\u770b qB2 \u79c1\u5bc6\u4efb\u52a1\u3002")
+        lines = [f"{result.get('downloader_id') or 'qB'} \u5f53\u524d\u627e\u5230 {len(items)} \u4e2a\u4efb\u52a1\uff1a"]
+        lines.extend(f"{index}. {item.get('name') or '-'} \u00b7 {float(item.get('progress') or 0) * 100:.1f}%" for index, item in enumerate(items, 1))
+        return "\n".join(lines)
+    return "\u6211\u5df2\u7ecf\u53d6\u5f97\u4e86\u76f8\u5173\u6570\u636e\uff0c\u4f46\u8fd9\u6b21\u6ca1\u6709\u987a\u5229\u7ec4\u7ec7\u6210\u5b8c\u6574\u56de\u590d\u3002\u4f60\u53ef\u4ee5\u6362\u4e00\u79cd\u8bf4\u6cd5\uff0c\u6211\u4f1a\u63a5\u7740\u5904\u7406\u3002"
+
+
+def run_media_hub_agent(
+    db: Session,
+    ai_adapter: DeepSeekChatAdapter,
+    request: WechatClawMessageRequest,
+    user: User,
+    telemetry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    session = get_assistant_agent_session(db, request)
+    observations: list[dict[str, Any]] = []
+    tool_calls: list[dict[str, Any]] = []
+    seen_calls: set[str] = set()
+    last_tool = ""
+    last_result: dict[str, Any] = {}
+    reply = ""
+    for step_index in range(ASSISTANT_AGENT_MAX_TOOL_STEPS):
+        decision_started = time.perf_counter()
+        try:
+            decision = ai_adapter.next_agent_step(
+                request.message,
+                history=list(session.get("history") or []),
+                recent_results=dict(session.get("recent_results") or {}),
+                observations=observations,
+                tools=AGENT_TOOL_CATALOG,
+                runtime_context={
+                    **system_time_context(),
+                    "channel": "web" if str(request.user_id or "").startswith("web-") else "wechat",
+                },
+            )
+        except AIServiceError as exc:
+            if telemetry is not None:
+                record_wechat_claw_stage(telemetry, "agent_decision", decision_started, status="failed", error=exc)
+            if not observations:
+                raise HTTPException(status_code=502, detail=f"Media Hub Agent failed: {exc}") from exc
+            reply = fallback_media_hub_agent_reply(last_tool, last_result)
+            break
+        if telemetry is not None:
+            record_wechat_claw_stage(telemetry, "agent_decision", decision_started)
+        if decision.get("decision") == "final":
+            reply = str(decision.get("reply") or "").strip()
+            break
+        tool = str(decision.get("tool") or "").strip()
+        arguments = decision.get("arguments") if isinstance(decision.get("arguments"), dict) else {}
+        safe_arguments = agent_safe_payload(arguments)
+        call_signature = json.dumps({"tool": tool, "arguments": safe_arguments}, ensure_ascii=False, sort_keys=True)
+        if tool not in AGENT_TOOL_NAMES:
+            observations.append({"tool": tool or "unknown", "state": "failed", "error": "Unknown tool. Select one from available_tools."})
+            continue
+        if call_signature in seen_calls:
+            observations.append({"tool": tool, "state": "failed", "error": "The same tool call already ran. Use its observation or change arguments."})
+            continue
+        seen_calls.add(call_signature)
+        tool_started = time.perf_counter()
+        try:
+            result = execute_media_hub_agent_tool(db, ai_adapter, tool, arguments, request, user, session)
+        except HTTPException as exc:
+            result = {"state": "failed", "error": str(agent_safe_payload(exc.detail))}
+        except (MTeamApiError, QbittorrentApiError, TmdbConfigError, AIServiceError, ValueError, TypeError) as exc:
+            result = {"state": "failed", "error": str(agent_safe_payload(str(exc)))}
+        safe_result = agent_safe_payload(result)
+        if telemetry is not None:
+            record_wechat_claw_stage(
+                telemetry, tool, tool_started,
+                status="failed" if result.get("state") == "failed" else "success",
+                error=result.get("error") if result.get("state") == "failed" else None,
+            )
+        tool_calls.append({"tool": tool, "arguments": safe_arguments})
+        observations.append({"tool": tool, "result": safe_result})
+        remember_assistant_agent_result(session, tool, result, arguments)
+        last_tool = tool
+        last_result = result
+    if not reply:
+        reply = fallback_media_hub_agent_reply(last_tool, last_result)
+    reply = redact_ai_user_text(redact_payload(reply)).strip()[:6000]
+    append_assistant_agent_turn(session, request.message, reply)
+    save_assistant_agent_session(db, request, session)
+    return {
+        "reply": reply,
+        "intent": {"intent_type": "agent", "action": "agent", "tools_used": [item["tool"] for item in tool_calls]},
+        "result": {"tool_calls": tool_calls, "observations": observations},
+        "source": "media_hub_agent",
+        "handled_at": utc_iso(),
+    }
 
 
 def save_wechat_claw_last_poll(db: Session, payload: dict[str, Any], user_id: int | None = None) -> dict[str, Any]:
@@ -2518,6 +3033,9 @@ def wechat_claw_notification_title(notification: Notification, action: str, role
 
 
 def push_wechat_claw_notification(db: Session, notification: Notification, action: str) -> dict[str, Any]:
+    preferences = get_notification_preferences(db)
+    if not preferences.get("wechat_claw_push", True):
+        return {"sent": False, "reason": "disabled_by_preferences"}
     # App-originated download events have no active chat scope. Fan them out to
     # every independently bound member instead of the legacy administrator bot.
     if _WECHAT_CLAW_ACTIVE_USER_ID.get() is None:
@@ -2531,9 +3049,6 @@ def push_wechat_claw_notification(db: Session, notification: Notification, actio
                 finally:
                     _WECHAT_CLAW_ACTIVE_USER_ID.reset(scope)
             return {"sent": any(item.get("sent") for item in deliveries.values()), "deliveries": deliveries}
-    preferences = get_notification_preferences(db)
-    if not preferences.get("wechat_claw_push", True):
-        return {"sent": False, "reason": "disabled_by_preferences"}
     binding_id = _WECHAT_CLAW_ACTIVE_USER_ID.get()
     role_name = ""
     if binding_id is not None:
@@ -3258,22 +3773,49 @@ TRAFFIC_DIMENSIONS = ("hour", "day", "week", "month", "year")
 
 
 def build_mteam_traffic_series(db: Session) -> dict[str, list[dict[str, Any]]]:
-    points = mteam_snapshot_delta_points(db)
-    return {dimension: aggregate_traffic_points(points, dimension) for dimension in TRAFFIC_DIMENSIONS}
+    raw_points = mteam_snapshot_delta_points(db)
+    daily_points = mteam_rollup_points(db, "day")
+    monthly_points = mteam_rollup_points(db, "month")
+    series = {
+        "hour": aggregate_traffic_points(raw_points, "hour"),
+        "day": merge_traffic_series(
+            aggregate_traffic_points(daily_points, "day"),
+            aggregate_traffic_points(raw_points, "day"),
+        ),
+        "week": merge_traffic_series(
+            aggregate_traffic_points(daily_points, "week"),
+            aggregate_traffic_points(raw_points, "week"),
+        ),
+        "month": merge_traffic_series(
+            aggregate_traffic_points(monthly_points, "month"),
+            aggregate_traffic_points(raw_points, "month"),
+        ),
+        "year": merge_traffic_series(
+            aggregate_traffic_points(monthly_points, "year"),
+            aggregate_traffic_points(raw_points, "year"),
+        ),
+    }
+    return {dimension: limit_traffic_series(series[dimension], dimension) for dimension in TRAFFIC_DIMENSIONS}
 
 
-def mteam_snapshot_delta_points(db: Session, limit: int = 5000) -> list[dict[str, Any]]:
-    rows = list(
-        reversed(
-            db.query(MTeamSnapshot)
-            .filter(MTeamSnapshot.source != "mock")
-            .order_by(MTeamSnapshot.captured_at.desc())
-            .limit(limit)
-            .all()
+def mteam_snapshot_delta_points(db: Session, limit: int | None = None) -> list[dict[str, Any]]:
+    query = (
+        db.query(
+            MTeamSnapshot.id,
+            MTeamSnapshot.captured_at,
+            MTeamSnapshot.upload_total,
+            MTeamSnapshot.download_total,
         )
+        .filter(MTeamSnapshot.source != "mock")
     )
+    if limit is None:
+        rows = query.order_by(MTeamSnapshot.captured_at.asc(), MTeamSnapshot.id.asc()).all()
+    else:
+        latest_rows = query.order_by(MTeamSnapshot.captured_at.desc(), MTeamSnapshot.id.desc()).limit(max(2, int(limit))).all()
+        rows = list(reversed(latest_rows))
+
     points = []
-    previous: MTeamSnapshot | None = None
+    previous: Any | None = None
     for row in rows:
         if previous is None:
             previous = row
@@ -3289,6 +3831,71 @@ def mteam_snapshot_delta_points(db: Session, limit: int = 5000) -> list[dict[str
         previous = row
     return points
 
+
+TRAFFIC_SERIES_LIMITS = {"hour": 24, "day": 14, "week": 12, "month": 12, "year": 12}
+
+
+def mteam_rollup_points(db: Session, period_type: str) -> list[dict[str, Any]]:
+    rows = (
+        db.query(MTeamTrafficRollup)
+        .filter(
+            MTeamTrafficRollup.period_type == period_type,
+            MTeamTrafficRollup.timezone == system_timezone_name(),
+        )
+        .order_by(MTeamTrafficRollup.period_start.asc())
+        .all()
+    )
+    return [
+        {
+            "captured_at": row.period_start,
+            "upload_total": float(row.upload_total or 0),
+            "download_total": float(row.download_total or 0),
+            "source": row.source,
+        }
+        for row in rows
+    ]
+
+
+def merge_traffic_series(*series_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for series in series_groups:
+        for item in series:
+            key = str(item.get("date") or "")
+            if not key:
+                continue
+            if key not in merged:
+                merged[key] = dict(item)
+                continue
+            current = merged[key]
+            current["upload_total"] = float(current.get("upload_total") or 0) + float(item.get("upload_total") or 0)
+            current["download_total"] = float(current.get("download_total") or 0) + float(item.get("download_total") or 0)
+    return [merged[key] for key in sorted(merged)]
+
+
+def traffic_window_start(dimension: str, bucket_count: int) -> datetime:
+    current = traffic_period_start(system_datetime(), dimension)
+    offset = max(0, bucket_count - 1)
+    if dimension == "hour":
+        return current - timedelta(hours=offset)
+    if dimension == "day":
+        return current - timedelta(days=offset)
+    if dimension == "week":
+        return current - timedelta(weeks=offset)
+    if dimension == "month":
+        month_index = current.year * 12 + current.month - 1 - offset
+        return current.replace(year=month_index // 12, month=month_index % 12 + 1, day=1)
+    return current.replace(year=max(1, current.year - offset), month=1, day=1)
+
+
+def limit_traffic_series(series: list[dict[str, Any]], dimension: str) -> list[dict[str, Any]]:
+    limit = TRAFFIC_SERIES_LIMITS[dimension]
+    cutoff = utc_datetime(traffic_window_start(dimension, limit))
+    filtered = []
+    for item in series:
+        period = parse_datetime(item.get("date"))
+        if period is not None and period >= cutoff:
+            filtered.append(item)
+    return filtered[-limit:]
 
 def aggregate_traffic_points(points: list[dict[str, Any]], dimension: str) -> list[dict[str, Any]]:
     buckets: dict[datetime, dict[str, float]] = {}
@@ -3341,42 +3948,90 @@ def traffic_period_label(value: datetime, dimension: str) -> str:
     return display_value.strftime("%m/%d")
 
 
-def persist_dashboard_snapshots(db: Session, mteam: dict[str, Any], qbs: list[dict[str, Any]], mteam_ok: bool) -> None:
-    has_rows = False
-    if mteam_ok:
-        db.add(
-            MTeamSnapshot(
-                user_level=str(mteam.get("user_level") or ""),
-                upload_total=float(mteam.get("upload_total") or 0),
-                download_total=float(mteam.get("download_total") or 0),
-                bonus=float(mteam.get("bonus") or 0),
-                ratio=float(mteam.get("ratio") or 0),
-                seed_size=float(mteam.get("seed_size") or 0),
-                active_uploads=int(mteam.get("active_uploads") or 0),
-                active_downloads=int(mteam.get("active_downloads") or 0),
-                source="real",
-            )
-        )
-        has_rows = True
-    for qb in qbs:
-        if not qb.get("online"):
-            continue
-        db.add(
-            QbSnapshot(
-                downloader_id=str(qb.get("id") or ""),
-                download_speed=float(qb.get("download_speed") or 0),
-                upload_speed=float(qb.get("upload_speed") or 0),
-                downloaded_total=float(qb.get("downloaded_total") or 0),
-                uploaded_total=float(qb.get("uploaded_total") or 0),
-                active_downloads=int(qb.get("active_downloads") or 0),
-                active_uploads=int(qb.get("active_uploads") or 0),
-                source="real",
-            )
-        )
-        has_rows = True
-    if has_rows:
-        db.commit()
 
+def _add_mteam_rollup_totals(
+    db: Session,
+    period_type: str,
+    period_start: datetime,
+    timezone_name: str,
+    upload_total: float,
+    download_total: float,
+) -> None:
+    stored_start = utc_datetime(period_start).replace(tzinfo=None)
+    row = (
+        db.query(MTeamTrafficRollup)
+        .filter(
+            MTeamTrafficRollup.period_type == period_type,
+            MTeamTrafficRollup.period_start == stored_start,
+            MTeamTrafficRollup.timezone == timezone_name,
+        )
+        .one_or_none()
+    )
+    if row is None:
+        db.add(
+            MTeamTrafficRollup(
+                period_type=period_type,
+                period_start=stored_start,
+                timezone=timezone_name,
+                upload_total=upload_total,
+                download_total=download_total,
+            )
+        )
+        return
+    row.upload_total = float(row.upload_total or 0) + upload_total
+    row.download_total = float(row.download_total or 0) + download_total
+    row.updated_at = utc_now_naive()
+
+
+def compact_mteam_snapshots(db: Session, retention_days: int | None = None) -> int:
+    cutoff = utc_now_naive() - timedelta(days=max(1, retention_days or settings.mteam_snapshot_retention_days))
+    rows = (
+        db.query(MTeamSnapshot)
+        .filter(MTeamSnapshot.source != "mock", MTeamSnapshot.captured_at <= cutoff)
+        .order_by(MTeamSnapshot.captured_at.asc(), MTeamSnapshot.id.asc())
+        .all()
+    )
+    if len(rows) < 2:
+        return 0
+
+    points = [
+        {
+            "captured_at": current.captured_at,
+            "upload_total": max(0.0, float(current.upload_total or 0) - float(previous.upload_total or 0)),
+            "download_total": max(0.0, float(current.download_total or 0) - float(previous.download_total or 0)),
+        }
+        for previous, current in zip(rows, rows[1:])
+    ]
+    timezone_name = system_timezone_name()
+    for period_type in ("day", "month"):
+        for item in aggregate_traffic_points(points, period_type):
+            period_start = parse_datetime(item.get("date"))
+            if period_start is None:
+                continue
+            _add_mteam_rollup_totals(
+                db,
+                period_type,
+                period_start,
+                timezone_name,
+                float(item.get("upload_total") or 0),
+                float(item.get("download_total") or 0),
+            )
+
+    deleted = (
+        db.query(MTeamSnapshot)
+        .filter(MTeamSnapshot.id.in_([row.id for row in rows[:-1]]))
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return int(deleted or 0)
+
+
+def cleanup_debug_traces(db: Session, retention_days: int | None = None) -> int:
+    days = max(1, retention_days or settings.debug_trace_retention_days)
+    cutoff = utc_now_naive() - timedelta(days=days)
+    deleted = db.query(DebugTrace).filter(DebugTrace.created_at < cutoff).delete(synchronize_session=False)
+    db.commit()
+    return int(deleted or 0)
 
 @router.get("/setup/status")
 def setup_status(db: Session = Depends(get_db)) -> dict[str, Any]:
@@ -3504,8 +4159,14 @@ def list_integrations(_: User = Depends(require_admin), db: Session = Depends(ge
             if provider in existing
             else {"provider": provider, "config_version": 0, "enabled": False, "redacted_summary": {}, "saved_payload": {}, "last_tested_at": None, "last_test_result": None, "updated_at": None}
             for provider in PROVIDERS
-        ]
+        ],
+        "default_downloader": default_downloader_status(db),
     }
+
+
+@router.put("/admin/downloaders/default")
+def update_default_downloader(request: DefaultDownloaderPayload, _: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    return {"default_downloader": save_default_downloader(db, request.downloader_id)}
 
 
 @router.get("/admin/storage/status")
@@ -3687,12 +4348,26 @@ def integration_audit(provider: str, _: User = Depends(require_admin), db: Sessi
     return {"items": [{"action": row.action, "config_version": row.config_version, "test_success": row.test_success, "trace_id": row.trace_id, "created_at": utc_iso(row.created_at)} for row in rows]}
 
 
-def build_dashboard_payload(db: Session) -> dict[str, Any]:
+def build_dashboard_payload(
+    db: Session,
+    *,
+    collected_mteam: dict[str, Any] | None = None,
+    collected_qbs: list[dict[str, Any]] | None = None,
+    collection_complete: bool = False,
+    mteam_collection_error: str | None = None,
+) -> dict[str, Any]:
     mteam_row = get_config(db, "mteam")
     connection = mteam_connection_payload(mteam_row)
     mteam = empty_mteam_stats()
     mteam_ok = False
-    if mteam_row and mteam_row.enabled:
+    if collection_complete:
+        if collected_mteam is not None:
+            mteam = dict(collected_mteam)
+            mteam_ok = True
+        elif mteam_collection_error:
+            connection["last_test_success"] = False
+            connection["message"] = mteam_collection_error
+    elif mteam_row and mteam_row.enabled:
         try:
             mteam = MTeamAdapter(get_decrypted_config(db, "mteam") or {}).get_user_stats()
             mteam_ok = True
@@ -3700,16 +4375,18 @@ def build_dashboard_payload(db: Session) -> dict[str, Any]:
             connection["last_test_success"] = False
             connection["message"] = f"M-Team 真实数据读取失败：{exc}"
             mteam = empty_mteam_stats("M-Team 真实数据读取失败，请回到设置页重新测试。")
-    qbs = [get_qb_state_for_dashboard(db, downloader_id) for downloader_id in ["qb1", "qb2", "qb3"]]
+    qbs = list(collected_qbs) if collected_qbs is not None else [
+        get_qb_state_for_dashboard(db, downloader_id) for downloader_id in ["qb1", "qb2", "qb3"]
+    ]
     nas_space = storage_status_from_setup_check(db)
-    persist_dashboard_snapshots(db, mteam, qbs, mteam_ok)
     if mteam_ok:
         apply_mteam_five_hour_deltas(db, mteam)
     mteam["traffic_series"] = build_mteam_traffic_series(db)
     mteam["traffic_history"] = mteam["traffic_series"]["day"]
     mteam["traffic_calculation"] = {
-        "source": "APP 本地累计快照",
+        "source": "M-Team 站点累计数据的本地快照",
         "formula": "周期流量 = 周期内相邻累计快照差值之和；负增量按 0 处理，避免站点计数回退污染统计。",
+        "scope": "仅统计应用开始成功记录快照后的 M-Team 站点累计增量，不包含部署前流量；离线期间产生的增量会归入恢复后的首个快照时段。",
         "snapshot_interval_minutes": settings.snapshot_interval_minutes,
     }
     return {
@@ -3747,6 +4424,27 @@ def refresh_dashboard_preload(db: Session) -> dict[str, Any]:
     set_preload_cache(db, "dashboard", payload, context={"timezone": system_timezone_name()})
     return payload
 
+
+
+def refresh_collected_preload_caches(
+    db: Session,
+    *,
+    mteam: dict[str, Any] | None,
+    qbs: list[dict[str, Any]],
+    downloads: dict[str, dict[str, Any]],
+    mteam_error: str | None = None,
+) -> dict[str, Any]:
+    payload = build_dashboard_payload(
+        db,
+        collected_mteam=mteam,
+        collected_qbs=qbs,
+        collection_complete=True,
+        mteam_collection_error=mteam_error,
+    )
+    set_preload_cache(db, "dashboard", payload, context={"timezone": system_timezone_name()})
+    for downloader_id, download_payload in downloads.items():
+        set_preload_cache(db, f"downloads.{downloader_id}", download_payload)
+    return payload
 
 def build_dashboard_qbs_payload(db: Session) -> dict[str, Any]:
     configs: list[tuple[str, dict[str, Any], str | None]] = []
@@ -3870,7 +4568,6 @@ def download_overview(
     if cached and not refresh:
         cache = get_preload_cache(db, cache_name)
         if cache:
-            add_preload_task_once(background_tasks, f"downloads.{downloader_id}", refresh_download_preload_task, downloader_id)
             return with_preload_meta(cache["payload"], cache, True)
     try:
         payload = refresh_download_preload(db, downloader_id)
@@ -3968,6 +4665,20 @@ def qb_add_torrent(downloader_id: str, request: QbActionPayload, authorization: 
     return result
 
 
+@router.post("/mteam/torrents/{torrent_id}/download")
+def mteam_download_to_default(
+    torrent_id: str,
+    request: QbActionPayload,
+    authorization: str | None = Header(default=None),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    downloader_id = resolve_default_downloader(db)
+    if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
+        raise HTTPException(status_code=403, detail="qB2 \u9700\u8981\u7ba1\u7406\u5458\u9a8c\u8bc1")
+    return mteam_download_to_qb(torrent_id, downloader_id, request, authorization, user, db)
+
+
 @router.post("/mteam/torrents/{torrent_id}/download-to/{downloader_id}")
 def mteam_download_to_qb(
     torrent_id: str,
@@ -4003,7 +4714,7 @@ def mteam_download_to_qb(
     task_hash = task_hashes[0] if task_hashes else torrent_id
     db.add(DownloadAction(trace_id=result["trace_id"], downloader_id=downloader_id, action="add_mteam", target_hash=task_hash, actor_user_id=user.id, status="accepted"))
     db.commit()
-    return {**result, "torrent_id": torrent_id, "task_hash": task_hash, "filename": torrent_file["filename"]}
+    return {**result, "torrent_id": torrent_id, "task_hash": task_hash, "filename": torrent_file["filename"], "downloader_id": downloader_id}
 
 
 @router.post("/qb/{downloader_id}/torrents/{torrent_hash}/delete-confirm")
@@ -4382,51 +5093,13 @@ def assistant_execute(request: AssistantExecuteRequest, user: User = Depends(get
 @router.post("/assistant/chat")
 def assistant_chat(request: AssistantChatRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     adapter = get_ai_adapter_or_error(db)
-    mobile_request = WechatClawMessageRequest(message=request.message, user_id=f"web-{user.id}", conversation_id=f"web-{user.id}")
-    if MTEAM_SHOW_ALL_RESULTS_RE.search(request.message or ""):
-        intent = {"intent_type": "mteam_search", "action": "mteam_search", "show_all": True}
-        result = get_wechat_claw_mobile_search_result(db, mobile_request) or {"intent_type": "mteam_search", "state": "selection_expired", "show_all": True}
-        return {
-            "intent": intent,
-            "result": result,
-            "reply": format_mobile_agent_reply(intent, result),
-            "source": "mteam_cached_results",
-            "handled_at": utc_iso(),
-        }
-    try:
-        intent = adapter.parse_intent(request.message)
-    except AIServiceError as exc:
-        raise HTTPException(status_code=502, detail=f"DeepSeek 解析失败：{exc}") from exc
-    if intent.get("intent_type") == "general_chat":
-        result = {"intent_type": "general_chat"}
-        try:
-            reply = adapter.answer_general(request.message)
-        except AIServiceError:
-            reply = format_mobile_agent_reply(intent, result)
-    elif intent.get("intent_type") == "download_selected":
-        result = {"intent_type": "download_selected", "state": "selection_missing"}
-        reply = format_mobile_agent_reply(intent, result)
-    else:
-        result = execute_mobile_agent_intent(db, intent, mobile_request, user)
-        if intent.get("intent_type") == "mteam_search":
-            result = enrich_mteam_recommendation(adapter, result)
-            result["mobile_selection"] = save_wechat_claw_mobile_candidates(
-                db,
-                mobile_request,
-                result.get("items") or [],
-                query=str(result.get("query") or ""),
-                recommended_index=result.get("recommended_index"),
-                presentation=result.get("presentation"),
-            )
-        reply = format_mobile_agent_reply(intent, result)
-    return {
-        "intent": intent,
-        "result": result,
-        "reply": reply,
-        "source": "deepseek",
-        "handled_at": utc_iso(),
-    }
-
+    conversation_id = request.conversation_id.strip() or f"web-{user.id}"
+    mobile_request = WechatClawMessageRequest(
+        message=request.message,
+        user_id=f"web-{user.id}",
+        conversation_id=conversation_id,
+    )
+    return run_media_hub_agent(db, adapter, mobile_request, user)
 
 @router.get("/notification-preferences")
 def notification_preferences(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
@@ -4651,15 +5324,6 @@ def handle_wechat_claw_text(
         interaction = record_wechat_claw_interaction(db, request, parsed_intent, result, reply, telemetry)
         return {"reply": reply, "intent": parsed_intent, "result": result, "interaction": interaction, "source": "wechat_claw", "conversation_id": request.conversation_id, "handled_at": utc_iso()}
 
-    if MTEAM_SHOW_ALL_RESULTS_RE.search(request.message or ""):
-        parsed_intent = {"intent_type": "mteam_search", "action": "mteam_search", "show_all": True}
-        result = get_wechat_claw_mobile_search_result(db, request) or {"intent_type": "mteam_search", "state": "selection_expired", "show_all": True}
-        render_started = time.perf_counter()
-        reply = format_mobile_agent_reply(parsed_intent, result)
-        record_wechat_claw_stage(telemetry, "mteam_show_all", render_started)
-        interaction = record_wechat_claw_interaction(db, request, parsed_intent, result, reply, telemetry)
-        return {"reply": reply, "intent": parsed_intent, "result": result, "interaction": interaction, "source": "wechat_claw", "conversation_id": request.conversation_id, "handled_at": utc_iso()}
-
     adapter_started = time.perf_counter()
     try:
         ai_adapter = get_ai_adapter_or_error(db)
@@ -4667,110 +5331,26 @@ def handle_wechat_claw_text(
         record_wechat_claw_stage(telemetry, "ai_adapter", adapter_started, status="failed", error=exc.detail)
         raise
     record_wechat_claw_stage(telemetry, "ai_adapter", adapter_started)
-    pending_candidate = get_wechat_claw_pending_download(db, request)
-    selection_index = infer_mobile_selection(request.message)
-    if pending_candidate and WECHAT_CLAW_DOWNLOAD_CONFIRM_RE.search(request.message or ""):
-        parsed_intent = {"intent_type": "download_selected", "action": "download_selected", "download_confirmation": True}
-        stage_started = time.perf_counter()
-        try:
-            dispatch = download_wechat_claw_selected_torrent(db, str(pending_candidate["id"]), user, pending_candidate)
-            clear_wechat_claw_pending_download(db, request)
-            result = {"intent_type": "download_selected", "state": "accepted", "candidate": pending_candidate, **dispatch}
-        except HTTPException as exc:
-            record_wechat_claw_stage(telemetry, "download_selected", stage_started, status="failed", error=exc.detail)
-            result = {"intent_type": "download_selected", "state": "failed", "candidate": pending_candidate, "message": str(exc.detail)}
-        else:
-            record_wechat_claw_stage(telemetry, "download_selected", stage_started)
-        render_started = time.perf_counter()
-        reply = format_mobile_agent_reply(parsed_intent, result)
-        record_wechat_claw_stage(telemetry, "reply_render", render_started)
-        interaction = record_wechat_claw_interaction(db, request, parsed_intent, result, reply, telemetry)
-        return {"reply": reply, "intent": parsed_intent, "result": result, "interaction": interaction, "source": "wechat_claw", "conversation_id": request.conversation_id, "handled_at": utc_iso()}
-
-    if selection_index:
-        stage_started = time.perf_counter()
-        candidate = get_wechat_claw_mobile_candidate(db, request, 1 if selection_index == -1 else selection_index)
-        parsed_intent = {"intent_type": "download_selected", "action": "download_selected", "selection_index": selection_index, "download_confirmation": False}
-        if candidate:
-            save_wechat_claw_pending_download(db, request, candidate)
-            result = {"intent_type": "download_selected", "state": "awaiting_confirmation", "candidate": candidate}
-        else:
-            result = {"intent_type": "download_selected", "state": "selection_missing"}
-        record_wechat_claw_stage(telemetry, "download_selection", stage_started)
-        render_started = time.perf_counter()
-        reply = format_mobile_agent_reply(parsed_intent, result)
-        record_wechat_claw_stage(telemetry, "reply_render", render_started)
-        interaction = record_wechat_claw_interaction(db, request, parsed_intent, result, reply, telemetry)
-        return {"reply": reply, "intent": parsed_intent, "result": result, "interaction": interaction, "source": "wechat_claw", "conversation_id": request.conversation_id, "handled_at": utc_iso()}
-
-    intent_started = time.perf_counter()
-    try:
-        parsed_intent = ai_adapter.parse_intent(request.message)
-    except AIServiceError as exc:
-        record_wechat_claw_stage(telemetry, "ai_intent", intent_started, status="failed", error=exc)
-        raise HTTPException(status_code=502, detail=f"DeepSeek 解析失败：{exc}") from exc
-    record_wechat_claw_stage(telemetry, "ai_intent", intent_started)
-    if parsed_intent.get("intent_type") == "general_chat":
-        result = {"intent_type": "general_chat"}
-        answer_started = time.perf_counter()
-        try:
-            reply = ai_adapter.answer_general(request.message, mobile_agent_history(db, request))
-        except AIServiceError as exc:
-            record_wechat_claw_stage(telemetry, "ai_general_answer", answer_started, status="failed", error=exc)
-            raise HTTPException(status_code=502, detail=f"DeepSeek 回复失败：{exc}") from exc
-        record_wechat_claw_stage(telemetry, "ai_general_answer", answer_started)
-    elif parsed_intent.get("intent_type") == "download_selected":
-        parsed_index = int(parsed_intent.get("selection_index") or 0)
-        if not parsed_index and str(parsed_intent.get("selection_reference") or "").startswith("recommend"):
-            parsed_index = -1
-        candidate = get_wechat_claw_mobile_candidate(db, request, 1 if parsed_index == -1 else parsed_index) if parsed_index else get_wechat_claw_pending_download(db, request)
-        if candidate:
-            save_wechat_claw_pending_download(db, request, candidate)
-            result = {"intent_type": "download_selected", "state": "awaiting_confirmation", "candidate": candidate}
-        else:
-            result = {"intent_type": "download_selected", "state": "selection_missing"}
-        render_started = time.perf_counter()
-        reply = format_mobile_agent_reply(parsed_intent, result)
-        record_wechat_claw_stage(telemetry, "reply_render", render_started)
-    else:
-        tool_started = time.perf_counter()
-        tool_stage = str(parsed_intent.get("intent_type") or "tool")
-        try:
-            result = execute_mobile_agent_intent(db, parsed_intent, request, user)
-        except Exception as exc:
-            record_wechat_claw_stage(telemetry, tool_stage, tool_started, status="failed", error=getattr(exc, "detail", exc))
-            raise
-        if result.get("state") == "failed":
-            interaction_status = "failed"
-            record_wechat_claw_stage(telemetry, tool_stage, tool_started, status="failed", error=result.get("error") or result.get("message"))
-        else:
-            record_wechat_claw_stage(telemetry, tool_stage, tool_started)
-        if parsed_intent.get("intent_type") == "mteam_search":
-            recommendation_started = time.perf_counter()
-            result = enrich_mteam_recommendation(ai_adapter, result)
-            result["mobile_selection"] = save_wechat_claw_mobile_candidates(
-                db,
-                request,
-                result.get("items") or [],
-                query=str(result.get("query") or ""),
-                recommended_index=result.get("recommended_index"),
-                presentation=result.get("presentation"),
-            )
-            record_wechat_claw_stage(telemetry, "ai_recommendation", recommendation_started)
-        render_started = time.perf_counter()
-        reply = format_mobile_agent_reply(parsed_intent, result)
-        record_wechat_claw_stage(telemetry, "reply_render", render_started)
-    interaction = record_wechat_claw_interaction(db, request, parsed_intent, result, reply, telemetry, status=interaction_status)
+    agent_result = run_media_hub_agent(db, ai_adapter, request, user, telemetry)
+    observations = agent_result.get("result", {}).get("observations", [])
+    interaction_status = "failed" if any(
+        isinstance(item, dict) and isinstance(item.get("result"), dict) and item["result"].get("state") == "failed"
+        for item in observations
+    ) else "completed"
+    interaction = record_wechat_claw_interaction(
+        db,
+        request,
+        agent_result["intent"],
+        agent_result["result"],
+        agent_result["reply"],
+        telemetry,
+        status=interaction_status,
+    )
     return {
-        "reply": reply,
-        "intent": parsed_intent,
-        "result": result,
+        **agent_result,
         "interaction": interaction,
-        "source": "wechat_claw",
         "conversation_id": request.conversation_id,
-        "handled_at": utc_iso(),
     }
-
 
 def poll_wechat_claw_messages(db: Session, user_id: int | None = None) -> dict[str, Any]:
     # iLink advances one shared get_updates_buf cursor. Never allow the admin
@@ -4937,6 +5517,214 @@ def wechat_claw_capabilities(
         "notification_preferences": preferences,
     }
 
+
+def live_diagnostic_error(error: Any) -> str:
+    message = str(redact_payload(str(error))).strip()
+    return (message or "实时检测未通过，请检查配置或网络。")[:300]
+
+
+def live_diagnostic_result(
+    db: Session,
+    module: str,
+    *,
+    enabled: bool,
+    configured: bool,
+    status: str,
+    checked_at: str,
+    duration_ms: int,
+    message: str,
+    error: str = "",
+) -> dict[str, Any]:
+    collection = get_module_health(db, module)
+    return {
+        "module": module,
+        "enabled": enabled,
+        "configured": configured,
+        "status": status,
+        "live": True,
+        "checked_at": checked_at,
+        "last_success_at": checked_at if status == "success" else collection.get("last_success_at"),
+        "duration_ms": duration_ms,
+        "message": message,
+        "last_error": error if status == "failed" else "",
+        "consecutive_failed_hours": int(collection.get("consecutive_failed_hours") or 0),
+    }
+
+
+def probe_live_integration(module: str, config: dict[str, Any]) -> tuple[bool, str]:
+    if module == "mteam":
+        detail = MTeamAdapter(config).test_connection()
+        message = "已实时读取 M-Team 用户资料。"
+    elif module in {"qb1", "qb2", "qb3"}:
+        detail = QbittorrentWebAdapter(config).test_connection()
+        version = str(detail.get("version") or "未知版本") if isinstance(detail, dict) else "未知版本"
+        message = f"已实时连接 qB WebUI，当前版本 {version}。"
+    elif module == "tmdb":
+        detail = TmdbAdapter(config).test_connection()
+        message = "已实时访问 TMDB 数据接口与图片资源。"
+    elif module == "ai":
+        detail = DeepSeekChatAdapter(config).test_connection()
+        model = str(detail.get("model") or config.get("model") or "当前模型") if isinstance(detail, dict) else "当前模型"
+        message = f"已实时调用 AI 服务（{model}）。"
+    else:
+        raise ValueError(f"Unsupported live diagnostic module: {module}")
+
+    detail = detail if isinstance(detail, dict) else {}
+    success = detail.get("success") is not False and detail.get("ok") is not False
+    if not success:
+        return False, str(detail.get("message") or "实时检测未通过，请检查配置或网络。")
+    return True, message
+
+
+def probe_live_wechat_claw(db: Session, config: dict[str, Any]) -> tuple[bool, str, list[dict[str, Any]]]:
+    bindings = ensure_wechat_claw_bindings(db)
+    members: list[dict[str, Any]] = []
+    mode = str(config.get("mode") or "ilink").strip().lower()
+    checked_at = utc_iso()
+
+    if mode != "ilink":
+        detail = WechatClawAdapter(config).test_connection()
+        success = detail.get("success") is not False if isinstance(detail, dict) else True
+        members = [wechat_claw_binding_status(db, binding) for binding in bindings]
+        return success, "已实时验证 WeChat claw 直连配置。" if success else "WeChat claw 直连检测未通过。", members
+
+    active_count = 0
+    connected_count = 0
+    for binding in bindings:
+        member = wechat_claw_binding_status(db, binding)
+        state = get_wechat_claw_ilink_state(db, binding.id)
+        saved_connection = bool(state.get("bot_token"))
+        member.update({"saved_connection": saved_connection, "live_checked_at": checked_at})
+        if not binding.enabled:
+            member.update({"live_connection_ok": None, "live_message": "成员已停用，本次未发起连接检测。"})
+        elif not saved_connection:
+            active_count += 1
+            member.update({"connected": False, "operational": False, "live_connection_ok": False, "live_message": "尚未完成微信扫码绑定。"})
+        else:
+            active_count += 1
+            try:
+                detail = WechatClawAdapter(wechat_claw_config_with_state(config, state)).test_connection()
+                live_ok = bool(
+                    isinstance(detail, dict)
+                    and detail.get("success") is not False
+                    and detail.get("connected") is not False
+                )
+                member.update(
+                    {
+                        "connected": live_ok,
+                        "operational": bool(member.get("module_enabled")) and live_ok,
+                        "live_connection_ok": live_ok,
+                        "live_message": str(detail.get("message") or ("微信连接正常。" if live_ok else "微信登录状态暂不可用。")),
+                    }
+                )
+                if live_ok:
+                    connected_count += 1
+            except Exception as exc:
+                member.update(
+                    {
+                        "connected": False,
+                        "operational": False,
+                        "live_connection_ok": False,
+                        "live_message": live_diagnostic_error(exc),
+                    }
+                )
+        members.append(member)
+
+    success = active_count > 0 and connected_count > 0
+    if success:
+        message = f"已实时验证微信连接，{connected_count} 位成员当前可用。"
+    elif active_count == 0:
+        message = "没有已启用的 WeChat claw 成员。"
+    else:
+        message = "当前没有可用的微信连接，请检查扫码或登录状态。"
+    return success, message, members
+
+
+def run_live_diagnostic_module(db: Session, module: str) -> dict[str, Any]:
+    if module not in LIVE_DIAGNOSTIC_MODULES:
+        raise HTTPException(status_code=404, detail="Unknown diagnostic module")
+
+    started_at = time.perf_counter()
+    checked_at = utc_iso()
+    member_statuses: list[dict[str, Any]] = []
+
+    if module == "nas_disk":
+        try:
+            storage = storage_status_from_setup_check(db, refresh=True)
+            success = bool(storage.get("nas_storage_readable"))
+            errors = storage.get("nas_storage_errors") if isinstance(storage.get("nas_storage_errors"), list) else []
+            message = "已实时确认 NAS 存储路径可以访问。" if success else str(errors[0] if errors else "请在 YAML 中填写并挂载可访问的 NAS 文件夹路径。")
+            error = "" if success else live_diagnostic_error(message)
+        except Exception as exc:
+            success = False
+            message = live_diagnostic_error(exc)
+            error = message
+        module_result = live_diagnostic_result(
+            db,
+            module,
+            enabled=True,
+            configured=True,
+            status="success" if success else "failed",
+            checked_at=checked_at,
+            duration_ms=max(0, round((time.perf_counter() - started_at) * 1000)),
+            message=message,
+            error=error,
+        )
+        return {"module": module_result}
+
+    row = get_config(db, module)
+    configured = bool(row and row.encrypted_payload)
+    if module == "wechat_claw":
+        bindings = ensure_wechat_claw_bindings(db)
+        member_statuses = [wechat_claw_binding_status(db, binding) for binding in bindings]
+    if not row or not row.enabled:
+        module_result = live_diagnostic_result(
+            db,
+            module,
+            enabled=False,
+            configured=configured,
+            status="disabled",
+            checked_at=checked_at,
+            duration_ms=max(0, round((time.perf_counter() - started_at) * 1000)),
+            message="当前模块未启用，本次未发起外部请求。",
+        )
+        payload: dict[str, Any] = {"module": module_result}
+        if module == "wechat_claw":
+            payload["wechat_members"] = member_statuses
+        return payload
+
+    config = get_decrypted_config(db, module) or {}
+    try:
+        if module == "wechat_claw":
+            success, message, member_statuses = probe_live_wechat_claw(db, config)
+        else:
+            success, message = probe_live_integration(module, config)
+        error = "" if success else live_diagnostic_error(message)
+    except Exception as exc:
+        success = False
+        message = live_diagnostic_error(exc)
+        error = message
+
+    module_result = live_diagnostic_result(
+        db,
+        module,
+        enabled=True,
+        configured=configured,
+        status="success" if success else "failed",
+        checked_at=checked_at,
+        duration_ms=max(0, round((time.perf_counter() - started_at) * 1000)),
+        message=message,
+        error=error,
+    )
+    payload = {"module": module_result}
+    if module == "wechat_claw":
+        payload["wechat_members"] = member_statuses
+    return payload
+
+
+@router.post("/diagnostics/modules/{module}/check")
+def check_diagnostic_module(module: str, _: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    return run_live_diagnostic_module(db, module)
 
 @router.get("/diagnostics/health")
 def diagnostics_health(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:

@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     debug_trace_retention_days: int = 7
     snapshot_interval_minutes: int = 10
+    mteam_snapshot_retention_days: int = 90
     static_dir: str = "static"
     app_timezone: str = Field(default_factory=lambda: (os.getenv("APP_TIMEZONE") or os.getenv("TZ") or "").strip())
     tmdb_mode: str = "direct"

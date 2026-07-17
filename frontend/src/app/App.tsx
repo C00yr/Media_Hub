@@ -223,7 +223,6 @@ type WechatClawForm = {
   inbound_token: string;
   webhook_url: string;
   webhook_secret: string;
-  default_downloader_id: "all" | "qb1" | "qb2" | "qb3";
   timeout: string;
 };
 
@@ -249,6 +248,14 @@ function wechatClawStageLabel(stage?: string): string {
     ai_recommendation: "AI 推荐说明",
     ai_intent: "AI 意图识别",
     ai_general_answer: "AI 生成回复",
+    agent_decision: "Agent 自主决策",
+    tmdb_media_details: "TMDB 影片详情",
+    tmdb_person_details: "TMDB 人物详情",
+    mteam_result_details: "M-Team 资源详情",
+    qb_list_torrents: "qB 任务查询",
+    qb_torrent_details: "qB 任务详情",
+    prepare_mteam_download: "准备下载确认",
+    confirm_mteam_download: "确认提交下载",
     tmdb_lookup: "TMDB 查询",
     mteam_search: "M-Team 搜索",
     dashboard_query: "仪表盘查询",
@@ -363,6 +370,8 @@ const SEARCH_HISTORY_STORAGE_KEY = "ptmh_search_history";
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "ptmh_sidebar_collapsed";
 const LOCAL_SNAPSHOT_PREFIX = "ptmh_snapshot:v3:";
 const LOCAL_SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024;
+const LOCAL_SNAPSHOT_TOTAL_MAX_BYTES = 4 * 1024 * 1024;
+const LOCAL_SNAPSHOT_MAX_ENTRIES = 20;
 const REVALIDATE_DELAY_MS = 3000;
 const TMDB_DIRECT_IMAGE_RE = /https:\/\/image\.tmdb\.org\/t\/p\/(w\d+|original)\/([A-Za-z0-9_./-]+\.(?:jpg|jpeg|png|webp))/gi;
 const IMAGE_FALLBACK_SRC = `data:image/svg+xml;utf8,${encodeURIComponent(
@@ -389,6 +398,58 @@ function handleImageError(event: SyntheticEvent<HTMLImageElement>) {
   image.src = IMAGE_FALLBACK_SRC;
 }
 
+
+function snapshotBytes(value: string) {
+  return new Blob([value]).size;
+}
+
+function snapshotContentHash(value: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function localSnapshotVersion(key: string, payload: any, serializedPayload: string) {
+  if (key === "dashboard") {
+    const dashboardVersion = payload?._preload?.cached_at ?? payload?.updated_at;
+    if (dashboardVersion) return String(dashboardVersion);
+  }
+  return `content:${snapshotContentHash(serializedPayload)}`;
+}
+
+function pruneLocalSnapshots(incomingKey: string, incomingBytes: number) {
+  const entries: Array<{ key: string; bytes: number; savedAt: number }> = [];
+  let totalBytes = 0;
+  for (let index = 0; index < localStorage.length; index += 1) {
+    const key = localStorage.key(index);
+    if (!key?.startsWith(LOCAL_SNAPSHOT_PREFIX) || key === incomingKey) continue;
+    const raw = localStorage.getItem(key);
+    if (!raw) continue;
+    const bytes = snapshotBytes(raw);
+    let savedAt = 0;
+    try {
+      savedAt = Date.parse(JSON.parse(raw)?.saved_at ?? "") || 0;
+    } catch {
+      // Invalid cache entries are the first candidates for eviction.
+    }
+    entries.push({ key, bytes, savedAt });
+    totalBytes += bytes;
+  }
+  entries.sort((left, right) => left.savedAt - right.savedAt);
+  while (
+    entries.length > 0 &&
+    (totalBytes + incomingBytes > LOCAL_SNAPSHOT_TOTAL_MAX_BYTES || entries.length + 1 > LOCAL_SNAPSHOT_MAX_ENTRIES)
+  ) {
+    const oldest = entries.shift();
+    if (!oldest) break;
+    localStorage.removeItem(oldest.key);
+    totalBytes -= oldest.bytes;
+  }
+}
+
 function readLocalSnapshot<T>(key: string): T | null {
   try {
     const raw = localStorage.getItem(`${LOCAL_SNAPSHOT_PREFIX}${key}`);
@@ -402,9 +463,23 @@ function readLocalSnapshot<T>(key: string): T | null {
 
 function writeLocalSnapshot(key: string, payload: unknown) {
   try {
-    const value = JSON.stringify({ saved_at: new Date().toISOString(), payload: rewriteTmdbImageUrls(payload) });
-    if (new Blob([value]).size > LOCAL_SNAPSHOT_MAX_BYTES) return;
-    localStorage.setItem(`${LOCAL_SNAPSHOT_PREFIX}${key}`, value);
+    const storageKey = `${LOCAL_SNAPSHOT_PREFIX}${key}`;
+    const normalizedPayload = rewriteTmdbImageUrls(payload);
+    const serializedPayload = JSON.stringify(normalizedPayload);
+    const version = localSnapshotVersion(key, normalizedPayload, serializedPayload);
+    const existing = localStorage.getItem(storageKey);
+    if (existing) {
+      try {
+        if (JSON.parse(existing)?.version === version) return;
+      } catch {
+        localStorage.removeItem(storageKey);
+      }
+    }
+    const value = JSON.stringify({ saved_at: new Date().toISOString(), version, payload: normalizedPayload });
+    const bytes = snapshotBytes(value);
+    if (bytes > LOCAL_SNAPSHOT_MAX_BYTES) return;
+    pruneLocalSnapshots(storageKey, bytes);
+    localStorage.setItem(storageKey, value);
   } catch {
     // Local cache is opportunistic; quota or privacy errors should not affect the app.
   }
@@ -1070,7 +1145,6 @@ function MTeamSnapshotPanel({
         <div className="traffic-chart-header">
           <h3>历史流量</h3>
           <div className="traffic-dimension-tools" aria-label="统计维度">
-            <span>维度</span>
             <div className="segmented compact">
               {[
                 ["hour", "小时"],
@@ -2024,11 +2098,19 @@ function DownloadsPage({ selectedDownloader = "qb1" }: { selectedDownloader?: st
   }, [selectedDownloader]);
 
   useEffect(() => {
-    refreshDownloadOverview(downloader);
-    const timer = window.setInterval(() => {
-      refreshDownloadOverview(downloader);
-    }, 5000);
-    return () => window.clearInterval(timer);
+    const poll = () => {
+      if (!document.hidden) refreshDownloadOverview(downloader);
+    };
+    poll();
+    const timer = window.setInterval(poll, 5000);
+    const onVisibilityChange = () => {
+      if (!document.hidden) poll();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
   }, [downloader]);
 
   function refreshDownloadOverview(target = downloader, refresh = true) {
@@ -2342,18 +2424,39 @@ function AdminGrant({ onDone }: { onDone: () => void }) {
 }
 
 function NotificationsAssistantPage({ onNavigate }: { onNavigate?: (key: NavKey) => void }) {
-  const [message, setMessage] = useState("帮我查一下 qB 下载器状态");
+  const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [result, setResult] = useState<any | null>(null);
+  const [conversationId, setConversationId] = useState(() => {
+    const saved = window.sessionStorage.getItem("ptmh.assistant.conversation");
+    if (saved) return saved;
+    const created = "web-" + Date.now() + "-" + Math.random().toString(36).slice(2, 9);
+    window.sessionStorage.setItem("ptmh.assistant.conversation", created);
+    return created;
+  });
+  const [turns, setTurns] = useState<Array<{ role: "user" | "assistant"; content: string; tools?: string[] }>>([]);
 
   async function submit(event?: FormEvent) {
     event?.preventDefault();
+    const prompt = message.trim();
+    if (!prompt || busy) return;
     setBusy(true);
     setError("");
+    setTurns((current) => [...current, { role: "user", content: prompt }]);
+    setMessage("");
     try {
-      const response = await api<any>("/api/assistant/chat", { method: "POST", body: JSON.stringify({ message }) });
-      setResult(response);
+      const response = await api<any>("/api/assistant/chat", {
+        method: "POST",
+        body: JSON.stringify({ message: prompt, conversation_id: conversationId }),
+      });
+      setTurns((current) => [
+        ...current,
+        {
+          role: "assistant",
+          content: String(response.reply || "这次没有收到有效回复，请稍后再试。"),
+          tools: Array.isArray(response.intent?.tools_used) ? response.intent.tools_used : [],
+        },
+      ]);
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -2361,30 +2464,49 @@ function NotificationsAssistantPage({ onNavigate }: { onNavigate?: (key: NavKey)
     }
   }
 
+  function startNewConversation() {
+    const created = "web-" + Date.now() + "-" + Math.random().toString(36).slice(2, 9);
+    window.sessionStorage.setItem("ptmh.assistant.conversation", created);
+    setConversationId(created);
+    setTurns([]);
+    setMessage("");
+    setError("");
+  }
+
   return (
     <div className="grid-page notifications-page">
       <MemberManagementCard onNavigate={onNavigate} />
-      <Panel title="AI 对话测试">
+      <Panel title="影视中枢 Agent">
         <form className="assistant-box" onSubmit={submit}>
           <div className="notice info">
-            <strong>验证 AI 回复</strong>
-            <span>在网页端发送一条测试消息，确认 AI 模块能够正常理解请求并返回结果。</span>
+            <strong>直接告诉我你想做什么</strong>
+            <span>可以查询影片和资源、查看 M-Team、qB、NAS 与仪表盘状态，也可以接着追问“第四个结果的完整简介”这类上下文问题。</span>
           </div>
-          <label>测试消息
-            <textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder="例如：帮我查一下 qB 下载器状态；查询沙丘的影视信息" />
+          <div className="assistant-conversation" aria-live="polite">
+            {turns.length === 0 && <div className="assistant-empty">还没有消息。试试“帮我找几部高分科幻片”，或者直接聊聊你的观影计划。</div>}
+            {turns.map((turn, index) => (
+              <div className={"assistant-message " + turn.role} key={turn.role + "-" + index}>
+                <strong>{turn.role === "user" ? "你" : "影视中枢"}</strong>
+                <AssistantReply reply={turn.content} />
+                {turn.role === "assistant" && Boolean(turn.tools?.length) && (
+                  <small>本轮调用：{turn.tools!.map((tool) => wechatClawStageLabel(tool)).join(" · ")}</small>
+                )}
+              </div>
+            ))}
+            {busy && <div className="assistant-message assistant pending"><strong>影视中枢</strong><span>正在理解并调用需要的功能…</span></div>}
+          </div>
+          <label>消息
+            <textarea
+              value={message}
+              onChange={(event) => setMessage(event.target.value)}
+              placeholder="例如：查一下沙丘的影视信息；再看看第四个结果的完整简介"
+            />
           </label>
           <div className="actions">
-            <button className="primary" disabled={busy}><MessageSquare size={16} />{busy ? "正在获取回复..." : "发送测试"}</button>
+            <button className="primary" disabled={busy || !message.trim()}><MessageSquare size={16} />{busy ? "处理中..." : "发送"}</button>
+            <button type="button" onClick={startNewConversation} disabled={busy}>新对话</button>
           </div>
           {error && <p className="error">{error}</p>}
-          {result && (
-            <div className="assistant-result">
-              <div className="result-card success">
-                <strong>AI 回复</strong>
-                <AssistantReply reply={result.reply} />
-              </div>
-            </div>
-          )}
         </form>
       </Panel>
     </div>
@@ -2933,7 +3055,7 @@ function SettingsPage({ user }: { user: User }) {
         <p className="muted">按顺序完成连接测试；绿点表示配置已验证，红点表示尚未配置或测试未通过。点击任一步即可切换到对应配置。</p>
       </Panel>
       <div className="settings-active-card" id="settings-active-card" key={activeStep}>
-        {activeStep === "storage" ? <StorageSettingsCard status={storage.data} loading={storage.loading} error={storage.error} /> : activeStep === "downloaders" ? <DownloadersSettingsCard providers={[providerById.qb1, providerById.qb2, providerById.qb3]} onChanged={reload} /> : activeStep === "media_search" ? <MediaSearchSettingsCard provider={providerById.tmdb} onChanged={reload} /> : activeProvider ? <IntegrationEditor provider={activeProvider} onChanged={reload} /> : <Panel title="配置"><p className="muted">该配置项不可用。</p></Panel>}
+        {activeStep === "storage" ? <StorageSettingsCard status={storage.data} loading={storage.loading} error={storage.error} /> : activeStep === "downloaders" ? <DownloadersSettingsCard providers={[providerById.qb1, providerById.qb2, providerById.qb3]} defaultDownloader={data.default_downloader} onChanged={reload} /> : activeStep === "media_search" ? <MediaSearchSettingsCard provider={providerById.tmdb} onChanged={reload} /> : activeProvider ? <IntegrationEditor provider={activeProvider} onChanged={reload} /> : <Panel title="配置"><p className="muted">该配置项不可用。</p></Panel>}
       </div>
     </div>
   );
@@ -2944,10 +3066,43 @@ function providerStepReady(provider: any): boolean {
   return Boolean(!provider?.configuration_unreadable && provider?.enabled && result?.success === true && result?.can_enable !== false);
 }
 
-function DownloadersSettingsCard({ providers, onChanged }: { providers: any[]; onChanged: () => void }) {
+function DownloadersSettingsCard({ providers, defaultDownloader, onChanged }: { providers: any[]; defaultDownloader?: any; onChanged: () => void }) {
+  const [settingDefault, setSettingDefault] = useState("");
+  const [error, setError] = useState("");
+  const defaultDownloaderId = String(defaultDownloader?.downloader_id ?? "");
+
+  async function setDefaultDownloader(downloaderId: string) {
+    setSettingDefault(downloaderId);
+    setError("");
+    try {
+      await api("/api/admin/downloaders/default", { method: "PUT", body: JSON.stringify({ downloader_id: downloaderId }) });
+      onChanged();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSettingDefault("");
+    }
+  }
+
   return (
-    <div className="downloaders-settings-grid">
-      {providers.filter(Boolean).map((provider) => <IntegrationEditor key={provider.provider} provider={provider} onChanged={onChanged} />)}
+    <div className="downloaders-settings-section">
+      <div className="notice info default-downloader-notice">
+        <strong>默认下载器</strong>
+        <span>M-Team、Media Hub AI 和 WeChat Claw 发起的下载都会发送到这里。请在已测试并启用的下载器中选择。</span>
+      </div>
+      {error && <p className="error">{error}</p>}
+      <div className="downloaders-settings-grid">
+        {providers.filter(Boolean).map((provider) => (
+          <QbIntegrationEditor
+            key={provider.provider}
+            provider={provider}
+            onChanged={onChanged}
+            isDefault={provider.provider === defaultDownloaderId}
+            defaultBusy={settingDefault !== ""}
+            onSetDefault={() => setDefaultDownloader(provider.provider)}
+          />
+        ))}
+      </div>
     </div>
   );
 }
@@ -3212,7 +3367,6 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
     inbound_token: String(saved.inbound_token ?? ""),
     webhook_url: String(saved.webhook_url ?? ""),
     webhook_secret: String(saved.webhook_secret ?? ""),
-    default_downloader_id: ["qb1", "qb2", "qb3", "all"].includes(saved.default_downloader_id) ? saved.default_downloader_id : "all",
     timeout: String(saved.timeout ?? "10"),
   });
   const bindings = useLoad<any>(() => api("/api/admin/wechat-claw/bindings"), [provider.config_version], null, false);
@@ -3246,7 +3400,6 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
       inbound_token: String(current.inbound_token ?? ""),
       webhook_url: String(current.webhook_url ?? ""),
       webhook_secret: String(current.webhook_secret ?? ""),
-      default_downloader_id: ["qb1", "qb2", "qb3", "all"].includes(current.default_downloader_id) ? current.default_downloader_id : "all",
       timeout: String(current.timeout ?? "10"),
     });
     setLocalResult(provider.last_test_result);
@@ -3269,7 +3422,6 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
     return {
       mode: "ilink",
       poll_timeout: Math.max(5, Number(form.poll_timeout) || 25),
-      default_downloader_id: form.default_downloader_id,
     };
   }
 
@@ -3414,14 +3566,6 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
         {!selectedBindingId && <p className="muted">先添加一个微信成员，再生成二维码完成绑定。</p>}
 
         <div className="settings-grid">
-          <label>默认下载器
-            <select value={form.default_downloader_id} onChange={(event) => updateField("default_downloader_id", event.target.value as WechatClawForm["default_downloader_id"])}>
-              <option value="all">自动选择</option>
-              <option value="qb1">qB1</option>
-              <option value="qb2">qB2</option>
-              <option value="qb3">qB3</option>
-            </select>
-          </label>
           <label className="compact-field">轮询超时（秒）
             <input type="number" min="5" max="120" value={form.poll_timeout} onChange={(event) => updateField("poll_timeout", event.target.value)} />
           </label>
@@ -3483,7 +3627,6 @@ function LegacyWechatClawIntegrationEditor({ provider, onChanged }: { provider: 
     inbound_token: String(saved.inbound_token ?? ""),
     webhook_url: String(saved.webhook_url ?? ""),
     webhook_secret: String(saved.webhook_secret ?? ""),
-    default_downloader_id: ["qb1", "qb2", "qb3", "all"].includes(saved.default_downloader_id) ? saved.default_downloader_id : "all",
     timeout: String(saved.timeout ?? "10"),
   });
   const [busy, setBusy] = useState("");
@@ -3502,7 +3645,6 @@ function LegacyWechatClawIntegrationEditor({ provider, onChanged }: { provider: 
       inbound_token: form.inbound_token.trim(),
       webhook_url: form.webhook_url.trim(),
       webhook_secret: form.webhook_secret.trim(),
-      default_downloader_id: form.default_downloader_id,
       timeout: Number(form.timeout) || 10,
     };
   }
@@ -3580,14 +3722,6 @@ function LegacyWechatClawIntegrationEditor({ provider, onChanged }: { provider: 
           <label>Webhook secret（可选）
             <SecretInput value={form.webhook_secret} onChange={(value) => updateField("webhook_secret", value)} placeholder="作为 X-Wechat-Claw-Secret 发送" autoComplete="off" />
           </label>
-          <label>默认下载器
-            <select value={form.default_downloader_id} onChange={(event) => updateField("default_downloader_id", event.target.value as WechatClawForm["default_downloader_id"])}>
-              <option value="all">自动 / 全部</option>
-              <option value="qb1">qB1</option>
-              <option value="qb2">qB2</option>
-              <option value="qb3">qB3</option>
-            </select>
-          </label>
           <label>超时秒数
             <CopyableInput value={form.timeout} onChange={(value) => updateField("timeout", value)} inputMode="numeric" placeholder="10" />
           </label>
@@ -3611,7 +3745,7 @@ function LegacyWechatClawIntegrationEditor({ provider, onChanged }: { provider: 
   );
 }
 
-function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
+function QbIntegrationEditor({ provider, onChanged, isDefault, defaultBusy, onSetDefault }: { provider: any; onChanged: () => void; isDefault?: boolean; defaultBusy?: boolean; onSetDefault?: () => void }) {
   const label = downloaderShortLabel(provider.provider);
   const saved = provider.saved_payload ?? {};
   const [form, setForm] = useState<QbForm>({
@@ -3692,9 +3826,18 @@ function QbIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
   return (
     <Panel title={`${label} 配置`}>
       <div className="integration tmdb-editor">
+        <div className="downloader-default-control">
+          {isDefault ? (
+            <span className={providerStepReady(provider) ? "default-downloader-badge" : "default-downloader-badge unavailable"}><Star size={15} fill="currentColor" /> 默认下载器{providerStepReady(provider) ? "" : "（当前不可用）"}</span>
+          ) : (
+            <button className="inline-tool set-default-downloader" type="button" onClick={onSetDefault} disabled={defaultBusy || !providerStepReady(provider)} title={providerStepReady(provider) ? `将 ${label} 设为默认下载器` : "请先保存、测试并启用此下载器"}>
+              <Star size={15} /> 设为默认下载器
+            </button>
+          )}
+        </div>
         <div className="notice info">
           <strong>连接下载器</strong>
-          <span>连接后可查看下载任务与状态，并作为默认下载器使用。</span>
+          <span>连接成功并启用后，可查看下载任务和运行状态，也可手动设为 M-Team、AI 与 WeChat Claw 的默认下载目标。</span>
         </div>
         <div className="settings-grid">
           <label>qB WebUI 地址（必填）
@@ -4315,61 +4458,136 @@ function diagnosticModuleName(module: string): string {
   return names[module] ?? module;
 }
 
+const DIAGNOSTIC_MODULE_IDS = ["mteam", "qb1", "qb2", "qb3", "tmdb", "ai", "wechat_claw", "nas_disk"] as const;
+
+function checkingDiagnosticModules(): any[] {
+  return DIAGNOSTIC_MODULE_IDS.map((module) => ({ module, status: "checking", checking: true }));
+}
+
 function diagnosticStatusMeta(item: any): { label: string; detail: string; tone: "success" | "failed" | "neutral" } {
+  if (item.checking) {
+    return { label: "检测中", detail: "正在连接并读取当前实际状态…", tone: "neutral" };
+  }
   if (!item.enabled) {
-    return { label: "未启用", detail: "当前模块尚未启用", tone: "neutral" };
+    return { label: "未启用", detail: item.message || "当前模块尚未启用", tone: "neutral" };
   }
   if (item.status === "success") {
-    return { label: "运行正常", detail: "最近一次检测通过", tone: "success" };
+    return { label: "运行正常", detail: item.message || "本次实时检测通过", tone: "success" };
   }
   if (["failed", "failure", "error", "unhealthy"].includes(String(item.status || "").toLowerCase())) {
-    return { label: "需要处理", detail: item.last_error || "检测未通过，请检查配置或网络", tone: "failed" };
+    return { label: "需要处理", detail: item.last_error || item.message || "检测未通过，请检查配置或网络", tone: "failed" };
   }
-  return { label: "待检测", detail: "保存并测试后会更新状态", tone: "neutral" };
+  return { label: "待检测", detail: "尚未取得本次实时检测结果", tone: "neutral" };
 }
 
 function DiagnosticsPage() {
-  const health = useLoad<any>(() => api("/api/diagnostics/health"), []);
-  const modules = health.data?.modules ?? [];
-  const members = health.data?.wechat_members ?? [];
+  const [modules, setModules] = useState<any[]>(checkingDiagnosticModules);
+  const [members, setMembers] = useState<any[]>([]);
+  const [membersChecking, setMembersChecking] = useState(true);
+  const mountedRef = useRef(false);
+  const autoStartedRef = useRef(false);
+  const runRef = useRef(0);
+  const checking = modules.some((item) => item.checking);
+  const completedCount = modules.filter((item) => !item.checking).length;
+
+  function runDiagnostics() {
+    const runId = ++runRef.current;
+    setModules(checkingDiagnosticModules());
+    setMembersChecking(true);
+
+    DIAGNOSTIC_MODULE_IDS.forEach((module) => {
+      api<any>(`/api/diagnostics/modules/${module}/check`, { method: "POST" })
+        .then((payload) => {
+          if (!mountedRef.current || runRef.current !== runId) return;
+          const result = payload?.module;
+          if (!result || result.module !== module) throw new Error("诊断接口返回了无效结果");
+          setModules((current) => current.map((item) => item.module === module ? { ...result, checking: false } : item));
+          if (module === "wechat_claw" && Array.isArray(payload.wechat_members)) {
+            setMembers(payload.wechat_members);
+          }
+        })
+        .catch((error) => {
+          if (!mountedRef.current || runRef.current !== runId) return;
+          setModules((current) => current.map((item) => item.module === module ? {
+            module,
+            enabled: true,
+            status: "failed",
+            checking: false,
+            checked_at: new Date().toISOString(),
+            last_error: (error as any)?.status === 404 ? "诊断服务尚未加载，请重启应用服务后重新检测。" : apiErrorDetail(error),
+            message: "未能完成该模块的实时检测。",
+          } : item));
+        })
+        .finally(() => {
+          if (!mountedRef.current || runRef.current !== runId) return;
+          if (module === "wechat_claw") setMembersChecking(false);
+        });
+    });
+  }
+
+  useEffect(() => {
+    mountedRef.current = true;
+    if (!autoStartedRef.current) {
+      autoStartedRef.current = true;
+      runDiagnostics();
+    }
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   return (
     <div className="grid-page">
       <Panel title="健康概览">
-        <div className="diagnostics-health-list">
+        <div className="diagnostics-toolbar">
+          <div className="diagnostics-toolbar-copy">
+            <strong>{checking ? `正在实时检测（${completedCount}/${DIAGNOSTIC_MODULE_IDS.length}）` : "本轮实时检测已完成"}</strong>
+            <small>{checking ? "系统正在核验各项服务的当前状态，检测结果会陆续更新。" : "检测结果已更新。如调整了服务配置，可重新检测。"}</small>
+          </div>
+          <button className={`diagnostics-refresh${checking ? " spinning" : ""}`} type="button" onClick={runDiagnostics} disabled={checking}>
+            <RefreshCw size={15} aria-hidden="true" />
+            {checking ? "检测中" : "重新检测全部"}
+          </button>
+        </div>
+        <div className="diagnostics-health-list" aria-live="polite">
           {modules.map((item: any) => {
             const meta = diagnosticStatusMeta(item);
             return (
-              <article className={`diagnostic-card ${meta.tone}`} key={item.module}>
+              <article className={`diagnostic-card ${meta.tone}${item.checking ? " checking" : ""}`} key={item.module} aria-busy={item.checking || undefined}>
                 <div>
                   <strong>{diagnosticModuleName(item.module)}</strong>
                   <span className="diagnostic-status-pill">{meta.label}</span>
                 </div>
                 <small>{meta.detail}</small>
-                {item.last_success_at && <small>最近检测：{formatDateLabel(item.last_success_at)}</small>}
+                {!item.checking && item.checked_at && (
+                  <small>本次检测：{formatSystemDateTime(item.checked_at)}{typeof item.duration_ms === "number" ? ` · ${item.duration_ms} ms` : ""}</small>
+                )}
               </article>
             );
           })}
-          {!modules.length && <p className="muted">暂无健康检测数据。</p>}
         </div>
       </Panel>
       <Panel title="WeChat claw 成员状态">
-        <div className="diagnostics-member-list">
+        {membersChecking && <div className="diagnostics-inline-loading" role="status"><RefreshCw size={15} aria-hidden="true" /><span>正在实时检测微信成员连接状态…</span></div>}
+        <div className="diagnostics-member-list" aria-live="polite">
           {members.map((member: any) => {
             const connected = Boolean(member.connected);
             const moduleEnabled = member.module_enabled !== false;
             const memberEnabled = member.enabled !== false;
             const operational = Boolean(member.operational ?? (moduleEnabled && memberEnabled && connected));
-            const tone = operational ? "success" : "neutral";
+            const liveFailed = member.live_connection_ok === false && Boolean(member.saved_connection);
+            const tone = liveFailed ? "failed" : operational ? "success" : "neutral";
             const statusLabel = !moduleEnabled
               ? "未启用"
               : !memberEnabled
                 ? "成员已停用"
-                : connected
-                  ? "已连接"
-                  : member.configured
-                    ? "等待扫码"
-                    : "未配置";
+                : liveFailed
+                  ? "连接异常"
+                  : connected
+                    ? "已连接"
+                    : member.configured
+                      ? "等待扫码"
+                      : "未配置";
             const lastPoll = member.last_poll ?? {};
             return (
               <article className={`diagnostic-card diagnostic-member-card ${tone}`} key={member.id}>
@@ -4377,18 +4595,18 @@ function DiagnosticsPage() {
                   <span className="diagnostic-member-title"><MemberAvatar member={member} size="small" /><strong>{member.display_name}</strong></span>
                   <span className="diagnostic-status-pill">{statusLabel}</span>
                 </div>
-                <small>微信：{member.account_id || member.qrcode_status || "尚未绑定"}{connected && !operational ? " · 登录状态已保留" : ""}</small>
+                <small>微信：{member.account_id || member.qrcode_status || "尚未绑定"}{member.saved_connection && !connected ? " · 登录信息已保存" : ""}</small>
+                {member.live_message && <small>实时检测：{member.live_message}</small>}
                 <small>最近同步：{lastPoll.updated_at ? formatSystemDateTime(lastPoll.updated_at) : "尚未同步"}{lastPoll.message ? ` · ${lastPoll.message}` : ""}</small>
               </article>
             );
           })}
-          {!members.length && <p className="muted">尚未创建 WeChat claw 成员。</p>}
+          {!membersChecking && !members.length && <p className="muted">尚未创建 WeChat claw 成员。</p>}
         </div>
       </Panel>
     </div>
   );
 }
-
 function Panel({ title, children }: { title: string; children: ReactNode }) {
   return <section className="panel"><h2>{title}</h2>{children}</section>;
 }
@@ -4631,7 +4849,8 @@ function MTeamResourceResults({
   sortDirection,
   onSortBy,
   onSortDirection,
-  onBack
+  onBack,
+  backLabel = "返回发现"
 }: {
   items: any[];
   loading?: boolean;
@@ -4641,12 +4860,13 @@ function MTeamResourceResults({
   onSortBy: (value: string) => void;
   onSortDirection: (value: "asc" | "desc") => void;
   onBack?: () => void;
+  backLabel?: string;
 }) {
   return (
     <section className="panel search-result-panel">
       <div className="search-result-header">
         <div className="search-result-title-row">
-          {onBack && <button type="button" onClick={onBack}><ArrowLeft size={17} />返回发现</button>}
+          {onBack && <button type="button" onClick={onBack}><ArrowLeft size={17} />{backLabel}</button>}
           <div className="search-result-heading">
             <h2>M-Team 资源结果</h2>
             <small>{loading ? "正在读取 M-Team" : error ? "读取失败" : `共 ${items.length} 条`}</small>
@@ -4709,13 +4929,14 @@ function MTeamResourceCard({ item }: { item: any }) {
       }, 1700),
     ];
     try {
-      await api<any>(`/api/mteam/torrents/${encodeURIComponent(item.id)}/download-to/qb1`, { method: "POST", body: JSON.stringify({ payload: item }) });
+      const result = await api<any>(`/api/mteam/torrents/${encodeURIComponent(item.id)}/download`, { method: "POST", body: JSON.stringify({ payload: item }) });
+      const targetLabel = downloaderShortLabel(result?.downloader_id || "qB");
       playDoneSound();
-      setPushNotice({ status: "success", title: "推送完成", step: "qB1 已接收下载任务", detail: item.title });
+      setPushNotice({ status: "success", title: "推送完成", step: `${targetLabel} 已接收下载任务`, detail: item.title });
       window.setTimeout(() => setPushNotice(null), 5200);
     } catch (err) {
       const detail = apiErrorDetail(err);
-      setPushNotice({ status: "error", title: "推送失败", step: "未能完成 M-Team 到 qB1 的闭环", detail });
+      setPushNotice({ status: "error", title: "推送失败", step: "未能完成 M-Team 到默认下载器的推送", detail });
     } finally {
       timers.forEach((timer) => window.clearTimeout(timer));
       setDownloading(false);
@@ -5082,7 +5303,7 @@ function PersonDetailPage({
 
 function ResourceRow({ item }: { item: any }) {
   async function download() {
-    await api(`/api/mteam/torrents/${encodeURIComponent(item.id)}/download-to/qb1`, { method: "POST", body: JSON.stringify({ payload: item }) });
+    await api(`/api/mteam/torrents/${encodeURIComponent(item.id)}/download`, { method: "POST", body: JSON.stringify({ payload: item }) });
   }
 
   return <div className="row"><strong>{item.title}</strong><span>{item.resolution} / {item.codec} / {item.size} / 做种 {item.seeders}</span><button className="resource-download-button" onClick={download}><Download size={16} />下载</button></div>;
@@ -5531,6 +5752,14 @@ function FavoritesPage() {
   const [selectedMedia, setSelectedMedia] = useState<any | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState("");
+  const [mteamItems, setMteamItems] = useState<any[]>([]);
+  const [mteamSearching, setMteamSearching] = useState(false);
+  const [mteamError, setMteamError] = useState("");
+  const [mteamSearchActive, setMteamSearchActive] = useState(false);
+  const [resourceSort, setResourceSort] = useState("seeders");
+  const [resourceSortDirection, setResourceSortDirection] = useState<"asc" | "desc">("desc");
+  const mteamSearchRequestId = useRef(0);
+  const sortedMteamItems = useMemo(() => sortResources(mteamItems, resourceSort, resourceSortDirection), [mteamItems, resourceSort, resourceSortDirection]);
 
   const timelineGroups = useMemo(() => {
     const groups = new Map<string, any[]>();
@@ -5557,6 +5786,52 @@ function FavoritesPage() {
     }
   }
 
+  async function searchMTeamFromFavorite(item: any) {
+    const keyword = String(item?.title || item?.original_title || "").trim();
+    if (!keyword) return;
+    const requestId = mteamSearchRequestId.current + 1;
+    mteamSearchRequestId.current = requestId;
+    setMteamItems([]);
+    setMteamError("");
+    setMteamSearching(true);
+    setMteamSearchActive(true);
+    window.requestAnimationFrame(() => window.scrollTo(0, 0));
+    try {
+      const result = await api<{ items: any[] }>(`/api/search/mteam?q=${encodeURIComponent(keyword)}`);
+      if (mteamSearchRequestId.current === requestId) setMteamItems(Array.isArray(result.items) ? result.items : []);
+    } catch (err) {
+      if (mteamSearchRequestId.current === requestId) setMteamError((err as Error).message);
+    } finally {
+      if (mteamSearchRequestId.current === requestId) setMteamSearching(false);
+    }
+  }
+
+  function returnToFavoriteDetail() {
+    mteamSearchRequestId.current += 1;
+    setMteamSearchActive(false);
+    setMteamSearching(false);
+    setMteamError("");
+    window.requestAnimationFrame(() => window.scrollTo(0, 0));
+  }
+
+  if (mteamSearchActive) {
+    return (
+      <div className="grid-page discover-search-results favorites-mteam-results">
+        <MTeamResourceResults
+          items={sortedMteamItems}
+          loading={mteamSearching}
+          error={mteamError}
+          sortBy={resourceSort}
+          sortDirection={resourceSortDirection}
+          onSortBy={setResourceSort}
+          onSortDirection={setResourceSortDirection}
+          onBack={returnToFavoriteDetail}
+          backLabel="返回影片详情"
+        />
+      </div>
+    );
+  }
+
   if (selectedMedia) {
     return (
       <MediaDetailPage
@@ -5567,6 +5842,8 @@ function FavoritesPage() {
         onBack={() => undefined}
         onExit={() => setSelectedMedia(null)}
         onMediaSelect={openFavoriteDetail}
+        onMTeamSearch={searchMTeamFromFavorite}
+        mteamSearching={mteamSearching}
         exitLabel="返回收藏"
       />
     );

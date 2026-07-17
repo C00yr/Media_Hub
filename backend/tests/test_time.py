@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from app.api import routes
-from app.utils.time import parse_datetime, reset_client_timezone, set_client_timezone, system_datetime, utc_iso
+from app.utils.time import parse_datetime, reset_client_timezone, set_client_timezone, system_datetime, system_time_context, utc_iso
 
 
 def test_utc_iso_is_explicit_and_round_trips():
@@ -16,6 +16,19 @@ def test_client_timezone_context_overrides_backend_default():
     try:
         localized = system_datetime("2026-07-16T10:30:00Z")
         assert localized.isoformat() == "2026-07-16T06:30:00-04:00"
+    finally:
+        reset_client_timezone(token)
+
+
+def test_ai_time_context_is_explicit_and_uses_client_system_timezone():
+    token = set_client_timezone("Asia/Shanghai")
+    try:
+        context = system_time_context()
+        assert context["current_time"].endswith("+08:00")
+        assert context["current_date"] == context["current_time"][:10]
+        assert context["timezone"] == "Asia/Shanghai"
+        assert context["utc_offset"] == "+08:00"
+        assert context["timezone_source"] == "client_system"
     finally:
         reset_client_timezone(token)
 

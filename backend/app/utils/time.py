@@ -45,6 +45,13 @@ def system_timezone_name() -> str:
     return str(getattr(current, "key", "") or current)
 
 
+def system_timezone_source() -> str:
+    if _named_timezone(_CLIENT_TIMEZONE.get()):
+        return "client_system"
+    if _named_timezone(get_settings().app_timezone):
+        return "app_configuration"
+    return "server_system"
+
 def utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -52,6 +59,19 @@ def utc_now() -> datetime:
 def system_now() -> datetime:
     return utc_now().astimezone(system_timezone())
 
+
+def system_time_context() -> dict[str, str]:
+    """Return an explicit local-time context for AI and other text generators."""
+    current = system_now()
+    raw_offset = current.strftime("%z")
+    offset = f"{raw_offset[:3]}:{raw_offset[3:]}" if len(raw_offset) == 5 else raw_offset
+    return {
+        "current_time": current.isoformat(timespec="seconds"),
+        "current_date": current.date().isoformat(),
+        "timezone": system_timezone_name(),
+        "utc_offset": offset,
+        "timezone_source": system_timezone_source(),
+    }
 
 def utc_now_naive() -> datetime:
     """UTC without tzinfo for the existing SQLite DateTime columns."""

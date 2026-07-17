@@ -11,8 +11,9 @@ services:
       ENVIRONMENT: production
       STATIC_DIR: /app/static
       APP_RUNTIME_SECRETS_FILE: /data/runtime-secrets.json
-      # Controls backend/AI calendar labels; browser timestamps still use the viewer's system timezone.
+      # APP_TIMEZONE controls backend/AI fallbacks; TZ keeps the container OS aligned.
       APP_TIMEZONE: ${APP_TIMEZONE:-Asia/Shanghai}
+      TZ: ${APP_TIMEZONE:-Asia/Shanghai}
     extra_hosts:
       # Optional hostname users may enter for a proxy published by the NAS host.
       # The proxy address and port are configured only in the Media Hub UI.

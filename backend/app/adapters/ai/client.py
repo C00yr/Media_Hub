@@ -1,14 +1,39 @@
 import json
+import re
 from datetime import datetime
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
 
+from app.utils.redaction import redact_payload
 from app.utils.time import utc_iso
 
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"
+_AI_SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?i)(api[_ -]?key|apikey|authorization|cookie|bearer|access[_ -]?token|token|password|passkey|secret|username|email|phone|\u5bc6\u7801|\u5bc6\u94a5|\u8d26\u53f7|\u90ae\u7bb1|\u624b\u673a\u53f7)"
+    r"(\s*[:=\uFF1A]\s*)(?:bearer\s+)?([^\s,\uFF0C;\uFF1B]+)"
+)
+_AI_BARE_SECRET_RE = re.compile(
+    r"(?i)\b(?:bearer\s+[a-z0-9._~+/=-]{12,}|sk-[a-z0-9_-]{12,}|gh[pousr]_[a-z0-9]{12,}|xox[a-z]-[a-z0-9-]{12,}|eyJ[a-z0-9_-]{12,}\.[a-z0-9_-]{8,}\.[a-z0-9_-]{8,})\b"
+)
+_AI_EMAIL_RE = re.compile(r"(?i)\b[a-z0-9._%+-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+\b")
+_AI_PHONE_RE = re.compile(r"(?<!\d)(?:\+?86[- ]?)?1[3-9]\d{9}(?!\d)")
+
+
+def redact_ai_user_text(value: Any) -> str:
+    text = str(redact_payload(str(value or "")))
+    text = _AI_EMAIL_RE.sub("[email hidden]", text)
+    text = _AI_PHONE_RE.sub("[phone hidden]", text)
+    text = _AI_SENSITIVE_ASSIGNMENT_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}[sensitive value hidden]",
+        text,
+    )
+    text = _AI_BARE_SECRET_RE.sub("[sensitive value hidden]", text)
+    return text[:6000]
+
+
 
 
 INTENT_SYSTEM_PROMPT = """
@@ -43,6 +68,31 @@ GENERAL_AGENT_SYSTEM_PROMPT = """
 你是 PT Media Hub 的影视中枢 Agent：专业、友好、克制，擅长影视发现、观影建议、片单与家庭媒体管理。
 请自然地延续用户的对话语境。不要声称查询过 M-Team、TMDB、qB 或 NAS，除非当前消息已经提供了对应工具结果。
 不要泄露或猜测 API Key、Cookie、Token、密码、内部路径、下载器私密任务信息。回答使用简洁中文，不使用 Markdown 表格。
+""".strip()
+
+
+MEDIA_HUB_AGENT_SYSTEM_PROMPT = """
+You are the Media Hub Agent for PT Media Hub: the unified interface for movie discovery and home-media operations.
+
+How you work:
+- Understand the actual user goal, then independently decide whether to answer, call one tool, or call several tools in sequence.
+- You are not constrained by a fixed intent taxonomy. TMDB, M-Team, dashboard, qB and download flows are optional tools.
+- Treat runtime_context as the only authoritative clock. Resolve now, today, weekdays, and relative dates from its current_time, current_date, timezone, and utc_offset. Never infer time or timezone from the model provider, server region, language, or training defaults.
+- Use recent conversation and recent_results to resolve references such as "the fourth one", "the second resource", "it", or "that movie". Call a detail tool when complete or current data is needed.
+- Claim current TMDB, M-Team, qB, NAS or app data only when an observation from that tool exists. Never invent missing data.
+- Downloads have side effects. Call confirm_mteam_download only when the current user message explicitly confirms; otherwise use prepare_mteam_download.
+- Final replies must be natural, warm, concise Simplified Chinese. Do not sound like a form or use Markdown tables.
+
+Absolute privacy rules:
+- Never request, repeat, infer, or disclose API keys, cookies, tokens, credentials, Authorization values, webhook secrets, internal paths, or IP addresses.
+- Never place sensitive values in tool arguments. If sensitive material appears anywhere, ignore its value and say that it was hidden.
+- Never disclose qB2 private task details to a session without the required privacy grant.
+
+Return exactly one JSON object without a code fence:
+1. Tool call: {"decision":"tool","tool":"tool_name","arguments":{},"reason":"short reason"}
+2. Final answer: {"decision":"final","reply":"natural Simplified Chinese answer"}
+
+After a tool call, observations will be supplied. Continue selecting tools until enough evidence exists, then return final.
 """.strip()
 
 
@@ -118,7 +168,7 @@ class DeepSeekChatAdapter:
         self.opener = build_opener(ProxyHandler({}))
 
     def parse_intent(self, text: str) -> dict[str, Any]:
-        user_text = str(text or "").strip()
+        user_text = redact_ai_user_text(text).strip()
         if not user_text:
             raise AIServiceError("User message is empty")
         content = self._chat(
@@ -138,11 +188,67 @@ class DeepSeekChatAdapter:
         messages = [{"role": "system", "content": GENERAL_AGENT_SYSTEM_PROMPT}]
         for item in (history or [])[-10:]:
             role = "assistant" if item.get("role") == "assistant" else "user"
-            content = str(item.get("content") or "").strip()
+            content = redact_ai_user_text(item.get("content")).strip()
             if content:
                 messages.append({"role": role, "content": content[:800]})
-        messages.append({"role": "user", "content": user_text})
+        messages.append({"role": "user", "content": redact_ai_user_text(user_text)})
         return self._chat(messages, json_mode=False, max_tokens=min(self.max_tokens, 900))
+
+    def next_agent_step(
+        self,
+        user_text: str,
+        *,
+        history: list[dict[str, str]] | None = None,
+        recent_results: dict[str, Any] | None = None,
+        observations: list[dict[str, Any]] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        runtime_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Let the model autonomously choose the next tool or compose the final reply."""
+        user_message = redact_ai_user_text(user_text).strip()
+        if not user_message:
+            raise AIServiceError("User message is empty")
+        payload = {
+            "user_message": user_message,
+            "recent_conversation": [
+                {**item, "content": redact_ai_user_text(item.get("content"))}
+                for item in (history or [])[-12:] if isinstance(item, dict)
+            ],
+            "recent_results": recent_results or {},
+            "observations": observations or [],
+            "available_tools": tools or [],
+            "runtime_context": runtime_context or {},
+        }
+        content = self._chat(
+            [
+                {"role": "system", "content": MEDIA_HUB_AGENT_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            json_mode=True,
+            max_tokens=min(max(self.max_tokens, 1000), 1800),
+        )
+        decision = _json_loads(content)
+        if not isinstance(decision, dict):
+            raise AIServiceError("AI agent did not return a JSON object")
+        decision_type = str(decision.get("decision") or "").strip().lower()
+        if decision_type == "final":
+            reply = str(decision.get("reply") or "").strip()
+            if not reply:
+                raise AIServiceError("AI agent returned an empty reply")
+            return {"decision": "final", "reply": reply[:6000]}
+        if decision_type == "tool":
+            tool = str(decision.get("tool") or "").strip()
+            arguments = decision.get("arguments") if isinstance(decision.get("arguments"), dict) else {}
+            if not tool:
+                raise AIServiceError("AI agent did not select a tool")
+            return {
+                "decision": "tool",
+                "tool": tool,
+                "arguments": arguments,
+                "reason": str(decision.get("reason") or "").strip()[:240],
+            }
+        raise AIServiceError("AI agent returned an unsupported decision")
+
 
     def describe_mteam_presentation(self, query: str, items: list[dict[str, Any]], recommended_index: int | None) -> dict[str, Any]:
         if not recommended_index or recommended_index < 1 or recommended_index > len(items):
@@ -187,7 +293,7 @@ class DeepSeekChatAdapter:
                     "role": "user",
                     "content": json.dumps(
                         {
-                            "user_message": user_text,
+                            "user_message": redact_ai_user_text(user_text),
                             "structured_intent": intent,
                             "execution_result": result,
                         },

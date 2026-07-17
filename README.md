@@ -42,7 +42,7 @@ The app generates its runtime encryption/JWT secrets on first start and stores t
 `data/runtime-secrets.json`. Keep the `data` folder when upgrading or recreating containers.
 Advanced users can still create `.env` from `.env.example` to override network/storage defaults.
 
-Browser timestamps and request-time calendar labels use the viewer device's current system timezone. Background jobs and WeChat replies without a browser context use `APP_TIMEZONE` (an IANA name such as `Asia/Shanghai`); the bundled Compose file defaults to `Asia/Shanghai`. Set this value in `.env` when the NAS uses another timezone. Timestamps remain stored in UTC so changing the display timezone does not rewrite historical data.
+Browser timestamps, request-time calendar labels, and AI replies use the viewer device's current IANA timezone. Background jobs and WeChat replies without a browser context use `APP_TIMEZONE` (for example, `Asia/Shanghai`). The local launcher detects the development computer's timezone automatically. The bundled Compose file defaults both `APP_TIMEZONE` and the container `TZ` to `Asia/Shanghai`; set `APP_TIMEZONE` in `.env` when the NAS should use another timezone. Timestamps remain stored in UTC so changing the display timezone does not rewrite historical data.
 
 
 Source-code development and NAS deployment are separate application instances. Do not copy the NAS database into `data/local`, and do not point local `DATABASE_URL` at a NAS share. The backend validates this at startup and rejects accidental cross-profile SQLite paths.
@@ -66,6 +66,15 @@ TMDB_PROXY_URL=http://mihomo:7890
 ```
 
 Values saved in the Settings page take priority over `.env`; legacy `TMDB_MODE=proxy` enables both allowed TMDB domains. The default `docker-compose.yml` does not start Mihomo. Direct mode needs no proxy files, while proxy mode requires an existing proxy that the Media Hub container can reach. Domain choices are managed in the Media Hub UI and do not need to be duplicated in Media Hub's Compose YAML.
+
+## Media Hub Agent
+
+The in-app assistant and WeChat Claw share one autonomous Media Hub Agent. The model is not routed through a fixed intent classifier: it decides whether to answer directly or call one or more tools for TMDB lookup and details, M-Team search and refreshed release details, dashboard/diagnostics, qB task summaries/details, and confirmed downloads.
+
+Agent sessions retain bounded conversation history and safe result references for 24 hours. Follow-ups such as "show the complete overview for the fourth result" or "how long is the second release free for?" resolve against the prior real result and call the appropriate detail service again. Starting a new web conversation creates an isolated context.
+
+All tool observations and API responses are bounded and redacted before reaching the model. Credentials, cookies, tokens, account identifiers, internal paths, IPs, qB hashes, and tracker URLs are excluded. qB2 task details still require its temporary privacy grant. A download is executed only when a resource is already pending and the current user message explicitly confirms it.
+
 
 ## NAS Storage Mounts
 
