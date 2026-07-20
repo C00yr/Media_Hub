@@ -594,8 +594,6 @@ textarea { min-height: 96px; resize: vertical; }
 @keyframes settingsCardEnter { from { opacity: .15; transform: translateY(9px); } to { opacity: 1; transform: translateY(0); } }
 .tmdb-editor label { font-size: 14px; }
 .media-search-settings { display: grid; gap: 14px; }
-.media-source-selector { grid-template-columns: minmax(220px, 340px) minmax(0, 1fr); align-items: end; }
-.media-source-selector > label { display: grid; gap: 7px; color: #344054; font-weight: 800; }
 .network-settings-card { gap: 12px; }
 .direct-network-summary { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 14px; border: 1px solid #b7ddd7; border-radius: 8px; background: #eef8f6; }
 .direct-network-icon, .proxy-collapse-icon { width: 36px; height: 36px; display: grid; place-items: center; border-radius: 50%; color: #0f766e; background: #fff; box-shadow: 0 0 0 1px rgba(15,118,110,.16); }
@@ -683,7 +681,7 @@ input.proxy-toggle-switch:disabled { opacity: .55; cursor: not-allowed; }
 .proxy-route-summary b.proxy { color: #065f46; background: #d1fae5; }
 .proxy-route-summary b.direct { color: #475467; background: #eaecf0; }
 @media (max-width: 700px) {
-  .media-source-selector, .proxy-domain-list, .tmdb-route-feedback-list, .connection-workflow { grid-template-columns: 1fr; }
+  .proxy-domain-list, .tmdb-route-feedback-list, .connection-workflow { grid-template-columns: 1fr; }
   .direct-network-summary { grid-template-columns: auto minmax(0, 1fr); align-items: start; }
   .direct-network-summary .network-mode-pill { grid-column: 2; justify-self: start; }
   .proxy-collapse-header { grid-template-columns: 1fr; }

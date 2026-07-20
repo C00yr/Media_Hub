@@ -134,6 +134,31 @@ def clear_agent_state(db):
     db.commit()
 
 
+def test_web_and_wechat_agent_use_the_same_reply_context(monkeypatch):
+    time_context = {
+        "current_time": "2026-07-20 12:34:56",
+        "current_date": "2026-07-20",
+        "timezone": "Asia/Shanghai",
+        "utc_offset": "+08:00",
+    }
+    monkeypatch.setattr(routes, "system_time_context", lambda: dict(time_context))
+    user = SimpleNamespace(id=1)
+    web_request = WechatClawMessageRequest(message="same question", user_id="web-1", conversation_id="web-conversation")
+    wechat_request = WechatClawMessageRequest(message="same question", user_id="wechat-user", conversation_id="wechat-conversation")
+    web_agent = ScriptedAgent([{"decision": "final", "reply": "same complete reply"}])
+    wechat_agent = ScriptedAgent([{"decision": "final", "reply": "same complete reply"}])
+
+    with SessionLocal() as db:
+        clear_agent_state(db)
+        web_result = run_media_hub_agent(db, web_agent, web_request, user)
+        wechat_result = run_media_hub_agent(db, wechat_agent, wechat_request, user)
+
+    assert web_result["reply"] == wechat_result["reply"]
+    assert web_agent.calls[0]["runtime_context"] == time_context
+    assert wechat_agent.calls[0]["runtime_context"] == time_context
+    assert "channel" not in web_agent.calls[0]["runtime_context"]
+
+
 def test_agent_can_follow_up_on_fourth_tmdb_result(monkeypatch):
     FakeTmdbAdapter.detail_calls = []
     monkeypatch.setattr(routes, "TmdbAdapter", FakeTmdbAdapter)

@@ -4206,7 +4206,7 @@ function MediaSearchSettingsCard({ provider, onChanged }: { provider: any; onCha
         mode: "real",
         can_enable: false,
         message: "草稿已保存。",
-        explanation: "媒体源凭据和精细代理策略已保存。",
+        explanation: "TMDB 凭据和网络设置已保存。",
         next_step: "点击“保存并测试”，确认数据接口和图片资源均可访问。",
       });
       onChanged();
@@ -4270,21 +4270,7 @@ function MediaSearchSettingsCard({ provider, onChanged }: { provider: any; onCha
 
   return (
     <div className="media-search-settings">
-      <Panel title="媒体搜索来源">
-        <div className="integration media-source-selector">
-          <label>当前媒体源
-            <select value="tmdb" onChange={() => undefined}>
-              <option value="tmdb">TMDB（当前支持）</option>
-            </select>
-          </label>
-          <div className="field-help compact-help">
-            <strong>TMDB 影视资料库</strong>
-            <span>为发现页和 AI 助手提供电影、剧集、演员、趋势、筛选和图片信息。</span>
-          </div>
-        </div>
-      </Panel>
-
-      <Panel title="TMDB 数据源">
+      <Panel title="TMDB 配置">
         <div className="integration tmdb-editor">
           <div className="notice info">
             <strong>访问凭据与内容偏好</strong>

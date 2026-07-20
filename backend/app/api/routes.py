@@ -2509,10 +2509,7 @@ def run_media_hub_agent(
                 recent_results=dict(session.get("recent_results") or {}),
                 observations=observations,
                 tools=AGENT_TOOL_CATALOG,
-                runtime_context={
-                    **system_time_context(),
-                    "channel": "web" if str(request.user_id or "").startswith("web-") else "wechat",
-                },
+                runtime_context=system_time_context(),
             )
         except AIServiceError as exc:
             if telemetry is not None:
