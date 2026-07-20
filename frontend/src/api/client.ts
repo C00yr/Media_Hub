@@ -13,7 +13,9 @@ export function setToken(token: string | null): void {
 
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers);
-  if (!headers.has("Content-Type") && options.body) headers.set("Content-Type", "application/json");
+  if (!headers.has("Content-Type") && options.body && !(options.body instanceof FormData) && !(options.body instanceof Blob)) {
+    headers.set("Content-Type", "application/json");
+  }
   const clientTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   if (clientTimezone) headers.set("X-Client-Timezone", clientTimezone);
   const token = getToken();

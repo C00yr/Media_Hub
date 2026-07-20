@@ -14,9 +14,10 @@ from socket import timeout as SocketTimeout
 from threading import Lock
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import unquote
 from urllib.request import Request
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request as FastAPIRequest, status
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -87,6 +88,7 @@ TMDB_DIRECT_IMAGE_RE = re.compile(
     re.IGNORECASE,
 )
 TMDB_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+TORRENT_FILE_MAX_BYTES = 20 * 1024 * 1024
 NAS_STORAGE_SETUP_STATUS_KEY = "setup.nas_storage.status"
 
 
@@ -4659,10 +4661,75 @@ def qb_add_torrent(downloader_id: str, request: QbActionPayload, authorization: 
     try:
         result = get_qb_adapter_or_error(db, downloader_id).add_torrent(downloader_id, request.payload)
     except QbittorrentApiError as exc:
-        raise HTTPException(status_code=502, detail=f"qB 添加任务失败：{exc}") from exc
+        status_code = 400 if exc.http_status == 400 else 502
+        raise HTTPException(status_code=status_code, detail=f"qB 添加任务失败：{exc}") from exc
     db.add(DownloadAction(trace_id=result["trace_id"], downloader_id=downloader_id, action="add", actor_user_id=user.id, status="accepted"))
     db.commit()
     return result
+
+
+@router.post("/qb/{downloader_id}/torrents/file")
+async def qb_add_torrent_file(
+    downloader_id: str,
+    raw_request: FastAPIRequest,
+    filename: str = Header(default="", alias="X-Torrent-Filename"),
+    save_path: str = Query(default="", max_length=1000),
+    category: str = Query(default="", max_length=200),
+    tags: str = Query(default="", max_length=500),
+    authorization: str | None = Header(default=None),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
+        raise HTTPException(status_code=403, detail="qB2 需要管理员验证")
+
+    safe_filename = re.split(r"[\\/]", unquote(filename).strip())[-1][:240]
+    if not safe_filename or not safe_filename.lower().endswith(".torrent"):
+        raise HTTPException(status_code=400, detail="请选择有效的 .torrent 种子文件")
+    try:
+        content_length = int(raw_request.headers.get("content-length") or 0)
+    except ValueError:
+        content_length = 0
+    if content_length > TORRENT_FILE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="种子文件不能超过 20 MB")
+
+    content = await raw_request.body()
+    if not content:
+        raise HTTPException(status_code=400, detail="种子文件为空")
+    if len(content) > TORRENT_FILE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="种子文件不能超过 20 MB")
+    info_hashes = torrent_info_hashes(content)
+    if not info_hashes:
+        raise HTTPException(status_code=400, detail="种子文件格式无效，未找到 info 字典")
+
+    payload = {
+        key: value.strip()
+        for key, value in {"save_path": save_path, "category": category, "tags": tags}.items()
+        if value.strip()
+    }
+    try:
+        result = get_qb_adapter_or_error(db, downloader_id).add_torrent_file(
+            downloader_id,
+            safe_filename,
+            content,
+            payload,
+        )
+    except QbittorrentApiError as exc:
+        raise HTTPException(status_code=502, detail=f"qB 添加种子文件失败：{exc}") from exc
+
+    task_hash = info_hashes[0]
+    db.add(
+        DownloadAction(
+            trace_id=result["trace_id"],
+            downloader_id=downloader_id,
+            action="add_file",
+            target_hash=task_hash,
+            actor_user_id=user.id,
+            status="accepted",
+        )
+    )
+    db.commit()
+    return {**result, "filename": safe_filename, "task_hash": task_hash}
 
 
 @router.post("/mteam/torrents/{torrent_id}/download")

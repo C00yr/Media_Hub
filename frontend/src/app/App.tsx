@@ -19,6 +19,7 @@ import {
   Grid3X3,
   HardDrive,
   Heart,
+  Link2,
   Lock,
   LogOut,
   MessageSquare,
@@ -35,6 +36,7 @@ import {
   Star,
   Trash2,
   Upload,
+  UploadCloud,
   UserRound,
   Users,
   Wrench
@@ -2090,9 +2092,11 @@ function DownloadsPage({ selectedDownloader = "qb1" }: { selectedDownloader?: st
   const downloadOverviewInFlight = useRef(false);
   const [qb2Authorized, setQb2Authorized] = useState(false);
   const [refreshingDownload, setRefreshingDownload] = useState(false);
+  const [addDialogMode, setAddDialogMode] = useState<"link" | "file" | null>(null);
 
   useEffect(() => {
     if (selectedDownloader && selectedDownloader !== downloader) {
+      setAddDialogMode(null);
       setDownloader(selectedDownloader);
     }
   }, [selectedDownloader]);
@@ -2165,18 +2169,145 @@ function DownloadsPage({ selectedDownloader = "qb1" }: { selectedDownloader?: st
           {["qb1", "qb2", "qb3"].map((id) => <button className={downloader === id ? "active" : ""} onClick={() => setDownloader(id)} key={id}>{downloaderShortLabel(id)}</button>)}
         </div>
       </div>
-      {summary && !qb2Locked && <QbSummaryCards qb={summary} count={items.length} onRefresh={manualRefreshDownloadOverview} refreshing={refreshingDownload} />}
+      {summary && !qb2Locked && (
+        <QbSummaryCards
+          qb={summary}
+          count={items.length}
+          onRefresh={manualRefreshDownloadOverview}
+          refreshing={refreshingDownload}
+          onAddLink={() => setAddDialogMode("link")}
+          onAddFile={() => setAddDialogMode("file")}
+        />
+      )}
       {downloader === "qb2" && qb2Authorized && !qb2Locked && <div className="qb-grant-strip"><span>qB2 隐私授权已开启</span><button type="button" onClick={revokeQb2Grant}>退出授权</button></div>}
       {qb2Locked && <Panel title="qB2 已锁定"><p>私有下载器需要管理员验证。</p><button className="primary" onClick={() => setGrantOpen(true)}><Lock size={16} /> 验证管理员</button></Panel>}
       {error && downloader !== "qb2" && <p className="error">{error}</p>}
       {grantOpen && <AdminGrant onDone={() => { setGrantOpen(false); setQb2Authorized(true); setData(null); refreshDownloadOverview("qb2"); }} />}
       {loading && !visibleData && (!error || qb2Authorized) && <Panel title="下载器"><p>正在读取 qB 真实数据...</p></Panel>}
       {visibleData && !qb2Locked && <QbTorrentTable key={downloader} items={items} downloader={downloader} onChanged={() => { refreshDownloadOverview(); }} />}
+      {addDialogMode && !qb2Locked && (
+        <DownloadTaskDialog
+          key={`${downloader}-${addDialogMode}`}
+          downloader={downloader}
+          mode={addDialogMode}
+          onClose={() => setAddDialogMode(null)}
+          onAdded={() => { refreshDownloadOverview(); }}
+        />
+      )}
     </div>
   );
 }
 
-function QbSummaryCards({ qb, count, onRefresh, refreshing }: { qb: any; count: number; onRefresh: () => void; refreshing: boolean }) {
+function DownloadTaskDialog({ downloader, mode, onClose, onAdded }: { downloader: string; mode: "link" | "file"; onClose: () => void; onAdded: () => void }) {
+  const [links, setLinks] = useState("");
+  const [torrentFile, setTorrentFile] = useState<File | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [submitted, setSubmitted] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const canSubmit = mode === "link" ? Boolean(links.trim()) : Boolean(torrentFile);
+
+  function chooseTorrentFile(file: File | null) {
+    setError("");
+    if (!file) {
+      setTorrentFile(null);
+      return;
+    }
+    if (!file.name.toLowerCase().endsWith(".torrent")) {
+      setTorrentFile(null);
+      setError("请选择扩展名为 .torrent 的种子文件。");
+      return;
+    }
+    if (file.size > 20 * 1024 * 1024) {
+      setTorrentFile(null);
+      setError("种子文件不能超过 20 MB。");
+      return;
+    }
+    setTorrentFile(file);
+  }
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (!canSubmit || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      if (mode === "link") {
+        await api(`/api/qb/${downloader}/torrents`, {
+          method: "POST",
+          body: JSON.stringify({ payload: { urls: links.trim() } }),
+        });
+      } else if (torrentFile) {
+        await api(`/api/qb/${downloader}/torrents/file`, {
+          method: "POST",
+          headers: {
+            "Content-Type": torrentFile.type || "application/x-bittorrent",
+            "X-Torrent-Filename": encodeURIComponent(torrentFile.name),
+          },
+          body: torrentFile,
+        });
+      }
+      setSubmitted(true);
+      onAdded();
+    } catch (error) {
+      setError(normalizeApiErrorMessage(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (submitted) {
+    return (
+      <div className="app-dialog-backdrop" role="presentation" onMouseDown={onClose}>
+        <div className="app-dialog download-task-dialog download-task-success" role="dialog" aria-modal="true" aria-labelledby="download-task-success-title" onMouseDown={(event) => event.stopPropagation()}>
+          <span className="download-dialog-success-icon"><Check size={24} /></span>
+          <h3 id="download-task-success-title">下载任务已添加</h3>
+          <p>任务已成功提交到 {downloaderShortLabel(downloader)}，下载列表会自动更新。</p>
+          <button type="button" className="primary" onClick={onClose}>完成</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="app-dialog-backdrop" role="presentation" onMouseDown={() => !busy && onClose()}>
+      <form className="app-dialog download-task-dialog" role="dialog" aria-modal="true" aria-labelledby="download-task-dialog-title" onSubmit={submit} onMouseDown={(event) => event.stopPropagation()}>
+        <div className="download-task-dialog-heading">
+          <span className="download-task-dialog-icon">{mode === "link" ? <Link2 size={20} /> : <UploadCloud size={20} />}</span>
+          <div>
+            <h3 id="download-task-dialog-title">{mode === "link" ? "通过链接下载" : "通过种子文件下载"}</h3>
+            <p>添加到 {downloaderShortLabel(downloader)}</p>
+          </div>
+          <button className="download-dialog-close" type="button" onClick={onClose} disabled={busy} aria-label="关闭">×</button>
+        </div>
+        {mode === "link" ? (
+          <label className="download-link-field">
+            <span>下载链接</span>
+            <textarea autoFocus value={links} onChange={(event) => { setLinks(event.target.value); setError(""); }} rows={5} placeholder={"粘贴 magnet、HTTP 或 HTTPS 种子链接\n每行一条，最多可同时添加 20 条"} disabled={busy} />
+          </label>
+        ) : (
+          <div
+            className={torrentFile ? "download-torrent-dropzone selected" : "download-torrent-dropzone"}
+            onDragOver={(event) => event.preventDefault()}
+            onDrop={(event) => { event.preventDefault(); chooseTorrentFile(event.dataTransfer.files[0] ?? null); }}
+          >
+            <span className="download-dropzone-icon"><UploadCloud size={26} /></span>
+            <div><strong>{torrentFile?.name || "选择一个 .torrent 文件"}</strong><span>{torrentFile ? `${formatBytes(torrentFile.size)} · 已准备就绪` : "也可以将文件拖放到这里"}</span></div>
+            <button type="button" onClick={() => fileInput.current?.click()} disabled={busy}>{torrentFile ? "重新选择" : "浏览文件"}</button>
+            <input ref={fileInput} type="file" accept=".torrent,application/x-bittorrent" onChange={(event) => chooseTorrentFile(event.target.files?.[0] ?? null)} hidden />
+          </div>
+        )}
+        {error && <p className="download-dialog-error"><CircleAlert size={15} />{error}</p>}
+        <div className="download-task-dialog-actions">
+          <button type="button" onClick={onClose} disabled={busy}>取消</button>
+          <button className="primary" type="submit" disabled={!canSubmit || busy}>{busy ? <RefreshCw className="spinning" size={16} /> : <Download size={16} />}{busy ? "正在添加..." : "开始下载"}</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function QbSummaryCards({ qb, count, onRefresh, refreshing, onAddLink, onAddFile }: { qb: any; count: number; onRefresh: () => void; refreshing: boolean; onAddLink: () => void; onAddFile: () => void }) {
   return (
     <div className="qb-summary-cards">
       <SummaryCard
@@ -2189,6 +2320,12 @@ function QbSummaryCards({ qb, count, onRefresh, refreshing }: { qb: any; count: 
           <button className={refreshing ? "refresh-icon-button spinning" : "refresh-icon-button"} type="button" onClick={onRefresh} disabled={refreshing} title="刷新当前下载器" aria-label="刷新当前下载器">
             <RefreshCw size={15} />
           </button>
+        )}
+        footerAction={(
+          <span className="summary-card-quick-actions" aria-label="添加下载任务">
+            <button type="button" onClick={onAddLink} title="通过链接添加" aria-label="通过链接添加下载任务"><Link2 size={15} /></button>
+            <button type="button" onClick={onAddFile} title="添加种子文件" aria-label="通过种子文件添加下载任务"><UploadCloud size={15} /></button>
+          </span>
         )}
       />
       <SummaryCard icon={Download} label="下载速度" value={formatSpeed(qb.download_speed ?? 0)} helper="qB 实时速度" tone="teal" />
@@ -2203,14 +2340,14 @@ function QbSummaryCards({ qb, count, onRefresh, refreshing }: { qb: any; count: 
   );
 }
 
-function SummaryCard({ icon: Icon, label, value, helper, tone, action }: { icon: typeof Film; label: string; value: ReactNode; helper: string; tone: "mint" | "teal" | "orange" | "blue"; action?: ReactNode }) {
+function SummaryCard({ icon: Icon, label, value, helper, tone, action, footerAction }: { icon: typeof Film; label: string; value: ReactNode; helper: string; tone: "mint" | "teal" | "orange" | "blue"; action?: ReactNode; footerAction?: ReactNode }) {
   return (
     <article className={`summary-card ${tone}`}>
       <div className="summary-card-icon"><Icon size={24} /></div>
       <div>
         <span>{label}{action}</span>
         <strong>{value}</strong>
-        <small>{helper}</small>
+        <span className="summary-card-helper"><small>{helper}</small>{footerAction}</span>
       </div>
     </article>
   );

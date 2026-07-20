@@ -114,10 +114,8 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
         return {"accepted": True, "trace_id": trace_id("QBFILE"), "downloader_id": downloader_id, "hash": torrent_hash, "file_id": file_id, "priority": priority}
 
     def add_torrent(self, downloader_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        torrent_url = _first_text(payload, "download_url", "torrent_url", "magnet", "url", "urls")
-        if not torrent_url:
-            raise QbittorrentApiError("当前资源没有可提交给 qB 的下载链接")
-        form = {"urls": torrent_url}
+        torrent_urls = _torrent_urls(payload)
+        form = {"urls": torrent_urls}
         save_path = _first_text(payload, "save_path") or self.default_save_path
         category = _first_text(payload, "category") or self.default_category
         tags = _first_text(payload, "tags") or self.default_tags
@@ -128,7 +126,13 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
         if tags:
             form["tags"] = tags
         self._text_request("POST", "/api/v2/torrents/add", form=form)
-        return {"accepted": True, "trace_id": trace_id("DL"), "downloader_id": downloader_id, "task_hash": None}
+        return {
+            "accepted": True,
+            "trace_id": trace_id("DL"),
+            "downloader_id": downloader_id,
+            "task_hash": None,
+            "source": "url",
+        }
 
     def add_torrent_file(self, downloader_id: str, filename: str, content: bytes, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         if not content:
@@ -433,6 +437,29 @@ def _first_text(payload: dict[str, Any], *keys: str) -> str:
         if value not in (None, ""):
             return str(value).strip()
     return ""
+
+
+def _torrent_urls(payload: dict[str, Any]) -> str:
+    value: Any = None
+    for key in ("download_url", "torrent_url", "magnet", "url", "urls"):
+        if payload.get(key) not in (None, "", []):
+            value = payload[key]
+            break
+    if value in (None, "", []):
+        raise QbittorrentApiError("请填写磁力链接或种子下载链接", 400)
+
+    raw_items = value if isinstance(value, list) else str(value).splitlines()
+    links = [str(item).strip() for item in raw_items if str(item).strip()]
+    if not links:
+        raise QbittorrentApiError("请填写磁力链接或种子下载链接", 400)
+    if len(links) > 20:
+        raise QbittorrentApiError("一次最多可添加 20 条下载链接", 400)
+    for link in links:
+        if len(link) > 8192:
+            raise QbittorrentApiError("下载链接过长，请检查后重试", 400)
+        if not link.lower().startswith(("magnet:?", "http://", "https://")):
+            raise QbittorrentApiError("仅支持 magnet、HTTP 或 HTTPS 下载链接", 400)
+    return "\n".join(links)
 
 
 def _multipart_body(boundary: str, fields: dict[str, str], files: dict[str, tuple[str, bytes, str]]) -> bytes:
