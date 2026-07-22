@@ -16,6 +16,8 @@ depends_on = None
 
 
 def upgrade() -> None:
+    if sa.inspect(op.get_bind()).has_table("mteam_traffic_rollups"):
+        return
     op.create_table(
         "mteam_traffic_rollups",
         sa.Column("id", sa.Integer(), primary_key=True),
@@ -32,6 +34,8 @@ def upgrade() -> None:
     op.create_index("ix_mteam_traffic_rollups_period_start", "mteam_traffic_rollups", ["period_start"])
 
 
+    if not sa.inspect(op.get_bind()).has_table("mteam_traffic_rollups"):
+        return
 def downgrade() -> None:
     op.drop_index("ix_mteam_traffic_rollups_period_start", table_name="mteam_traffic_rollups")
     op.drop_index("ix_mteam_traffic_rollups_period_type", table_name="mteam_traffic_rollups")

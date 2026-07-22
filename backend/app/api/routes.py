@@ -23,7 +23,6 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.adapters.ai import AIConfigError, AIServiceError, DeepSeekChatAdapter, redact_ai_user_text
-from app.adapters.mock import MockMetadataAdapter
 from app.adapters.mteam import MTeamAdapter, MTeamApiError, MTeamConfigError
 from app.adapters.qbittorrent import QbittorrentApiError, QbittorrentConfigError, QbittorrentWebAdapter
 from app.adapters.tmdb import TmdbAdapter
@@ -37,7 +36,14 @@ from app.adapters.tmdb.client import (
 )
 from app.adapters.wechat_claw import WechatClawAdapter, WechatClawApiError, WechatClawConfigError
 from app.api.deps import get_current_user, has_qb2_grant, require_admin
-from app.auth.security import create_access_token, decode_token, hash_password, verify_password
+from app.auth.security import (
+    DEFAULT_CREDENTIALS_PENDING_KEY,
+    LEGACY_DEFAULT_ADMIN_PASSWORD,
+    create_access_token,
+    decode_token,
+    hash_password,
+    verify_password,
+)
 from app.config.settings import get_settings
 from app.db.session import SessionLocal, get_db
 from app.diagnostics.tracing import TraceRecorder
@@ -50,6 +56,7 @@ from app.models.entities import (
     MTeamTrafficRollup,
     MediaFavorite,
     Notification,
+    QbDeleteConfirmation,
     QbSnapshot,
     Setting,
     User,
@@ -58,8 +65,10 @@ from app.models.entities import (
 )
 from app.services.integrations import (
     PROVIDERS,
+    decode_saved_payload,
     get_config,
     get_decrypted_config,
+    public_test_result,
     record_test_result,
     serialize_config,
     set_enabled,
@@ -89,6 +98,7 @@ TMDB_DIRECT_IMAGE_RE = re.compile(
 )
 TMDB_IMAGE_MAX_BYTES = 20 * 1024 * 1024
 TORRENT_FILE_MAX_BYTES = 20 * 1024 * 1024
+QB_DELETE_CONFIRM_TTL_SECONDS = 2 * 60
 NAS_STORAGE_SETUP_STATUS_KEY = "setup.nas_storage.status"
 
 
@@ -212,7 +222,6 @@ WECHAT_CLAW_EXPLICIT_DOWNLOAD_CONFIRM_RE = re.compile(
 )
 WECHAT_CLAW_SELECTION_WORDS = {"第一个": 1, "第一部": 1, "第1个": 1, "推荐的": -1, "推荐那个": -1, "推荐的那个": -1}
 WECHAT_CLAW_PRIVACY_GRANT_SECONDS = 15 * 60
-DEFAULT_CREDENTIALS_PENDING_KEY = "account.default_credentials_pending"
 SUPER_PASSWORD_SETTING_KEY = "auth.super_password"
 
 
@@ -495,7 +504,7 @@ def module_display_name(module: str) -> str:
         "qb1": "qB1 下载器",
         "qb2": "qB2 下载器",
         "qb3": "qB3 下载器",
-        "ai": "AI 服务",
+        "ai": "影视中枢 Agent",
         "tmdb": "TMDB",
         "wechat_claw": "WeChat claw",
     }.get(module, module)
@@ -753,8 +762,8 @@ WECHAT_CLAW_MOBILE_SECTIONS: list[dict[str, Any]] = [
     {"key": "discover", "label": "发现", "description": "TMDB 趋势、热门、筛选和 M-Team 搜索入口。"},
     {"key": "dashboard", "label": "仪表盘", "description": "M-Team、qB 下载器、NAS 空间总览。"},
     {"key": "downloads", "label": "下载", "description": "qB1/qB2/qB3 下载任务状态与操作入口。"},
-    {"key": "notifications", "label": "通知", "description": "成员通知偏好与 AI 对话测试。"},
-    {"key": "settings", "label": "设置", "description": "M-Team、qB、TMDB、AI、WeChat claw 等运行配置。"},
+    {"key": "notifications", "label": "通知", "description": "成员通知偏好与影视中枢 Agent 对话。"},
+    {"key": "settings", "label": "设置", "description": "M-Team、qB、TMDB、影视中枢 Agent、WeChat claw 等运行配置。"},
     {"key": "diagnostics", "label": "诊断", "description": "管理员诊断健康检查与脱敏导出。"},
 ]
 
@@ -763,7 +772,7 @@ WECHAT_CLAW_CAPABILITIES: list[dict[str, Any]] = [
     {"action": "mteam_search", "label": "M-Team 资源搜索", "examples": ["搜索沙丘 2160p", "推荐一个沙丘资源"]},
     {"action": "dashboard_query", "label": "仪表盘查询", "examples": ["qB1 现在速度多少", "查一下仪表盘状态"]},
     {"action": "download_selected", "label": "手机端添加下载", "examples": ["第一个", "下载推荐的那个", "确认开始下载"]},
-    {"action": "general_chat", "label": "影视中枢对话", "examples": ["周末适合看什么电影"]},
+    {"action": "general_chat", "label": "影视中枢 Agent 对话", "examples": ["周末适合看什么电影"]},
 ]
 
 
@@ -1137,7 +1146,6 @@ def tmdb_test_result(success: bool, trace: str, message: str, explanation: str, 
     return {
         "success": success,
         "provider": "tmdb",
-        "mode": "real",
         "http_status": http_status,
         "duration_ms": 0,
         "message": message,
@@ -1221,47 +1229,10 @@ def classify_tmdb_gateway_test_error(exc: Exception, trace: str, phase: str = "a
     return result
 
 
-def mock_test_result(provider: str, trace: str, row: IntegrationConfig | None) -> dict[str, Any]:
-    return {
-        "success": True,
-        "provider": provider,
-        "mode": "mock",
-        "http_status": 200,
-        "duration_ms": 120,
-        "message": "Mock 只读连接测试成功。",
-        "trace_id": trace,
-        "config_version": row.config_version if row else 0,
-    }
-
-
-def qb_config_test_result(provider: str, trace: str, config: dict[str, Any], row: IntegrationConfig | None) -> dict[str, Any]:
-    missing = [
-        label
-        for key, label in (("base_url", "qB WebUI 地址"), ("username", "用户名"), ("password", "密码"))
-        if not str(config.get(key) or "").strip()
-    ]
-    success = not missing
-    return {
-        "success": success,
-        "provider": provider,
-        "mode": "config",
-        "http_status": None,
-        "duration_ms": 0,
-        "message": "qB 配置字段完整。" if success else "qB 配置还缺少必填项。",
-        "explanation": "已保存下载器连接信息。" if success else f"缺少：{', '.join(missing)}。",
-        "next_step": "请测试连接后再启用。" if success else "请填好 WebUI 地址、用户名和密码后再测试。",
-        "error_type": None if success else "missing_required_fields",
-        "can_enable": False,
-        "trace_id": trace,
-        "config_version": row.config_version if row else 0,
-    }
-
-
 def qb_test_result(success: bool, provider: str, trace: str, message: str, explanation: str, next_step: str, error_type: str | None = None, http_status: int | None = None, can_enable: bool | None = None, detail: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "success": success,
         "provider": provider,
-        "mode": "real",
         "http_status": http_status,
         "duration_ms": 0,
         "message": message,
@@ -1327,7 +1298,6 @@ def mteam_test_result(success: bool, trace: str, message: str, explanation: str,
     return {
         "success": success,
         "provider": "mteam",
-        "mode": "real",
         "http_status": http_status,
         "duration_ms": 0,
         "message": message,
@@ -1376,13 +1346,13 @@ def classify_mteam_test_error(exc: Exception, trace: str) -> dict[str, Any]:
         trace,
         "M-Team 测试失败。",
         "应用遇到了未能自动识别的问题。",
-        "请检查填写内容后重试；如果仍然失败，可以把这条提示截图发给开发者排查。",
+        "请检查填写内容后重试；如果问题持续，可前往诊断页查看详细信息。",
         "unknown_error",
     )
 
 
 def mteam_connection_payload(row: IntegrationConfig | None) -> dict[str, Any]:
-    result = row.last_test_result if row else None
+    result = public_test_result(row.last_test_result) if row else None
     configured = bool(row and row.redacted_summary)
     enabled = bool(row and row.enabled)
     last_test_success = bool(result and result.get("success"))
@@ -1399,7 +1369,7 @@ def mteam_connection_payload(row: IntegrationConfig | None) -> dict[str, Any]:
         "config_version": row.config_version if row else 0,
         "last_tested_at": utc_iso(row.last_tested_at) if row and row.last_tested_at else None,
         "last_test_result": result,
-        "data_source": "M-Team 原始数据（Real API）",
+        "data_source": "M-Team 站点数据",
         "message": message,
     }
 
@@ -1408,7 +1378,6 @@ def ai_test_result(success: bool, trace: str, message: str, explanation: str, ne
     return {
         "success": success,
         "provider": "ai",
-        "mode": "real",
         "http_status": http_status,
         "duration_ms": 0,
         "message": message,
@@ -1426,7 +1395,7 @@ def classify_ai_test_error(exc: Exception, trace: str) -> dict[str, Any]:
         return ai_test_result(
             False,
             trace,
-            "AI 助手尚未配置完成。",
+            "影视中枢 Agent 尚未配置完成。",
             "请填写 API Key 后再测试。",
             "保存 API Key 并重新测试。",
             "missing_credentials",
@@ -1436,7 +1405,7 @@ def classify_ai_test_error(exc: Exception, trace: str) -> dict[str, Any]:
         return ai_test_result(
             False,
             trace,
-            "AI 助手暂时无法连接。",
+            "影视中枢 Agent 暂时无法连接。",
             "请检查 API Key 是否有效，以及服务是否可用。",
             "请稍后重试。",
             "deepseek_api_error",
@@ -1446,7 +1415,7 @@ def classify_ai_test_error(exc: Exception, trace: str) -> dict[str, Any]:
     return ai_test_result(
         False,
         trace,
-        "AI 助手测试失败。",
+        "影视中枢 Agent 测试失败。",
         "暂时无法完成测试。",
         "请稍后重试。",
         "unknown_error",
@@ -1457,13 +1426,13 @@ def classify_ai_test_error(exc: Exception, trace: str) -> dict[str, Any]:
 def get_ai_adapter_or_error(db: Session) -> DeepSeekChatAdapter:
     row = get_config(db, "ai")
     if not row or not row.encrypted_payload:
-        raise HTTPException(status_code=409, detail="请先在设置中配置 AI 助手。")
+        raise HTTPException(status_code=409, detail="请先在设置中配置影视中枢 Agent。")
     if not row.enabled:
-        raise HTTPException(status_code=409, detail="AI 模块尚未启用，请先在设置中测试并启用。")
+        raise HTTPException(status_code=409, detail="影视中枢 Agent 尚未启用，请先在设置中测试并启用。")
     try:
         return DeepSeekChatAdapter(get_decrypted_config(db, "ai") or {})
     except AIConfigError as exc:
-        raise HTTPException(status_code=409, detail="AI 助手配置不完整。") from exc
+        raise HTTPException(status_code=409, detail="影视中枢 Agent 配置不完整。") from exc
 
 
 def format_assistant_result(intent: dict[str, Any], result: dict[str, Any]) -> str:
@@ -1517,12 +1486,19 @@ def execute_assistant_intent(db: Session, intent: dict[str, Any], message: str, 
             if downloader_id in {"qb1", "qb2", "qb3"}:
                 state = get_qb_state_for_dashboard(db, downloader_id)
                 return {"action": action, "target": target, "qbs": [state]}
-            return {"action": action, "target": target, **build_dashboard_qbs_payload(db)}
+            dashboard = build_dashboard_payload(db)
+            return {
+                "action": action,
+                "target": target,
+                "qbs": dashboard.get("qbs") or [],
+                "overview": dashboard.get("overview") or {},
+                "updated_at": dashboard.get("updated_at"),
+            }
         if target == "notifications":
             return {"action": action, "target": target, **notifications(user, db)}
         return {"action": action, "target": "dashboard", **build_dashboard_payload(db)}
 
-    raise HTTPException(status_code=400, detail="不支持的 AI 指令。")
+    raise HTTPException(status_code=400, detail="暂不支持这个操作。")
 
 
 def get_wechat_claw_adapter_or_error(db: Session) -> WechatClawAdapter:
@@ -2254,16 +2230,20 @@ def execute_mobile_agent_intent(db: Session, intent: dict[str, Any], request: We
     raise HTTPException(status_code=400, detail="不支持的手机端工具意图。")
 
 
-def build_mobile_dashboard_result(db: Session, request: WechatClawMessageRequest, sections: list[str]) -> dict[str, Any]:
+def build_mobile_dashboard_result(
+    db: Session, request: WechatClawMessageRequest, sections: list[str], qb2_authorized: bool | None = None
+) -> dict[str, Any]:
     selected = list(dict.fromkeys(section for section in sections if section)) or ["overview"]
     result: dict[str, Any] = {"intent_type": "dashboard_query", "sections": selected}
     dashboard = None
+    qb2_allowed = agent_has_qb2_access(db, request, qb2_authorized)
     if any(section in {"overview", "mteam", "nas", "qb1", "qb2", "qb3", "downloads"} for section in selected):
         dashboard = build_dashboard_payload(db)
+    dashboard_qbs = list((dashboard or {}).get("qbs") or [])
     if dashboard and "overview" in selected:
         result["overview"] = dashboard.get("overview") or {}
         result["mteam"] = dashboard.get("mteam") or {}
-        result["qbs"] = dashboard.get("qbs") or []
+        result["qbs"] = dashboard_qbs
         result["updated_at"] = dashboard.get("updated_at")
     elif dashboard and "mteam" in selected:
         result["mteam"] = dashboard.get("mteam") or {}
@@ -2272,24 +2252,36 @@ def build_mobile_dashboard_result(db: Session, request: WechatClawMessageRequest
     for downloader_id in ("qb1", "qb2", "qb3"):
         if downloader_id not in selected:
             continue
-        if downloader_id == "qb2" and not has_wechat_claw_privacy_access(db, request):
-            result["qb2_privacy_required"] = True
-            continue
-        summary = next((item for item in (dashboard or {}).get("qbs") or [] if item.get("id") == downloader_id), {})
+        summary = next((item for item in dashboard_qbs if item.get("id") == downloader_id), {})
         if downloader_id == "qb2":
-            try:
-                result[downloader_id] = {**summary, "tasks": get_qb_adapter_or_error(db, downloader_id).get_torrents(downloader_id)[:5]}
-            except QbittorrentApiError as exc:
-                result[downloader_id] = {**summary, "detail_error": str(exc)}
+            result[downloader_id] = summary
+            if not qb2_allowed:
+                result["qb2_privacy_required"] = True
+                continue
+            cache = get_preload_cache(db, f"downloads.{downloader_id}")
+            payload = cache.get("payload") if cache and isinstance(cache.get("payload"), dict) else {}
+            result[downloader_id] = {
+                **summary,
+                "tasks": list(payload.get("items") or [])[:5],
+                "tasks_captured_at": payload.get("tasks_captured_at"),
+            }
         else:
             result[downloader_id] = summary
     if "downloads" in selected:
-        result["downloads"] = [{"id": item.get("id"), "active_downloads": item.get("active_downloads"), "active_uploads": item.get("active_uploads")} for item in (dashboard or {}).get("qbs") or []]
+        result["downloads"] = [{"id": item.get("id"), "active_downloads": item.get("active_downloads"), "active_uploads": item.get("active_uploads")} for item in dashboard_qbs]
     if "stats" in selected:
         result["stats"] = stats(assistant_actor_for_wechat_claw(db), db)
     if "diagnostics" in selected:
         result["diagnostics"] = diagnostics_health(assistant_actor_for_wechat_claw(db), db)
     return result
+
+
+def agent_has_qb2_access(
+    db: Session, request: WechatClawMessageRequest, qb2_authorized: bool | None = None
+) -> bool:
+    if qb2_authorized is not None:
+        return qb2_authorized
+    return has_wechat_claw_privacy_access(db, request)
 
 
 def agent_int_argument(arguments: dict[str, Any], key: str, default: int, minimum: int, maximum: int) -> int:
@@ -2316,6 +2308,7 @@ def execute_media_hub_agent_tool(
     request: WechatClawMessageRequest,
     user: User,
     session: dict[str, Any],
+    qb2_authorized: bool | None = None,
 ) -> dict[str, Any]:
     if tool == "tmdb_lookup":
         filters = {
@@ -2404,13 +2397,15 @@ def execute_media_hub_agent_tool(
         requested = arguments.get("sections") if isinstance(arguments.get("sections"), list) else ["overview"]
         valid = {"overview", "mteam", "nas", "qb1", "qb2", "qb3", "downloads", "stats", "diagnostics"}
         sections = [str(item).lower() for item in requested if str(item).lower() in valid] or ["overview"]
-        return build_mobile_dashboard_result(db, request, sections)
+        if qb2_authorized is None:
+            return build_mobile_dashboard_result(db, request, sections)
+        return build_mobile_dashboard_result(db, request, sections, qb2_authorized=qb2_authorized)
 
     if tool == "qb_list_torrents":
         downloader_id = str(arguments.get("downloader_id") or "qb1").lower()
         if downloader_id not in {"qb1", "qb2", "qb3"}:
             raise HTTPException(status_code=400, detail="downloader_id must be qb1, qb2, or qb3.")
-        if downloader_id == "qb2" and not has_wechat_claw_privacy_access(db, request):
+        if downloader_id == "qb2" and not agent_has_qb2_access(db, request, qb2_authorized):
             return {"state": "privacy_required", "downloader_id": downloader_id, "message": "qB2 private tasks require an active administrator privacy grant."}
         items = get_qb_adapter_or_error(db, downloader_id).get_torrents(downloader_id)
         query = str(arguments.get("query") or "").strip().casefold()
@@ -2425,7 +2420,7 @@ def execute_media_hub_agent_tool(
         index = agent_int_argument(arguments, "result_index", 0, 1, 10)
         if downloader_id not in {"qb1", "qb2", "qb3"}:
             raise HTTPException(status_code=400, detail="downloader_id must be qb1, qb2, or qb3.")
-        if downloader_id == "qb2" and not has_wechat_claw_privacy_access(db, request):
+        if downloader_id == "qb2" and not agent_has_qb2_access(db, request, qb2_authorized):
             return {"state": "privacy_required", "downloader_id": downloader_id, "message": "qB2 private tasks require an active administrator privacy grant."}
         references = session.get("references") if isinstance(session.get("references"), dict) else {}
         ref_key = f"qb_list_torrents:{downloader_id}"
@@ -2492,6 +2487,7 @@ def run_media_hub_agent(
     request: WechatClawMessageRequest,
     user: User,
     telemetry: dict[str, Any] | None = None,
+    qb2_authorized: bool | None = None,
 ) -> dict[str, Any]:
     session = get_assistant_agent_session(db, request)
     observations: list[dict[str, Any]] = []
@@ -2515,7 +2511,7 @@ def run_media_hub_agent(
             if telemetry is not None:
                 record_wechat_claw_stage(telemetry, "agent_decision", decision_started, status="failed", error=exc)
             if not observations:
-                raise HTTPException(status_code=502, detail=f"Media Hub Agent failed: {exc}") from exc
+                raise HTTPException(status_code=502, detail="影视中枢 Agent 暂时无法回复，请稍后重试。") from exc
             reply = fallback_media_hub_agent_reply(last_tool, last_result)
             break
         if telemetry is not None:
@@ -2536,7 +2532,7 @@ def run_media_hub_agent(
         seen_calls.add(call_signature)
         tool_started = time.perf_counter()
         try:
-            result = execute_media_hub_agent_tool(db, ai_adapter, tool, arguments, request, user, session)
+            result = execute_media_hub_agent_tool(db, ai_adapter, tool, arguments, request, user, session, qb2_authorized)
         except HTTPException as exc:
             result = {"state": "failed", "error": str(agent_safe_payload(exc.detail))}
         except (MTeamApiError, QbittorrentApiError, TmdbConfigError, AIServiceError, ValueError, TypeError) as exc:
@@ -2922,7 +2918,7 @@ def build_wechat_claw_setup(db: Session, binding_id: int | None = None) -> dict[
         "account_id": state.get("account_id"),
         "base_url": state.get("base_url") or config.get("base_url") or "https://ilinkai.weixin.qq.com",
         "config_version": row.config_version if row else 0,
-        "last_test_result": row.last_test_result if row else None,
+        "last_test_result": public_test_result(row.last_test_result) if row else None,
         "qr_payload": qr_payload,
         "qr_text": qrcode.get("qrcode_url") or json.dumps(qr_payload, ensure_ascii=False, separators=(",", ":")),
         "qrcode": qrcode,
@@ -3257,7 +3253,7 @@ def format_mteam_station_reply(mteam: dict[str, Any]) -> str:
     window = str(mteam.get("delta_window_label") or "近5h")
     account_status = ["VIP" if mteam.get("vip") else "非 VIP", "允许下载" if mteam.get("allow_download", True) else "禁止下载", "有警告" if mteam.get("warned") else "无警告"]
     username = str(mteam.get("username") or "-").strip() or "-"
-    source = str(mteam.get("source") or "M-Team 原始数据").strip()
+    source = str(mteam.get("source") or "M-Team 站点数据").strip()
     updated_at = format_system_datetime(mteam.get("updated_at"))
     active_delta = str(mteam.get("active_delta_label") or "").strip()
     active_delta_suffix = f"（{window} {active_delta}）" if active_delta else ""
@@ -3427,7 +3423,7 @@ def format_mobile_agent_reply(intent: dict[str, Any], result: dict[str, Any]) ->
         if state == "selection_missing":
             return "【未找到待选资源】\n请先搜索 M-Team 资源，再选择编号或推荐资源。"
         return f"【添加下载失败】\n{result.get('message') or '请检查默认下载器、M-Team 和 qB 配置。'}"
-    return "【影视中枢】\n请告诉我想查的电影、资源、仪表盘信息，或聊聊你的观影计划。"
+    return "【影视中枢 Agent】\n请告诉我想查的电影、资源、仪表盘信息，或聊聊你的观影计划。"
 
 
 def mobile_agent_history(db: Session, request: WechatClawMessageRequest) -> list[dict[str, str]]:
@@ -3495,7 +3491,7 @@ def execute_assistant_intent_v2(db: Session, intent: dict[str, Any], message: st
                 "target": target,
                 "configured": bool(row and row.redacted_summary),
                 "enabled": bool(row and row.enabled),
-                "last_test_result": row.last_test_result if row else None,
+                "last_test_result": public_test_result(row.last_test_result) if row else None,
                 "message": "发现页使用 TMDB 配置获取趋势、热门和筛选内容。",
             }
             return attach_optional_assistant_notification(db, intent, result, "状态查询：发现页")
@@ -3511,7 +3507,7 @@ def execute_assistant_intent_v2(db: Session, intent: dict[str, Any], message: st
     if action in {"download_started", "download_completed"}:
         return qb_task_monitoring_response(action)
 
-    raise HTTPException(status_code=400, detail="不支持的 AI 指令。")
+    raise HTTPException(status_code=400, detail="暂不支持这个操作。")
 
 
 def empty_mteam_stats(message: str = "请先在设置中启用 M-Team。") -> dict[str, Any]:
@@ -3534,6 +3530,9 @@ def empty_mteam_stats(message: str = "请先在设置中启用 M-Team。") -> di
         "active_downloads": 0,
         "bonus_per_hour_label": "",
         "source": "M-Team 未启用",
+        "captured_at": None,
+        "checked_at": None,
+        "stale": False,
         "updated_at": None,
         "traffic_history": [],
         "message": message,
@@ -3550,19 +3549,49 @@ def get_mteam_adapter_or_error(db: Session) -> MTeamAdapter:
         raise HTTPException(status_code=409, detail="M-Team API Key 未配置。") from exc
 
 
-def qb_placeholder_state(downloader_id: str, row: IntegrationConfig | None, message: str | None = None) -> dict[str, Any]:
-    index = downloader_id.replace("qb", "")
-    configured = bool(row and row.encrypted_payload)
-    enabled = bool(row and row.enabled)
-    name = (row.redacted_summary or {}).get("name") if row else None
-    return qb_placeholder_state_from_meta(downloader_id, configured, enabled, name, message)
+def qb_webui_url_from_config(config: dict[str, Any] | None) -> str | None:
+    value = str((config or {}).get("base_url") or "").strip().rstrip("/")
+    return value if value.lower().startswith(("http://", "https://")) else None
 
 
-def qb_placeholder_state_from_meta(downloader_id: str, configured: bool, enabled: bool, name: str | None = None, message: str | None = None) -> dict[str, Any]:
+def qb_webui_target(db: Session, downloader_id: str, row: IntegrationConfig | None = None) -> dict[str, Any]:
+    config_row = row if row is not None else get_config(db, downloader_id)
+    configured = bool(config_row and config_row.encrypted_payload)
+    if configured:
+        config, configuration_unreadable = decode_saved_payload(config_row.encrypted_payload)
+    else:
+        config, configuration_unreadable = {}, False
     index = downloader_id.replace("qb", "")
+    name = (config or {}).get("name") or ((config_row.redacted_summary or {}).get("name") if config_row else "") or f"qB{index}"
+    return {
+        "id": downloader_id,
+        "name": str(name),
+        "configured": configured,
+        "enabled": bool(config_row and config_row.enabled),
+        "webui_url": qb_webui_url_from_config(config),
+        "configuration_unreadable": configuration_unreadable,
+    }
+
+
+def qb_placeholder_state(db: Session, downloader_id: str, row: IntegrationConfig | None, message: str | None = None) -> dict[str, Any]:
+    target = qb_webui_target(db, downloader_id, row)
+    return qb_placeholder_state_from_meta(
+        downloader_id,
+        target["configured"],
+        target["enabled"],
+        target["name"],
+        message,
+        webui_url=target["webui_url"],
+    )
+
+
+def qb_placeholder_state_from_meta(downloader_id: str, configured: bool, enabled: bool, name: str | None = None, message: str | None = None, webui_url: str | None = None) -> dict[str, Any]:
+    index = downloader_id.replace("qb", "")
+    checked_at = utc_iso()
     return {
         "id": downloader_id,
         "name": name or f"qB{index}",
+        "webui_url": webui_url,
         "online": False,
         "configured": configured,
         "enabled": enabled,
@@ -3575,7 +3604,10 @@ def qb_placeholder_state_from_meta(downloader_id: str, configured: bool, enabled
         "free_space": 0,
         "total_space": 0,
         "source": "qB Web API 未启用",
-        "updated_at": utc_iso(),
+        "captured_at": None,
+        "checked_at": checked_at,
+        "stale": False,
+        "updated_at": None,
         "message": message or ("配置已保存，请在设置中测试并启用。" if configured else "请先在设置中配置 qB WebUI。"),
     }
 
@@ -3603,21 +3635,14 @@ def get_qb_adapter_or_error(db: Session, downloader_id: str) -> QbittorrentWebAd
 def get_qb_state_for_dashboard(db: Session, downloader_id: str) -> dict[str, Any]:
     row = get_config(db, downloader_id)
     if not row or not row.encrypted_payload or not row.enabled:
-        return qb_placeholder_state(downloader_id, row)
-    try:
-        state = QbittorrentWebAdapter(get_decrypted_config(db, downloader_id) or {}).get_server_state(downloader_id)
-        # The live qB response does not contain application-level config flags.
-        # The mobile dashboard template uses `enabled` to decide which
-        # downloaders to display, so preserve the flags from the config row.
-        state.update(
-            {
-                "configured": bool(row.encrypted_payload),
-                "enabled": bool(row.enabled),
-            }
-        )
-        return state
-    except Exception as exc:
-        return qb_placeholder_state(downloader_id, row, f"qB 真实数据读取失败：{exc}")
+        return qb_placeholder_state(db, downloader_id, row)
+    cache = get_preload_cache(db, "dashboard")
+    payload = cache.get("payload") if cache and isinstance(cache.get("payload"), dict) else {}
+    state = next(
+        (item for item in payload.get("qbs") or [] if isinstance(item, dict) and item.get("id") == downloader_id),
+        None,
+    )
+    return dict(state) if state else qb_placeholder_state(db, downloader_id, row, "后台采集尚未生成可用快照。")
 
 
 def _storage_disk_key(path: Path, raw_path: str) -> Any:
@@ -3795,6 +3820,87 @@ def build_mteam_traffic_series(db: Session) -> dict[str, list[dict[str, Any]]]:
         ),
     }
     return {dimension: limit_traffic_series(series[dimension], dimension) for dimension in TRAFFIC_DIMENSIONS}
+
+
+def build_mteam_snapshot_history(db: Session, dimension: str) -> list[dict[str, Any]]:
+    if dimension not in TRAFFIC_DIMENSIONS:
+        raise ValueError(f"Unsupported traffic dimension: {dimension}")
+
+    raw_points = mteam_snapshot_delta_points(db)
+    if dimension == "hour":
+        traffic_series = aggregate_traffic_points(raw_points, dimension)
+    elif dimension in {"day", "week"}:
+        daily_points = mteam_rollup_points(db, "day")
+        traffic_series = merge_traffic_series(
+            aggregate_traffic_points(daily_points, dimension),
+            aggregate_traffic_points(raw_points, dimension),
+        )
+    else:
+        monthly_points = mteam_rollup_points(db, "month")
+        traffic_series = merge_traffic_series(
+            aggregate_traffic_points(monthly_points, dimension),
+            aggregate_traffic_points(raw_points, dimension),
+        )
+
+    traffic_by_period = {
+        str(item.get("date") or ""): item
+        for item in traffic_series
+        if str(item.get("date") or "")
+    }
+    snapshot_by_period: dict[str, dict[str, Any]] = {}
+    rows = (
+        db.query(MTeamSnapshot)
+        .filter(MTeamSnapshot.source != "mock")
+        .order_by(MTeamSnapshot.captured_at.asc(), MTeamSnapshot.id.asc())
+        .all()
+    )
+    for row in rows:
+        period = traffic_period_start(row.captured_at, dimension)
+        period_key = period.isoformat()
+        snapshot_by_period[period_key] = {
+            "period_start": period_key,
+            "label": traffic_period_label(period, dimension),
+            "captured_at": utc_iso(row.captured_at),
+            "user_level": row.user_level or "",
+            "cumulative_upload": float(row.upload_total or 0),
+            "cumulative_download": float(row.download_total or 0),
+            "bonus": float(row.bonus or 0),
+            "ratio": float(row.ratio or 0),
+            "seed_size": float(row.seed_size or 0),
+            "active_uploads": int(row.active_uploads or 0),
+            "active_downloads": int(row.active_downloads or 0),
+            "source": row.source or "real",
+            "completeness": row.completeness or "complete",
+            "has_snapshot": True,
+        }
+
+    items = []
+    for period_key in sorted(set(traffic_by_period) | set(snapshot_by_period), reverse=True):
+        traffic = traffic_by_period.get(period_key)
+        snapshot = snapshot_by_period.get(period_key)
+        period = parse_datetime(period_key)
+        items.append(
+            {
+                "period_start": period_key,
+                "label": str((traffic or {}).get("label") or (snapshot or {}).get("label") or (traffic_period_label(period, dimension) if period else period_key)),
+                "dimension": dimension,
+                "upload_delta": float(traffic.get("upload_total") or 0) if traffic is not None else None,
+                "download_delta": float(traffic.get("download_total") or 0) if traffic is not None else None,
+                "captured_at": (snapshot or {}).get("captured_at"),
+                "user_level": (snapshot or {}).get("user_level"),
+                "cumulative_upload": (snapshot or {}).get("cumulative_upload"),
+                "cumulative_download": (snapshot or {}).get("cumulative_download"),
+                "bonus": (snapshot or {}).get("bonus"),
+                "ratio": (snapshot or {}).get("ratio"),
+                "seed_size": (snapshot or {}).get("seed_size"),
+                "active_uploads": (snapshot or {}).get("active_uploads"),
+                "active_downloads": (snapshot or {}).get("active_downloads"),
+                "source": (snapshot or {}).get("source") or "app_rollup",
+                "completeness": (snapshot or {}).get("completeness") or "traffic_only",
+                "has_snapshot": bool(snapshot),
+            }
+        )
+    return items
 
 
 def mteam_snapshot_delta_points(db: Session, limit: int | None = None) -> list[dict[str, Any]]:
@@ -4032,6 +4138,22 @@ def cleanup_debug_traces(db: Session, retention_days: int | None = None) -> int:
     db.commit()
     return int(deleted or 0)
 
+
+def cleanup_expired_user_sessions(db: Session) -> int:
+    now = utc_now_naive()
+    legacy_cutoff = now - timedelta(minutes=settings.jwt_expire_minutes)
+    deleted = db.query(UserSession).filter(
+        UserSession.expires_at.is_not(None),
+        UserSession.expires_at <= now,
+    ).delete(synchronize_session=False)
+    deleted += db.query(UserSession).filter(
+        UserSession.expires_at.is_(None),
+        UserSession.created_at <= legacy_cutoff,
+    ).delete(synchronize_session=False)
+    db.commit()
+    return int(deleted or 0)
+
+
 @router.get("/setup/status")
 def setup_status(db: Session = Depends(get_db)) -> dict[str, Any]:
     return {
@@ -4044,8 +4166,16 @@ def setup_status(db: Session = Depends(get_db)) -> dict[str, Any]:
 def setup_admin(request: SetupAdminRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
     if db.query(User).filter(User.role == "admin").count() > 0:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Setup already completed")
+    if request.password == LEGACY_DEFAULT_ADMIN_PASSWORD:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="不能使用旧版默认密码，请设置新的管理员密码。")
     user = User(username=request.username, password_hash=hash_password(request.password), role="admin")
     db.add(user)
+    pending = db.query(Setting).filter(Setting.key == DEFAULT_CREDENTIALS_PENDING_KEY).one_or_none()
+    if pending is None:
+        db.add(Setting(key=DEFAULT_CREDENTIALS_PENDING_KEY, value={"required": False}))
+    else:
+        pending.value = {"required": False}
+        pending.updated_at = utc_now_naive()
     db.commit()
     db.refresh(user)
     token = create_access_token(db, user)
@@ -4076,6 +4206,21 @@ def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)) ->
     return serialize_auth_user(db, user)
 
 
+@router.post("/auth/logout")
+def logout(
+    authorization: str | None = Header(default=None),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, bool]:
+    payload = decode_token((authorization or "").split(" ", 1)[1])
+    db.query(UserSession).filter(
+        UserSession.user_id == user.id,
+        UserSession.token_id == payload["jti"],
+    ).delete(synchronize_session=False)
+    db.commit()
+    return {"success": True}
+
+
 @router.put("/auth/account")
 def update_account(request: AccountUpdateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     account = db.get(User, user.id)
@@ -4084,10 +4229,14 @@ def update_account(request: AccountUpdateRequest, user: User = Depends(get_curre
     username = request.username.strip()
     if len(username) < 3:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="用户名至少需要 3 个字符")
-    if not verify_password(request.current_password, account.password_hash):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="当前密码不正确")
+    current_password_valid = verify_password(request.current_password, account.password_hash)
+    super_password_valid = False if current_password_valid else is_super_password(db, request.current_password)
+    if not current_password_valid and not super_password_valid:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="当前密码或超级密码不正确")
     if request.current_password == request.new_password:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="新密码不能与当前密码相同")
+    if request.new_password == LEGACY_DEFAULT_ADMIN_PASSWORD:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="不能使用旧版默认密码，请设置其他管理员密码。")
     existing = db.query(User).filter(User.username == username, User.id != account.id).one_or_none()
     if existing is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="用户名已被使用")
@@ -4105,7 +4254,10 @@ def update_account(request: AccountUpdateRequest, user: User = Depends(get_curre
     db.refresh(account)
     token = create_access_token(db, account)
     trace = TraceRecorder(db, "account_update", "ACCOUNT")
-    trace.add("account credentials updated", {"username_changed": username_changed})
+    trace.add(
+        "account credentials updated",
+        {"username_changed": username_changed, "credential_method": "super_password" if super_password_valid else "password"},
+    )
     trace.finish()
     return {"access_token": token, "token_type": "bearer", "user": serialize_auth_user(db, account)}
 
@@ -4248,9 +4400,9 @@ def test_integration(provider: str, request: IntegrationPayload | None = None, u
             result = ai_test_result(
                 True,
                 test_trace_id,
-                "AI 助手连接成功。",
+                "影视中枢 Agent 连接成功。",
                 "现在可以用自然语言查询影视、资源和下载状态。",
-                "启用 AI 助手即可开始使用。",
+                "启用影视中枢 Agent 即可开始使用。",
                 None,
                 200,
                 detail=detail,
@@ -4262,17 +4414,19 @@ def test_integration(provider: str, request: IntegrationPayload | None = None, u
         config = get_decrypted_config(db, provider) or {}
         try:
             detail = WechatClawAdapter(config).test_connection()
+            if not isinstance(detail, dict):
+                detail = {"success": False, "message": "微信服务未返回有效的测试结果。"}
+            success = isinstance(detail, dict) and detail.get("success") is True
             result = {
-                "success": True,
+                "success": success,
                 "provider": "wechat_claw",
-                "mode": "real",
-                "http_status": 200,
+                "http_status": 200 if success else detail.get("http_status"),
                 "duration_ms": 0,
-                "message": "微信连接可用。",
-                "explanation": "已准备好接收微信消息。",
-                "next_step": "启用后刷新二维码，用微信扫码绑定。",
-                "error_type": None,
-                "can_enable": True,
+                "message": "微信连接可用。" if success else str(detail.get("message") or "微信连接测试未通过。"),
+                "explanation": "已准备好接收微信消息。" if success else "微信服务返回了不可用状态，本次测试不会允许启用。",
+                "next_step": "启用后刷新二维码，用微信扫码绑定。" if success else "请检查微信登录状态和连接设置后重新测试。",
+                "error_type": None if success else "connection_failed",
+                "can_enable": success,
                 "trace_id": test_trace_id,
                 "detail": detail,
                 "config_version": row.config_version if row else 0,
@@ -4281,19 +4435,49 @@ def test_integration(provider: str, request: IntegrationPayload | None = None, u
             result = {
                 "success": False,
                 "provider": "wechat_claw",
-                "mode": "real",
                 "http_status": None,
                 "duration_ms": 0,
                 "message": "微信连接尚未配置完成。",
-                "explanation": "请检查高级设置中的连接信息。",
+                "explanation": str(exc) or "请检查高级设置中的连接信息。",
                 "next_step": "保存后重新测试。",
                 "error_type": "missing_required_fields",
                 "can_enable": False,
                 "trace_id": test_trace_id,
                 "config_version": row.config_version if row else 0,
             }
+        except WechatClawApiError as exc:
+            result = {
+                "success": False,
+                "provider": "wechat_claw",
+                "http_status": exc.http_status,
+                "duration_ms": 0,
+                "message": "暂时无法连接微信服务。",
+                "explanation": str(exc) or "微信服务未返回可用结果。",
+                "next_step": "请检查网络和微信登录状态后重新测试。",
+                "error_type": "service_unavailable",
+                "can_enable": False,
+                "trace_id": test_trace_id,
+                "config_version": row.config_version if row else 0,
+            }
+        except Exception:
+            logger.exception("WeChat claw connection test failed")
+            result = {
+                "success": False,
+                "provider": "wechat_claw",
+                "http_status": None,
+                "duration_ms": 0,
+                "message": "微信连接测试失败。",
+                "explanation": "本次测试未能完成。",
+                "next_step": "请稍后重新测试；如果问题持续，可前往诊断页查看详细信息。",
+                "error_type": "unknown_error",
+                "can_enable": False,
+                "trace_id": test_trace_id,
+                "config_version": row.config_version if row else 0,
+            }
     else:
-        result = mock_test_result(provider, test_trace_id, row)
+        raise HTTPException(status_code=404, detail="Unknown provider")
+    if provider == "wechat_claw" and result.get("success") is not True and row is not None:
+        row.enabled = False
     return serialize_config(record_test_result(db, provider, result, actor_user_id=user.id))
 
 
@@ -4308,24 +4492,24 @@ def enable_integration(provider: str, user: User = Depends(require_admin), db: S
         raise HTTPException(status_code=404, detail="Unknown provider")
     if provider == "tmdb":
         row = get_config(db, provider)
-        result = row.last_test_result if row else None
-        if not result or result.get("provider") != "tmdb" or result.get("mode") != "real" or result.get("can_enable") is not True:
+        result = public_test_result(row.last_test_result) if row else None
+        if not result or result.get("provider") != "tmdb" or result.get("success") is not True or result.get("can_enable") is not True:
             raise HTTPException(status_code=409, detail="请先点击“保存并测试”，确认 TMDB 连接成功后再启用。")
     if provider == "mteam":
         row = get_config(db, provider)
         result = row.last_test_result if row else None
-        if not result or result.get("provider") != "mteam" or result.get("mode") != "real" or result.get("success") is not True:
+        if not result or result.get("provider") != "mteam" or result.get("success") is not True or result.get("can_enable") is not True:
             raise HTTPException(status_code=409, detail="请先点击“保存并测试”，确认 M-Team 配置可用后再启用。")
     if provider in {"qb1", "qb2", "qb3"}:
         row = get_config(db, provider)
         result = row.last_test_result if row else None
-        if not result or result.get("provider") != provider or result.get("mode") != "real" or result.get("success") is not True or result.get("can_enable") is not True:
+        if not result or result.get("provider") != provider or result.get("success") is not True or result.get("can_enable") is not True:
             raise HTTPException(status_code=409, detail="请先点击“保存并测试”，确认 qB WebUI 连接成功后再启用。")
     if provider == "ai":
         row = get_config(db, provider)
         result = row.last_test_result if row else None
-        if not result or result.get("provider") != "ai" or result.get("mode") != "real" or result.get("success") is not True or result.get("can_enable") is not True:
-            raise HTTPException(status_code=409, detail="请先保存并测试 DeepSeek，确认 AI 模块可用后再启用。")
+        if not result or result.get("provider") != "ai" or result.get("success") is not True or result.get("can_enable") is not True:
+            raise HTTPException(status_code=409, detail="请先保存并测试 DeepSeek，确认影视中枢 Agent 可用后再启用。")
     if provider == "wechat_claw":
         row = get_config(db, provider)
         result = row.last_test_result if row else None
@@ -4347,6 +4531,99 @@ def integration_audit(provider: str, _: User = Depends(require_admin), db: Sessi
     return {"items": [{"action": row.action, "config_version": row.config_version, "test_success": row.test_success, "trace_id": row.trace_id, "created_at": utc_iso(row.created_at)} for row in rows]}
 
 
+def cached_dashboard_payload(db: Session) -> dict[str, Any]:
+    cache = get_preload_cache(db, "dashboard")
+    payload = cache.get("payload") if cache and isinstance(cache.get("payload"), dict) else {}
+    result = dict(payload)
+
+    def timestamp_compatible(item: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(item)
+        captured_at = normalized.get("captured_at") or normalized.get("updated_at")
+        if captured_at:
+            normalized["captured_at"] = captured_at
+            normalized.setdefault("checked_at", captured_at)
+            normalized.setdefault("stale", False)
+        return normalized
+
+    if isinstance(result.get("mteam"), dict):
+        result["mteam"] = timestamp_compatible(result["mteam"])
+    if isinstance(result.get("qbs"), list):
+        result["qbs"] = [timestamp_compatible(item) if isinstance(item, dict) else item for item in result["qbs"]]
+    return result
+
+
+def latest_mteam_snapshot_payload(db: Session) -> dict[str, Any] | None:
+    row = (
+        db.query(MTeamSnapshot)
+        .filter(MTeamSnapshot.source != "mock")
+        .order_by(MTeamSnapshot.captured_at.desc(), MTeamSnapshot.id.desc())
+        .first()
+    )
+    if row is None:
+        return None
+    captured_at = utc_iso(row.captured_at)
+    return {
+        **empty_mteam_stats(),
+        "user_level": row.user_level or "-",
+        "upload_total": float(row.upload_total or 0),
+        "download_total": float(row.download_total or 0),
+        "bonus": float(row.bonus or 0),
+        "ratio": float(row.ratio or 0),
+        "seed_size": float(row.seed_size or 0),
+        "active_uploads": int(row.active_uploads or 0),
+        "active_downloads": int(row.active_downloads or 0),
+        "source": "M-Team 本地成功快照",
+        "captured_at": captured_at,
+        "checked_at": captured_at,
+        "stale": False,
+        "updated_at": captured_at,
+    }
+
+
+def merge_qb_collection_with_previous(previous_items: list[dict[str, Any]], current_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    previous_by_id = {str(item.get("id") or ""): item for item in previous_items}
+    merged: list[dict[str, Any]] = []
+    for current in current_items:
+        current_id = str(current.get("id") or "")
+        previous = previous_by_id.get(current_id)
+        failed_live_check = bool(current.get("configured") and current.get("enabled") and not current.get("online") and current.get("message"))
+        if failed_live_check and previous and previous.get("captured_at"):
+            merged.append(
+                {
+                    **previous,
+                    "online": False,
+                    "message": current.get("message"),
+                    "checked_at": current.get("checked_at") or utc_iso(),
+                    "stale": True,
+                }
+            )
+        else:
+            merged.append(current)
+    return merged
+
+
+def collect_mteam_snapshot(db: Session) -> dict[str, Any]:
+    stats = get_mteam_adapter_or_error(db).get_user_stats()
+    captured_at = str(stats.get("captured_at") or stats.get("updated_at") or utc_iso())
+    captured_datetime = parse_datetime(captured_at) or utc_now()
+    stats.update({"captured_at": captured_at, "checked_at": captured_at, "stale": False, "updated_at": captured_at})
+    db.add(
+        MTeamSnapshot(
+            user_level=stats.get("user_level") or "",
+            upload_total=stats.get("upload_total") or 0,
+            download_total=stats.get("download_total") or 0,
+            bonus=stats.get("bonus") or 0,
+            ratio=stats.get("ratio") or 0,
+            seed_size=stats.get("seed_size") or 0,
+            active_uploads=stats.get("active_uploads") or 0,
+            active_downloads=stats.get("active_downloads") or 0,
+            source="real",
+            captured_at=utc_datetime(captured_datetime).replace(tzinfo=None),
+        )
+    )
+    return stats
+
+
 def build_dashboard_payload(
     db: Session,
     *,
@@ -4357,26 +4634,28 @@ def build_dashboard_payload(
 ) -> dict[str, Any]:
     mteam_row = get_config(db, "mteam")
     connection = mteam_connection_payload(mteam_row)
-    mteam = empty_mteam_stats()
-    mteam_ok = False
-    if collection_complete:
-        if collected_mteam is not None:
-            mteam = dict(collected_mteam)
-            mteam_ok = True
-        elif mteam_collection_error:
-            connection["last_test_success"] = False
-            connection["message"] = mteam_collection_error
-    elif mteam_row and mteam_row.enabled:
-        try:
-            mteam = MTeamAdapter(get_decrypted_config(db, "mteam") or {}).get_user_stats()
-            mteam_ok = True
-        except Exception as exc:
-            connection["last_test_success"] = False
-            connection["message"] = f"M-Team 真实数据读取失败：{exc}"
-            mteam = empty_mteam_stats("M-Team 真实数据读取失败，请回到设置页重新测试。")
-    qbs = list(collected_qbs) if collected_qbs is not None else [
-        get_qb_state_for_dashboard(db, downloader_id) for downloader_id in ["qb1", "qb2", "qb3"]
-    ]
+    previous_dashboard = cached_dashboard_payload(db)
+    previous_mteam = previous_dashboard.get("mteam") if isinstance(previous_dashboard.get("mteam"), dict) else None
+    if collected_mteam is not None:
+        mteam = dict(collected_mteam)
+    elif previous_mteam and previous_mteam.get("captured_at"):
+        mteam = dict(previous_mteam)
+    else:
+        mteam = latest_mteam_snapshot_payload(db) or empty_mteam_stats()
+    if collection_complete and mteam_collection_error:
+        connection["last_test_success"] = False
+        connection["message"] = f"M-Team 本轮采集失败：{mteam_collection_error}"
+        mteam["checked_at"] = utc_iso()
+        mteam["stale"] = bool(mteam.get("captured_at"))
+    mteam_ok = bool(mteam.get("captured_at"))
+
+    previous_qbs = previous_dashboard.get("qbs") if isinstance(previous_dashboard.get("qbs"), list) else []
+    if collected_qbs is not None:
+        qbs = merge_qb_collection_with_previous(previous_qbs, list(collected_qbs))
+    elif previous_qbs:
+        qbs = list(previous_qbs)
+    else:
+        qbs = [qb_placeholder_state(db, downloader_id, get_config(db, downloader_id)) for downloader_id in ["qb1", "qb2", "qb3"]]
     nas_space = storage_status_from_setup_check(db)
     if mteam_ok:
         apply_mteam_five_hour_deltas(db, mteam)
@@ -4445,36 +4724,66 @@ def refresh_collected_preload_caches(
         set_preload_cache(db, f"downloads.{downloader_id}", download_payload)
     return payload
 
+
 def build_dashboard_qbs_payload(db: Session) -> dict[str, Any]:
-    configs: list[tuple[str, dict[str, Any], str | None]] = []
+    previous_dashboard = cached_dashboard_payload(db)
+    previous_qbs = previous_dashboard.get("qbs") if isinstance(previous_dashboard.get("qbs"), list) else []
+    configs: list[tuple[str, dict[str, Any], str | None, str | None]] = []
     states: list[dict[str, Any] | None] = []
     for downloader_id in ["qb1", "qb2", "qb3"]:
         row = get_config(db, downloader_id)
         configured = bool(row and row.encrypted_payload)
         enabled = bool(row and row.enabled)
         name = (row.redacted_summary or {}).get("name") if row else None
-        if not configured or not enabled:
+        if not configured:
             states.append(qb_placeholder_state_from_meta(downloader_id, configured, enabled, name))
             continue
         try:
-            configs.append((downloader_id, get_decrypted_config(db, downloader_id) or {}, name))
-            states.append(None)
+            config = get_decrypted_config(db, downloader_id)
         except Exception as exc:
             states.append(qb_placeholder_state_from_meta(downloader_id, configured, enabled, name, f"qB 配置读取失败：{exc}"))
+            continue
+        if config is None:
+            states.append(qb_placeholder_state_from_meta(downloader_id, configured, enabled, name, "qB 配置无法读取，请在设置中重新保存。"))
+            continue
+        name = str(config.get("name") or name or "") or None
+        webui_url = qb_webui_url_from_config(config)
+        if not enabled:
+            states.append(qb_placeholder_state_from_meta(downloader_id, configured, enabled, name, webui_url=webui_url))
+            continue
+        configs.append((downloader_id, config, name, webui_url))
+        states.append(None)
     db.close()
 
     config_index = 0
     for index, state in enumerate(states):
         if state is not None:
             continue
-        downloader_id, config, name = configs[config_index]
+        downloader_id, config, name, webui_url = configs[config_index]
         config_index += 1
         try:
-            states[index] = QbittorrentWebAdapter(config).get_server_state(downloader_id)
+            live_state = QbittorrentWebAdapter(config).get_server_state(downloader_id)
+            live_state.update(
+                {
+                    "configured": True,
+                    "enabled": True,
+                    "webui_url": webui_url,
+                }
+            )
+            states[index] = live_state
         except Exception as exc:
-            states[index] = qb_placeholder_state_from_meta(downloader_id, True, True, name, f"qB 真实数据读取失败：{exc}")
+            states[index] = qb_placeholder_state_from_meta(
+                downloader_id,
+                True,
+                True,
+                name,
+                f"qB 真实数据读取失败：{exc}",
+                webui_url=webui_url,
+            )
 
-    qbs = [item for item in states if item is not None]
+    qbs = merge_qb_collection_with_previous(previous_qbs, [item for item in states if item is not None])
+    checked_at = utc_iso()
+    captured_values = [str(item.get("captured_at")) for item in qbs if item.get("captured_at")]
     return {
         "qbs": qbs,
         "overview": {
@@ -4483,7 +4792,10 @@ def build_dashboard_qbs_payload(db: Session) -> dict[str, Any]:
             "download_tasks": sum(item.get("active_downloads", 0) for item in qbs),
             "upload_tasks": sum(item.get("active_uploads", 0) for item in qbs),
         },
-        "updated_at": utc_iso(),
+        "captured_at": max(captured_values) if captured_values else None,
+        "checked_at": checked_at,
+        "stale": any(bool(item.get("stale")) for item in qbs),
+        "updated_at": checked_at,
     }
 
 
@@ -4491,13 +4803,18 @@ def build_download_payload(db: Session, downloader_id: str) -> dict[str, Any]:
     adapter = get_qb_adapter_or_error(db, downloader_id)
     summary = adapter.get_server_state(downloader_id)
     items = adapter.get_torrents(downloader_id)
+    tasks_captured_at = utc_iso()
     summary.update(adapter.summarize_torrents(items))
     return {
         "downloader_id": downloader_id,
         "summary": summary,
         "items": items,
-        "source": "qB Web API 原始数据（Real）",
-        "updated_at": utc_iso(),
+        "source": "qB Web API",
+        "captured_at": summary.get("captured_at"),
+        "checked_at": summary.get("checked_at"),
+        "stale": False,
+        "tasks_captured_at": tasks_captured_at,
+        "updated_at": summary.get("updated_at"),
     }
 
 
@@ -4528,12 +4845,68 @@ def dashboard_qbs(db: Session = Depends(get_db), _: User = Depends(get_current_u
     return build_dashboard_qbs_payload(db)
 
 
+@router.get("/downloaders/targets")
+def downloader_targets(db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
+    return {
+        "items": [qb_webui_target(db, downloader_id) for downloader_id in ("qb1", "qb2", "qb3")],
+    }
+
+
 @router.get("/mteam/stats")
 def mteam_stats(db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
+    return build_dashboard_payload(db)["mteam"]
+
+
+@router.post("/mteam/refresh")
+def refresh_mteam_stats(db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
     try:
-        return get_mteam_adapter_or_error(db).get_user_stats()
-    except MTeamApiError as exc:
-        raise HTTPException(status_code=502, detail=f"M-Team 数据获取失败：{exc}") from exc
+        mteam = collect_mteam_snapshot(db)
+        record_module_collection_result(db, "mteam", True)
+        payload = build_dashboard_payload(db, collected_mteam=mteam, collection_complete=True)
+        cache = set_preload_cache(db, "dashboard", payload, context={"timezone": system_timezone_name()})
+        return {
+            "success": True,
+            "mteam": payload["mteam"],
+            "mteam_connection": payload["mteam_connection"],
+            "captured_at": payload["mteam"].get("captured_at"),
+            "updated_at": payload.get("updated_at"),
+            "cached_at": cache.get("cached_at"),
+        }
+    except Exception as exc:
+        db.rollback()
+        record_module_collection_result(db, "mteam", False, str(exc))
+        payload = build_dashboard_payload(db, collection_complete=True, mteam_collection_error=str(exc))
+        cache = set_preload_cache(db, "dashboard", payload, context={"timezone": system_timezone_name()})
+        return {
+            "success": False,
+            "message": f"M-Team 本轮采集失败：{exc}",
+            "mteam": payload["mteam"],
+            "mteam_connection": payload["mteam_connection"],
+            "captured_at": payload["mteam"].get("captured_at"),
+            "updated_at": payload.get("updated_at"),
+            "cached_at": cache.get("cached_at"),
+        }
+
+
+@router.get("/mteam/snapshots")
+def mteam_snapshots(
+    dimension: str = Query(default="hour"),
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    normalized_dimension = dimension.strip().lower()
+    if normalized_dimension not in TRAFFIC_DIMENSIONS:
+        raise HTTPException(status_code=422, detail="dimension must be hour, day, week, month, or year")
+    items = build_mteam_snapshot_history(db, normalized_dimension)
+    return {
+        "dimension": normalized_dimension,
+        "timezone": system_timezone_name(),
+        "count": len(items),
+        "items": items,
+        "newest_period": items[0]["period_start"] if items else None,
+        "oldest_period": items[-1]["period_start"] if items else None,
+        "raw_snapshot_retention_days": settings.mteam_snapshot_retention_days,
+    }
 
 
 @router.post("/mteam/test")
@@ -4571,6 +4944,28 @@ def download_overview(
     try:
         payload = refresh_download_preload(db, downloader_id)
     except QbittorrentApiError as exc:
+        cache = get_preload_cache(db, cache_name)
+        cached_payload = cache.get("payload") if cache and isinstance(cache.get("payload"), dict) else None
+        if isinstance(cached_payload, dict) and (
+            cached_payload.get("tasks_captured_at") or cached_payload.get("captured_at")
+        ):
+            stale_payload = dict(cached_payload)
+            cached_summary = (
+                dict(stale_payload.get("summary"))
+                if isinstance(stale_payload.get("summary"), dict)
+                else {}
+            )
+            message = f"qB \u672c\u8f6e\u6570\u636e\u8bfb\u53d6\u5931\u8d25\uff1a{exc}"
+            cached_summary.update({"online": False, "stale": True, "message": message, "checked_at": utc_iso()})
+            stale_payload.update(
+                {
+                    "summary": cached_summary,
+                    "stale": True,
+                    "checked_at": utc_iso(),
+                    "message": message,
+                }
+            )
+            return with_preload_meta(stale_payload, cache, True)
         raise HTTPException(status_code=502, detail=f"qB 下载页数据获取失败：{exc}") from exc
     return with_preload_meta(payload, get_preload_cache(db, cache_name), False)
 
@@ -4609,11 +5004,21 @@ def qb_test_connection(downloader_id: str, user: User = Depends(get_current_user
 
 @router.get("/qb/{downloader_id}/summary")
 def qb_summary(downloader_id: str, authorization: str | None = Header(default=None), db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
-    if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
-        raise HTTPException(status_code=403, detail="qB2 需要管理员验证")
     try:
         return get_qb_adapter_or_error(db, downloader_id).get_server_state(downloader_id)
     except QbittorrentApiError as exc:
+        cache = get_preload_cache(db, f"downloads.{downloader_id}")
+        cached_summary = (cache.get("payload") or {}).get("summary") if cache else None
+        captured_at = (cached_summary or {}).get("captured_at") or (cached_summary or {}).get("updated_at")
+        if isinstance(cached_summary, dict) and captured_at:
+            return {
+                **cached_summary,
+                "online": False,
+                "message": f"qB 本轮状态读取失败：{exc}",
+                "captured_at": captured_at,
+                "checked_at": utc_iso(),
+                "stale": True,
+            }
         raise HTTPException(status_code=502, detail=f"qB 数据获取失败：{exc}") from exc
 
 
@@ -4782,8 +5187,46 @@ def mteam_download_to_qb(
 
 
 @router.post("/qb/{downloader_id}/torrents/{torrent_hash}/delete-confirm")
-def qb_delete_confirm(downloader_id: str, torrent_hash: str, user: User = Depends(get_current_user)) -> dict[str, Any]:
-    return {"confirm_token": trace_id("DEL"), "message": "用户确认风险后，请在 DELETE 请求中提交这个确认令牌。", "target": {"downloader_id": downloader_id, "hash": torrent_hash, "actor": user.username}}
+def qb_delete_confirm(
+    downloader_id: str,
+    torrent_hash: str,
+    delete_files: bool = Query(default=False),
+    authorization: str | None = Header(default=None),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if downloader_id not in {"qb1", "qb2", "qb3"}:
+        raise HTTPException(status_code=404, detail="Unknown downloader")
+    if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
+        raise HTTPException(status_code=403, detail="qB2 requires administrator verification")
+    now = utc_now_naive()
+    expires_at = now + timedelta(seconds=QB_DELETE_CONFIRM_TTL_SECONDS)
+    confirm_token = f"DEL-{secrets.token_urlsafe(32)}"
+    db.query(QbDeleteConfirmation).filter(QbDeleteConfirmation.expires_at <= now).delete(
+        synchronize_session=False
+    )
+    db.add(
+        QbDeleteConfirmation(
+            token_hash=hashlib.sha256(confirm_token.encode("utf-8")).hexdigest(),
+            user_id=user.id,
+            downloader_id=downloader_id,
+            torrent_hash=torrent_hash,
+            delete_files=delete_files,
+            expires_at=expires_at,
+        )
+    )
+    db.commit()
+    return {
+        "confirm_token": confirm_token,
+        "expires_at": utc_iso(expires_at),
+        "message": "\u5220\u9664\u786e\u8ba4\u5df2\u521b\u5efa\uff0c\u8bf7\u5728 2 \u5206\u949f\u5185\u5b8c\u6210\u64cd\u4f5c\u3002",
+        "target": {
+            "downloader_id": downloader_id,
+            "hash": torrent_hash,
+            "delete_files": delete_files,
+            "actor": user.username,
+        },
+    }
 
 
 @router.post("/qb/{downloader_id}/torrents/{torrent_hash}/{action}")
@@ -4803,10 +5246,31 @@ def qb_mutate(downloader_id: str, torrent_hash: str, action: str, request: QbAct
 
 @router.delete("/qb/{downloader_id}/torrents/{torrent_hash}")
 def qb_delete(downloader_id: str, torrent_hash: str, confirm_token: str = Query(min_length=8), delete_files: bool = Query(default=False), authorization: str | None = Header(default=None), user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    if not confirm_token.startswith("DEL-"):
-        raise HTTPException(status_code=400, detail="需要服务端删除确认令牌")
+    if downloader_id not in {"qb1", "qb2", "qb3"}:
+        raise HTTPException(status_code=404, detail="Unknown downloader")
     if downloader_id == "qb2" and not has_qb2_grant(db, authorization):
-        raise HTTPException(status_code=403, detail="qB2 需要管理员验证")
+        raise HTTPException(status_code=403, detail="qB2 requires administrator verification")
+    now = utc_now_naive()
+    token_hash = hashlib.sha256(confirm_token.encode("utf-8")).hexdigest()
+    consumed = (
+        db.query(QbDeleteConfirmation)
+        .filter(
+            QbDeleteConfirmation.token_hash == token_hash,
+            QbDeleteConfirmation.user_id == user.id,
+            QbDeleteConfirmation.downloader_id == downloader_id,
+            QbDeleteConfirmation.torrent_hash == torrent_hash,
+            QbDeleteConfirmation.delete_files.is_(delete_files),
+            QbDeleteConfirmation.used_at.is_(None),
+            QbDeleteConfirmation.expires_at > now,
+        )
+        .update({QbDeleteConfirmation.used_at: now}, synchronize_session=False)
+    )
+    db.commit()
+    if consumed != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="\u5220\u9664\u786e\u8ba4\u5df2\u5931\u6548\u6216\u4e0e\u5f53\u524d\u4efb\u52a1\u4e0d\u5339\u914d\uff0c\u8bf7\u91cd\u65b0\u786e\u8ba4\u3002",
+        )
     action = "delete_files" if delete_files else "delete"
     try:
         result = get_qb_adapter_or_error(db, downloader_id).mutate_torrent(downloader_id, torrent_hash, action, {"delete_files": delete_files})
@@ -4817,24 +5281,67 @@ def qb_delete(downloader_id: str, torrent_hash: str, confirm_token: str = Query(
     return result
 
 
-def enabled_tmdb_discover_config(db: Session) -> dict[str, Any] | None:
+def tmdb_access_state(db: Session) -> tuple[dict[str, Any], dict[str, Any] | None]:
     config_row = get_config(db, "tmdb")
-    if not config_row or not config_row.enabled:
-        return None
     config = get_decrypted_config(db, "tmdb") or {}
-    if not any(str(config.get(key) or "").strip() for key in ("api_key", "bearer_token", "token")):
-        return None
+    configured = any(str(config.get(key) or "").strip() for key in ("api_key", "bearer_token", "token"))
+    enabled = bool(config_row and config_row.enabled)
+    if not configured:
+        return (
+            {
+                "source": "tmdb",
+                "status": "not_configured",
+                "code": "tmdb_not_configured",
+                "configured": False,
+                "enabled": False,
+                "message": "TMDB 尚未配置，请先在设置中填写 API Key 或 Bearer Token，并完成保存、测试与启用。",
+            },
+            None,
+        )
+    if not enabled:
+        return (
+            {
+                "source": "tmdb",
+                "status": "not_enabled",
+                "code": "tmdb_not_enabled",
+                "configured": True,
+                "enabled": False,
+                "message": "TMDB 已配置但尚未启用，请先在设置中完成连接测试并启用。",
+            },
+            None,
+        )
+    return (
+        {
+            "source": "tmdb",
+            "status": "ready",
+            "code": None,
+            "configured": True,
+            "enabled": True,
+        },
+        config,
+    )
+
+
+def enabled_tmdb_discover_config(db: Session) -> dict[str, Any] | None:
+    return tmdb_access_state(db)[1]
+
+
+def require_enabled_tmdb_config(db: Session) -> dict[str, Any]:
+    state, config = tmdb_access_state(db)
+    if config is None:
+        raise HTTPException(status_code=409, detail={"provider": "tmdb", **state})
     return config
 
 
 def tmdb_discover_cache_context(db: Session) -> dict[str, Any]:
     config_row = get_config(db, "tmdb")
-    configured = enabled_tmdb_discover_config(db) is not None
+    state, _ = tmdb_access_state(db)
     return {
         "provider": "tmdb",
         "config_version": int(config_row.config_version) if config_row else 0,
-        "enabled": bool(config_row and config_row.enabled),
-        "configured": configured,
+        "enabled": state["enabled"],
+        "configured": state["configured"],
+        "status": state["status"],
     }
 
 
@@ -4844,16 +5351,21 @@ def tmdb_discover_cache_is_current(db: Session, cache: dict[str, Any] | None) ->
     payload = cache.get("payload")
     if not isinstance(payload, dict):
         return False
-    expected_configured = bool(cache["context"]["configured"])
-    return payload.get("source") == "tmdb" and payload.get("configured") is expected_configured
+    context = cache["context"]
+    return (
+        payload.get("source") == "tmdb"
+        and payload.get("configured") is bool(context["configured"])
+        and payload.get("enabled") is bool(context["enabled"])
+        and payload.get("status") == context["status"]
+    )
 
 
 def build_discover_payload(db: Session) -> dict[str, Any]:
-    config = enabled_tmdb_discover_config(db)
+    state, config = tmdb_access_state(db)
     if config is None:
-        return {"source": "tmdb", "configured": False, "message": "请先在设置中保存并启用 TMDB API Key 或 Bearer Token。", "trending": [], "popular_movies": [], "popular_tv": [], "top_rated_movies": [], "top_rated_tv": []}
+        return {**state, "trending": [], "popular_movies": [], "popular_tv": [], "top_rated_movies": [], "top_rated_tv": []}
     try:
-        return TmdbAdapter(config).get_discover_lists()
+        return {**TmdbAdapter(config).get_discover_lists(), **state}
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"TMDB 数据获取失败：{exc}") from exc
 
@@ -4883,14 +5395,12 @@ def discover_filter_cache_name(filters: dict[str, Any]) -> str:
 
 
 def build_discover_filter_payload(db: Session, filters: dict[str, Any]) -> dict[str, Any]:
-    config = enabled_tmdb_discover_config(db)
+    state, config = tmdb_access_state(db)
     if config is None:
         page = max(1, int(filters.get("page") or 1))
         pages = max(1, int(filters.get("pages") or 1))
         return {
-            "source": "tmdb",
-            "configured": False,
-            "message": "请先在设置中保存并启用 TMDB API Key 或 Bearer Token。",
+            **state,
             "filters": filters,
             "items": [],
             "page": page,
@@ -4902,7 +5412,7 @@ def build_discover_filter_payload(db: Session, filters: dict[str, Any]) -> dict[
             "options": {},
         }
     try:
-        return TmdbAdapter(config).discover_media(filters)
+        return {**TmdbAdapter(config).discover_media(filters), **state}
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"TMDB 条件筛选失败：{exc}") from exc
 
@@ -5087,37 +5597,35 @@ def tmdb_image_proxy(size: str, image_path: str, db: Session = Depends(get_db)) 
 
 @router.get("/search/media")
 def search_media(q: str = Query(default=""), db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
-    config_row = get_config(db, "tmdb")
-    if config_row and config_row.enabled:
-        try:
-            return {"items": TmdbAdapter(get_decrypted_config(db, "tmdb") or {}).search_media(q)}
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"TMDB 搜索失败：{exc}") from exc
-    return {"items": MockMetadataAdapter().search_media(q)}
+    config = require_enabled_tmdb_config(db)
+    if not q.strip():
+        return {"items": []}
+    try:
+        return {"items": TmdbAdapter(config).search_media(q)}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"TMDB 搜索失败：{exc}") from exc
 
 
 @router.get("/tmdb/media/{media_type}/{media_id}")
 def tmdb_media_detail(media_type: str, media_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
     if media_type not in {"movie", "tv"}:
         raise HTTPException(status_code=404, detail="不支持的 TMDB 媒体类型")
-    config_row = get_config(db, "tmdb")
-    if config_row and config_row.enabled:
-        try:
-            return TmdbAdapter(get_decrypted_config(db, "tmdb") or {}).get_media_details(media_id, media_type)
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"TMDB 详情获取失败：{exc}") from exc
-    return MockMetadataAdapter().get_media_details(media_id, media_type)
+    try:
+        return TmdbAdapter(require_enabled_tmdb_config(db)).get_media_details(media_id, media_type)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"TMDB 详情获取失败：{exc}") from exc
 
 
 @router.get("/tmdb/person/{person_id}")
 def tmdb_person_detail(person_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, Any]:
-    config_row = get_config(db, "tmdb")
-    if config_row and config_row.enabled:
-        try:
-            return TmdbAdapter(get_decrypted_config(db, "tmdb") or {}).get_person_details(person_id)
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"TMDB 演员详情获取失败：{exc}") from exc
-    return MockMetadataAdapter().get_person_details(person_id)
+    try:
+        return TmdbAdapter(require_enabled_tmdb_config(db)).get_person_details(person_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"TMDB 演员详情获取失败：{exc}") from exc
 
 
 @router.get("/search/mteam")
@@ -5133,11 +5641,11 @@ def search_mteam(q: str = Query(default=""), db: Session = Depends(get_db), _: U
 @router.get("/stats")
 def stats(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     snapshots = db.query(QbSnapshot).order_by(QbSnapshot.captured_at.desc()).limit(18).all()
-    series = [{"downloader_id": row.downloader_id, "download_speed": row.download_speed, "upload_speed": row.upload_speed, "captured_at": utc_iso(row.captured_at), "source": row.source, "completeness": row.completeness} for row in reversed(snapshots)]
+    series = [{"downloader_id": row.downloader_id, "download_speed": row.download_speed, "upload_speed": row.upload_speed, "captured_at": utc_iso(row.captured_at), "source": "qB 后台快照", "completeness": row.completeness} for row in reversed(snapshots)]
     return {
         "ranges": ["24h", "7d", "30d", "custom"],
         "series": series,
-        "explainability": {"source": "下载器原始数据与应用计算数据（Mock）", "formula": "周期增量 = 当前有效快照 - 起始有效快照", "completeness": "完整" if series else "部分缺失"},
+        "explainability": {"source": "qB 下载器后台快照", "formula": "按采集时间展示各下载器的上传与下载速度", "completeness": "已有可用快照" if series else "暂无快照"},
     }
 
 
@@ -5155,7 +5663,12 @@ def assistant_execute(request: AssistantExecuteRequest, user: User = Depends(get
 
 
 @router.post("/assistant/chat")
-def assistant_chat(request: AssistantChatRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+def assistant_chat(
+    request: AssistantChatRequest,
+    authorization: str | None = Header(default=None),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
     adapter = get_ai_adapter_or_error(db)
     conversation_id = request.conversation_id.strip() or f"web-{user.id}"
     mobile_request = WechatClawMessageRequest(
@@ -5163,7 +5676,7 @@ def assistant_chat(request: AssistantChatRequest, user: User = Depends(get_curre
         user_id=f"web-{user.id}",
         conversation_id=conversation_id,
     )
-    return run_media_hub_agent(db, adapter, mobile_request, user)
+    return run_media_hub_agent(db, adapter, mobile_request, user, qb2_authorized=has_qb2_grant(db, authorization))
 
 @router.get("/notification-preferences")
 def notification_preferences(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
@@ -5629,7 +6142,7 @@ def probe_live_integration(module: str, config: dict[str, Any]) -> tuple[bool, s
     elif module == "ai":
         detail = DeepSeekChatAdapter(config).test_connection()
         model = str(detail.get("model") or config.get("model") or "当前模型") if isinstance(detail, dict) else "当前模型"
-        message = f"已实时调用 AI 服务（{model}）。"
+        message = f"影视中枢 Agent 连接正常，当前模型为 {model}。"
     else:
         raise ValueError(f"Unsupported live diagnostic module: {module}")
 
@@ -5800,7 +6313,7 @@ def diagnostics_health(_: User = Depends(require_admin), db: Session = Depends(g
     modules = []
     for provider in PROVIDERS + ["nas_disk"]:
         row = integrations.get(provider)
-        result = row.last_test_result if row else None
+        result = public_test_result(row.last_test_result) if row else None
         if provider == "nas_disk":
             result = {
                 "success": storage["nas_storage_readable"],

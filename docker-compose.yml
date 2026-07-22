@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: pt-media-hub:0.1.0-mvp
+    image: pt-media-hub:1.0.0
     environment:
       APP_RUNTIME_PROFILE: nas
       APP_DATA_DIR: /data

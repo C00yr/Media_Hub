@@ -1,8 +1,11 @@
 frontend/node_modules
 frontend/dist
 backend/.pytest_cache
+backend/.venv
+backend/*.egg-info
 backend/__pycache__
 backend/**/__pycache__
+backend/**/*.pyc
 backend/pytest-cache-files-*
 pytest-cache-files-*
 data
@@ -11,6 +14,9 @@ data
 !.env.example
 .tmp-*
 .tmp-*/
+.agents
+.npm-cache
+.pnpm-store
 _exports
 deploy-packages
 cloudflare

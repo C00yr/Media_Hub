@@ -26,6 +26,15 @@ def auth_headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def admin_token() -> str:
+    login = client.post("/api/auth/login", json={"username": "admin", "password": "password123"})
+    if login.status_code == 200:
+        return login.json()["access_token"]
+    created = client.post("/api/setup/admin", json={"username": "admin", "password": "password123"})
+    assert created.status_code == 200
+    return created.json()["access_token"]
+
+
 def test_tmdb_missing_credentials_feedback():
     result = classify_tmdb_test_error(TmdbConfigError("missing"), "CFGTEST-1")
     assert result["success"] is False
@@ -464,24 +473,16 @@ def test_tmdb_image_proxy_returns_placeholder_when_upstream_fails(monkeypatch, t
 
 
 def test_cached_discover_does_not_schedule_immediate_refresh(monkeypatch):
-    created = client.post("/api/setup/admin", json={"username": "admin", "password": "password123"})
-    if created.status_code == 200:
-        token = created.json()["access_token"]
-    else:
-        login = client.post("/api/auth/login", json={"username": "admin", "password": "password123"})
-        if login.status_code != 200:
-            login = client.post("/api/auth/login", json={"username": "admin", "password": "adminadmin"})
-        token = login.json()["access_token"]
+    token = admin_token()
 
     db = SessionLocal()
     try:
-        configured = routes.enabled_tmdb_discover_config(db) is not None
+        state, _ = routes.tmdb_access_state(db)
         routes.set_preload_cache(
             db,
             "discover",
             {
-                "source": "tmdb",
-                "configured": configured,
+                **state,
                 "trending": [],
                 "popular_movies": [],
                 "popular_tv": [],
@@ -504,11 +505,26 @@ def test_cached_discover_does_not_schedule_immediate_refresh(monkeypatch):
 
 
 def test_discover_filter_without_tmdb_never_returns_mock_items(monkeypatch):
-    monkeypatch.setattr(routes, "enabled_tmdb_discover_config", lambda _db: None)
+    monkeypatch.setattr(
+        routes,
+        "tmdb_access_state",
+        lambda _db: (
+            {
+                "source": "tmdb",
+                "status": "not_configured",
+                "code": "tmdb_not_configured",
+                "configured": False,
+                "enabled": False,
+                "message": "TMDB 尚未配置。",
+            },
+            None,
+        ),
+    )
 
     result = routes.build_discover_filter_payload(None, routes.default_discover_filter())
 
     assert result["source"] == "tmdb"
+    assert result["status"] == "not_configured"
     assert result["configured"] is False
     assert result["items"] == []
     assert result["next_page"] is None
@@ -526,15 +542,8 @@ def test_non_tmdb_adapters_disable_environment_proxy(monkeypatch):
         assert "ProxyHandler" not in handler_names
 
 
-def test_tmdb_enable_requires_real_success():
-    created = client.post("/api/setup/admin", json={"username": "admin", "password": "password123"})
-    if created.status_code == 200:
-        token = created.json()["access_token"]
-    else:
-        login = client.post("/api/auth/login", json={"username": "admin", "password": "password123"})
-        if login.status_code != 200:
-            login = client.post("/api/auth/login", json={"username": "admin", "password": "adminadmin"})
-        token = login.json()["access_token"]
+def test_tmdb_enable_requires_successful_connection_test():
+    token = admin_token()
 
     saved = client.put(
         "/api/admin/integrations/tmdb",
@@ -547,3 +556,51 @@ def test_tmdb_enable_requires_real_success():
 
     enabled = client.post("/api/admin/integrations/tmdb/enable", headers=auth_headers(token))
     assert enabled.status_code == 409
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/search/media?q=test",
+        "/api/tmdb/media/movie/1",
+        "/api/tmdb/person/1",
+    ],
+)
+def test_tmdb_product_endpoints_never_fall_back_to_example_data(monkeypatch, path):
+    token = admin_token()
+    monkeypatch.setattr(
+        routes,
+        "tmdb_access_state",
+        lambda _db: (
+            {
+                "source": "tmdb",
+                "status": "not_configured",
+                "code": "tmdb_not_configured",
+                "configured": False,
+                "enabled": False,
+                "message": "TMDB 尚未配置，请先完成设置。",
+            },
+            None,
+        ),
+    )
+
+    response = client.get(path, headers=auth_headers(token))
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "tmdb_not_configured"
+    assert detail["message"] == "TMDB 尚未配置，请先完成设置。"
+    assert "演员 A" not in response.text
+    assert "示例媒体详情" not in response.text
+
+
+def test_stats_explainability_uses_collected_snapshot_terms():
+    token = admin_token()
+
+    response = client.get("/api/stats", headers=auth_headers(token))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["explainability"]["source"] == "qB 下载器后台快照"
+    assert "mock" not in response.text.lower()
+    assert "real" not in response.text.lower()

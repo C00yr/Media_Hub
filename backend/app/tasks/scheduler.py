@@ -2,17 +2,15 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock, Thread
 from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime
 from sqlalchemy.orm import Session
 
 from app.adapters.qbittorrent import QbittorrentWebAdapter
-from app.adapters.mteam import MTeamAdapter
 from app.adapters.ai import DeepSeekChatAdapter
 from app.adapters.tmdb import TmdbAdapter
 from app.db.session import SessionLocal
-from app.models.entities import MTeamSnapshot, QbSnapshot
+from app.models.entities import QbSnapshot
 from app.services.integrations import get_config, get_decrypted_config
-from app.utils.time import system_now
+from app.utils.time import parse_datetime, system_now, utc_datetime, utc_iso, utc_now
 
 
 logger = logging.getLogger(__name__)
@@ -24,6 +22,8 @@ _wechat_claw_stop_event = Event()
 def capture_snapshots() -> None:
     from app.api.routes import (
         cleanup_debug_traces,
+        cleanup_expired_user_sessions,
+        collect_mteam_snapshot,
         compact_mteam_snapshots,
         qb_placeholder_state,
         record_module_collection_result,
@@ -40,20 +40,7 @@ def capture_snapshots() -> None:
         mteam_row = get_config(db, "mteam")
         if mteam_row and mteam_row.enabled:
             try:
-                mteam_stats = MTeamAdapter(get_decrypted_config(db, "mteam") or {}).get_user_stats()
-                db.add(
-                    MTeamSnapshot(
-                        user_level=mteam_stats.get("user_level") or "",
-                        upload_total=mteam_stats["upload_total"],
-                        download_total=mteam_stats["download_total"],
-                        bonus=mteam_stats["bonus"],
-                        ratio=mteam_stats["ratio"],
-                        seed_size=mteam_stats.get("seed_size", 0),
-                        active_uploads=mteam_stats["active_uploads"],
-                        active_downloads=mteam_stats["active_downloads"],
-                        source="real",
-                    )
-                )
+                mteam_stats = collect_mteam_snapshot(db)
                 record_module_collection_result(db, "mteam", True)
             except Exception as exc:
                 mteam_error = str(exc)
@@ -62,20 +49,25 @@ def capture_snapshots() -> None:
         for downloader_id in ["qb1", "qb2", "qb3"]:
             row = get_config(db, downloader_id)
             if not row or not row.enabled or not row.encrypted_payload:
-                qbs.append(qb_placeholder_state(downloader_id, row))
+                qbs.append(qb_placeholder_state(db, downloader_id, row))
                 continue
             try:
                 adapter = QbittorrentWebAdapter(get_decrypted_config(db, downloader_id) or {})
                 state = adapter.get_server_state(downloader_id)
                 state.update({"configured": True, "enabled": True})
                 tasks = adapter.get_torrents(downloader_id)
+                tasks_captured_at = utc_iso()
                 summary = dict(state)
                 summary.update(adapter.summarize_torrents(tasks))
                 downloads[downloader_id] = {
                     "downloader_id": downloader_id,
                     "summary": summary,
                     "items": tasks,
-                    "source": "qB Web API raw data (Real)",
+                    "source": "qB Web API",
+                    "captured_at": state.get("captured_at"),
+                    "checked_at": state.get("checked_at"),
+                    "stale": False,
+                    "tasks_captured_at": tasks_captured_at,
                     "updated_at": state.get("updated_at"),
                 }
                 qbs.append(state)
@@ -89,17 +81,19 @@ def capture_snapshots() -> None:
                         active_downloads=state["active_downloads"],
                         active_uploads=state["active_uploads"],
                         source="real",
+                        captured_at=utc_datetime(parse_datetime(state.get("captured_at")) or utc_now()).replace(tzinfo=None),
                     )
                 )
                 record_module_collection_result(db, downloader_id, True)
                 record_qb_task_transitions(db, downloader_id, tasks)
             except Exception as exc:
                 record_module_collection_result(db, downloader_id, False, str(exc))
-                qbs.append(qb_placeholder_state(downloader_id, row, str(exc)))
+                qbs.append(qb_placeholder_state(db, downloader_id, row, str(exc)))
 
         db.commit()
         compact_mteam_snapshots(db)
         cleanup_debug_traces(db)
+        cleanup_expired_user_sessions(db)
         refresh_collected_preload_caches(
             db,
             mteam=mteam_stats,
@@ -160,6 +154,7 @@ def _wechat_claw_poll_loop() -> None:
             db = None
             if not binding_user_ids:
                 delay_seconds = 5.0
+                _wechat_claw_stop_event.wait(delay_seconds)
                 continue
 
             def poll_binding(user_id: int | None) -> dict:

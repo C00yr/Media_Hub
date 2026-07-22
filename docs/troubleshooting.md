@@ -4,9 +4,11 @@
 
 Check `/api/setup/status`. If it returns `{"initialized": true}`, at least one user exists in SQLite. Use a fresh data volume for a clean setup.
 
-## Settings Save Works But Adapter Still Uses Mock Data
+## A Module Is Unavailable After Saving Settings
 
-This is expected in phase one. The credential center is real, but external adapters are mocked until the qB, M-Team, TMDB, AI, and WeChat Claw phases are implemented.
+Saving only stores a draft. Use “保存并测试”, confirm the connection test succeeds, and then enable the module. The diagnostics page performs a fresh check and shows the current failure reason. Verify the service address from inside the Media Hub container; a NAS browser being able to open an address does not prove the container can reach it.
+
+For TMDB through Mihomo, verify the HTTP proxy port and use a hostname reachable from the container, such as `mihomo` on the same Docker network or `host.docker.internal` for a host-published port.
 
 ## qB 2 Is Locked
 

@@ -22,11 +22,24 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
   if (token) headers.set("Authorization", `Bearer ${token}`);
   const response = await fetch(`${API_BASE}${path}`, { ...options, headers });
   if (!response.ok) {
-    const error = new Error(normalizeApiErrorMessage(await response.text(), response.status)) as ApiError;
+    const responseText = await response.text();
+    if (response.status === 401 && authErrorCode(responseText) === "auth_session_invalid" && typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("ptmh:auth-session-invalid"));
+    }
+    const error = new Error(normalizeApiErrorMessage(responseText, response.status)) as ApiError;
     error.status = response.status;
     throw error;
   }
   return response.json() as Promise<T>;
+}
+
+function authErrorCode(value: string): string {
+  try {
+    const payload = JSON.parse(value);
+    return typeof payload?.detail?.code === "string" ? payload.detail.code : "";
+  } catch {
+    return "";
+  }
 }
 
 export function normalizeApiErrorMessage(error: unknown, status?: number): string {
@@ -57,20 +70,18 @@ function normalizeDetail(detail: any, fallback: string): string {
 
   const message = stringValue(detail.message) || stringValue(detail.error) || stringValue(detail.reason);
   const provider = providerLabel(stringValue(detail.provider));
-  const stage = stageLabel(stringValue(detail.stage));
   const target = stringValue(detail.title) || stringValue(detail.name) || stringValue(detail.torrent_id);
 
-  if (message && (provider || stage || target)) {
+  if (message && (provider || target)) {
     const parts = [`操作没有完成：${message}`];
     if (provider) parts.push(`服务：${provider}`);
-    if (stage) parts.push(`环节：${stage}`);
     if (target) parts.push(`对象：${target}`);
     return parts.join("\n");
   }
   if (message) return message;
 
   const readableValues = Object.entries(detail)
-    .filter(([key]) => !["trace_id", "stack", "payload"].includes(key))
+    .filter(([key]) => !["trace_id", "duration_ms", "stage", "stages", "stack", "payload"].includes(key))
     .map(([key, value]) => readablePair(key, value))
     .filter(Boolean);
   return readableValues.length ? readableValues.slice(0, 4).join("\n") : fallback;
@@ -117,15 +128,6 @@ function providerLabel(value: string): string {
   return labels[value.toLowerCase()] || value;
 }
 
-function stageLabel(value: string): string {
-  const labels: Record<string, string> = {
-    mteam_config: "检查 M-Team 配置",
-    mteam_download_torrent: "从 M-Team 下载种子",
-    qb_config: "检查 qB 配置",
-    qb_add_torrent_file: "添加任务到 qB",
-  };
-  return labels[value] || value;
-}
 
 function httpStatusMessage(status?: number): string {
   if (status === 400) return "请求内容有误，请检查填写的信息。";
@@ -134,7 +136,7 @@ function httpStatusMessage(status?: number): string {
   if (status === 404) return "请求的内容不存在，可能是服务尚未更新或地址不正确。";
   if (status === 409) return "当前功能还没有准备好，请先完成设置并启用。";
   if (status === 422) return "填写内容有误，请检查表单后重试。";
-  if (status && status >= 500) return "服务暂时不可用，请稍后重试或查看后端日志。";
+  if (status && status >= 500) return "服务暂时不可用，请稍后重试；如问题持续，可前往诊断页查看详情。";
   return "请求失败，请稍后重试。";
 }
 

@@ -405,3 +405,84 @@ def test_agent_and_wechat_download_dispatch_uses_global_default(monkeypatch):
     )
     assert result["downloader_id"] == "qb3"
     assert db.added[0].downloader_id == "qb3"
+
+
+def test_web_agent_qb2_access_uses_explicit_browser_grant(monkeypatch):
+    qb = FakeQbAdapter()
+    monkeypatch.setattr(routes, "get_qb_adapter_or_error", lambda _db, _downloader_id: qb)
+    user = SimpleNamespace(id=1)
+
+    denied_request = WechatClawMessageRequest(
+        message="show qb2 tasks", user_id="web-1", conversation_id="web-qb2-denied"
+    )
+    denied_agent = ScriptedAgent(
+        [
+            {"decision": "tool", "tool": "qb_list_torrents", "arguments": {"downloader_id": "qb2"}},
+            {"decision": "final", "reply": "Administrator verification is required."},
+        ]
+    )
+    with SessionLocal() as db:
+        clear_agent_state(db)
+        denied = run_media_hub_agent(
+            db, denied_agent, denied_request, user, qb2_authorized=False
+        )
+
+    denied_observation = denied["result"]["observations"][0]["result"]
+    assert denied_observation["state"] == "privacy_required"
+
+    allowed_request = WechatClawMessageRequest(
+        message="show qb2 tasks", user_id="web-1", conversation_id="web-qb2-allowed"
+    )
+    allowed_agent = ScriptedAgent(
+        [
+            {"decision": "tool", "tool": "qb_list_torrents", "arguments": {"downloader_id": "qb2"}},
+            {"decision": "final", "reply": "One qB2 task is available."},
+        ]
+    )
+    with SessionLocal() as db:
+        clear_agent_state(db)
+        allowed = run_media_hub_agent(
+            db, allowed_agent, allowed_request, user, qb2_authorized=True
+        )
+
+    allowed_observation = allowed["result"]["observations"][0]["result"]
+    assert allowed_observation["state"] == "success"
+    assert allowed_observation["downloader_id"] == "qb2"
+    assert allowed_observation["count"] == 1
+
+
+def test_dashboard_qb2_summary_uses_the_same_privacy_grant(monkeypatch):
+    monkeypatch.setattr(
+        routes,
+        "build_dashboard_payload",
+        lambda _db: {
+            "overview": {"download_tasks": 2},
+            "mteam": {},
+            "qbs": [
+                {"id": "qb1", "active_downloads": 1, "active_uploads": 0},
+                {"id": "qb2", "active_downloads": 0, "active_uploads": 1},
+            ],
+            "updated_at": "2026-07-22T08:00:00Z",
+        },
+    )
+    request = WechatClawMessageRequest(
+        message="show dashboard", user_id="web-1", conversation_id="web-dashboard"
+    )
+
+    with SessionLocal() as db:
+        denied = routes.build_mobile_dashboard_result(
+            db, request, ["overview", "downloads", "qb2"], qb2_authorized=False
+        )
+        allowed = routes.build_mobile_dashboard_result(
+            db, request, ["overview", "downloads", "qb2"], qb2_authorized=True
+        )
+
+    assert denied["qb2_privacy_required"] is True
+    assert [item["id"] for item in denied["qbs"]] == ["qb1", "qb2"]
+    assert [item["id"] for item in denied["downloads"]] == ["qb1", "qb2"]
+    assert denied["qb2"]["id"] == "qb2"
+
+    assert allowed.get("qb2_privacy_required") is not True
+    assert [item["id"] for item in allowed["qbs"]] == ["qb1", "qb2"]
+    assert [item["id"] for item in allowed["downloads"]] == ["qb1", "qb2"]
+    assert allowed["qb2"]["id"] == "qb2"

@@ -17,6 +17,8 @@ depends_on = None
 
 
 def upgrade() -> None:
+    if sa.inspect(op.get_bind()).has_table("media_favorites"):
+        return
     op.create_table(
         "media_favorites",
         sa.Column("id", sa.Integer(), primary_key=True),
@@ -35,6 +37,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    if not sa.inspect(op.get_bind()).has_table("media_favorites"):
+        return
     op.drop_index("ix_media_favorites_created_at", table_name="media_favorites")
     op.drop_index("ix_media_favorites_tmdb_id", table_name="media_favorites")
     op.drop_index("ix_media_favorites_media_type", table_name="media_favorites")

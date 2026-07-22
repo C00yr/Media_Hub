@@ -20,11 +20,12 @@ def auth_headers(token: str) -> dict[str, str]:
 
 
 def admin_token() -> str:
-    for password in ("password123", "adminadmin"):
-        response = client.post("/api/auth/login", json={"username": "admin", "password": password})
-        if response.status_code == 200:
-            return response.json()["access_token"]
-    raise AssertionError("default administrator login failed")
+    response = client.post("/api/auth/login", json={"username": "admin", "password": "password123"})
+    if response.status_code == 200:
+        return response.json()["access_token"]
+    created = client.post("/api/setup/admin", json={"username": "admin", "password": "password123"})
+    assert created.status_code == 200
+    return created.json()["access_token"]
 
 
 def set_mteam_enabled(enabled: bool) -> None:

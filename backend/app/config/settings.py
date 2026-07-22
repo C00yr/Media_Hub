@@ -39,27 +39,32 @@ def _load_or_create_runtime_secret(name: str) -> str:
     values: dict[str, str] = {}
     if secret_file.exists():
         try:
-            values = json.loads(secret_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            values = {}
+            loaded = json.loads(secret_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Runtime secret file is unreadable or damaged: {secret_file}. Restore it from backup before starting."
+            ) from exc
+        if not isinstance(loaded, dict):
+            raise RuntimeError(f"Runtime secret file has an invalid structure: {secret_file}.")
+        values = loaded
     value = values.get(name)
     if isinstance(value, str) and len(value) >= 32:
         return value
     value = secrets.token_urlsafe(48)
     values[name] = value
+    temporary_file = secret_file.with_suffix(secret_file.suffix + ".tmp")
     try:
         secret_file.parent.mkdir(parents=True, exist_ok=True)
-        secret_file.write_text(json.dumps(values, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError:
-        # Last-resort fallback for read-only development environments. Docker/NAS
-        # deployments persist this file under /data, so tokens remain stable.
-        return value
+        temporary_file.write_text(json.dumps(values, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary_file.replace(secret_file)
+    except OSError as exc:
+        raise RuntimeError(f"Unable to persist runtime secrets at {secret_file}.") from exc
     return value
 
 
 class Settings(BaseSettings):
     app_name: str = "PT Media Hub"
-    app_version: str = "0.1.0-mvp"
+    app_version: str = "1.0.0"
     environment: str = "development"
     runtime_profile: str = Field(default_factory=_runtime_profile)
     app_data_dir: str = Field(default_factory=lambda: str(_runtime_data_dir()))

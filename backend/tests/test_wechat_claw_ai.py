@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.adapters.ai.client import normalize_assistant_intent, render_mobile_reply
 from app.adapters.wechat_claw import WechatClawAdapter
+from app.api import routes
 from app.api.routes import (
     WECHAT_CLAW_INTERACTIONS_KEY,
     WechatClawMessageRequest,
@@ -43,11 +44,12 @@ def auth_headers(token: str) -> dict[str, str]:
 
 
 def admin_token() -> str:
-    for password in ("password123", "adminadmin"):
-        login = client.post("/api/auth/login", json={"username": "admin", "password": password})
-        if login.status_code == 200:
-            return login.json()["access_token"]
-    raise AssertionError("default administrator login failed")
+    login = client.post("/api/auth/login", json={"username": "admin", "password": "password123"})
+    if login.status_code == 200:
+        return login.json()["access_token"]
+    created = client.post("/api/setup/admin", json={"username": "admin", "password": "password123"})
+    assert created.status_code == 200
+    return created.json()["access_token"]
 
 
 def test_wechat_claw_provider_and_notification_preferences():
@@ -112,6 +114,35 @@ def test_wechat_claw_provider_and_notification_preferences():
     assert interaction["user_id"] == "wx-user-1"
     assert interaction["action"] == "status_query"
     assert interaction["target"] == "dashboard"
+
+
+def test_wechat_claw_business_failure_cannot_be_enabled(monkeypatch):
+    token = admin_token()
+
+    class FailedWechatClawAdapter:
+        def __init__(self, _config):
+            pass
+
+        def test_connection(self):
+            return {"success": False, "connected": False, "message": "微信登录状态已失效。", "http_status": 200}
+
+    monkeypatch.setattr(routes, "WechatClawAdapter", FailedWechatClawAdapter)
+    tested = client.post(
+        "/api/admin/integrations/wechat_claw/test",
+        headers=auth_headers(token),
+        json={"payload": {"mode": "ilink", "poll_timeout": 25}},
+    )
+
+    assert tested.status_code == 200
+    assert tested.json()["enabled"] is False
+    result = tested.json()["last_test_result"]
+    assert result["success"] is False
+    assert result["can_enable"] is False
+    assert result["error_type"] == "connection_failed"
+    assert result["message"] == "微信登录状态已失效。"
+
+    enabled = client.post("/api/admin/integrations/wechat_claw/enable", headers=auth_headers(token))
+    assert enabled.status_code == 409
 
     preferences = client.put(
         "/api/notification-preferences",

@@ -32,9 +32,24 @@ class UserSession(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     token_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     qb2_grant_expires_at: Mapped[datetime | None] = mapped_column(DateTime)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     user: Mapped[User] = relationship()
+
+
+class QbDeleteConfirmation(Base):
+    __tablename__ = "qb_delete_confirmations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    downloader_id: Mapped[str] = mapped_column(String(16), index=True)
+    torrent_hash: Mapped[str] = mapped_column(String(128))
+    delete_files: Mapped[bool] = mapped_column(Boolean, default=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class WechatClawBinding(Base):
@@ -117,7 +132,7 @@ class MTeamSnapshot(Base):
     seed_size: Mapped[float] = mapped_column(Float, default=0)
     active_uploads: Mapped[int] = mapped_column(Integer, default=0)
     active_downloads: Mapped[int] = mapped_column(Integer, default=0)
-    source: Mapped[str] = mapped_column(String(64), default="mock")
+    source: Mapped[str] = mapped_column(String(64), default="collected")
     completeness: Mapped[str] = mapped_column(String(64), default="complete")
     captured_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
@@ -149,7 +164,7 @@ class QbSnapshot(Base):
     uploaded_total: Mapped[float] = mapped_column(Float, default=0)
     active_downloads: Mapped[int] = mapped_column(Integer, default=0)
     active_uploads: Mapped[int] = mapped_column(Integer, default=0)
-    source: Mapped[str] = mapped_column(String(64), default="mock")
+    source: Mapped[str] = mapped_column(String(64), default="collected")
     completeness: Mapped[str] = mapped_column(String(64), default="complete")
     captured_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
@@ -174,7 +189,7 @@ class NasDiskSnapshot(Base):
     path_label: Mapped[str] = mapped_column(String(120), default="media")
     free_bytes: Mapped[float] = mapped_column(Float, default=0)
     total_bytes: Mapped[float] = mapped_column(Float, default=0)
-    source: Mapped[str] = mapped_column(String(64), default="mock")
+    source: Mapped[str] = mapped_column(String(64), default="collected")
     completeness: Mapped[str] = mapped_column(String(64), default="complete")
     captured_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 

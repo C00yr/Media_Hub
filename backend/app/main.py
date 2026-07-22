@@ -1,40 +1,53 @@
 import logging
+from contextlib import asynccontextmanager
 import secrets
 from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import inspect, text
 
 from app.api.routes import router
-from app.auth.security import hash_password
+from app.auth.security import (
+    DEFAULT_CREDENTIALS_PENDING_KEY,
+    LEGACY_DEFAULT_ADMIN_PASSWORD,
+    hash_password,
+    verify_password,
+)
 from app.config.settings import get_settings
-from app.db.session import Base, SessionLocal, engine
-from app.models import entities  # noqa: F401
+from app.db.migrations import upgrade_database
+from app.db.session import SessionLocal, engine
 from app.models.entities import Setting, User
 from app.tasks.scheduler import build_scheduler, capture_snapshots, start_wechat_claw_polling, stop_wechat_claw_polling
-from app.utils.time import reset_client_timezone, set_client_timezone
+from app.utils.time import reset_client_timezone, set_client_timezone, utc_now_naive
 
 
 settings = get_settings()
 scheduler = build_scheduler(settings.snapshot_interval_minutes)
 logger = logging.getLogger(__name__)
 
-DEFAULT_ADMIN_USERNAME = "admin"
-DEFAULT_ADMIN_PASSWORD = "adminadmin"
-DEFAULT_CREDENTIALS_PENDING_KEY = "account.default_credentials_pending"
 SUPER_PASSWORD_SETTING_KEY = "auth.super_password"
 
 
-def ensure_default_admin() -> None:
+def ensure_legacy_default_credentials_state() -> None:
     db = SessionLocal()
     try:
-        if db.query(User).filter(User.role == "admin").first() is not None:
+        admin = db.query(User).filter(User.role == "admin").order_by(User.id.asc()).first()
+        if admin is None:
             return
-        db.add(User(username=DEFAULT_ADMIN_USERNAME, password_hash=hash_password(DEFAULT_ADMIN_PASSWORD), role="admin"))
-        db.add(Setting(key=DEFAULT_CREDENTIALS_PENDING_KEY, value={"required": True}))
-        db.commit()
+        try:
+            required = verify_password(LEGACY_DEFAULT_ADMIN_PASSWORD, admin.password_hash)
+        except ValueError:
+            required = False
+        setting = db.query(Setting).filter(Setting.key == DEFAULT_CREDENTIALS_PENDING_KEY).one_or_none()
+        current = bool(setting and isinstance(setting.value, dict) and setting.value.get("required"))
+        if setting is None and required:
+            db.add(Setting(key=DEFAULT_CREDENTIALS_PENDING_KEY, value={"required": True}))
+            db.commit()
+        elif setting is not None and current != required:
+            setting.value = {"required": required}
+            setting.updated_at = utc_now_naive()
+            db.commit()
     finally:
         db.close()
 
@@ -57,31 +70,28 @@ def ensure_super_password() -> None:
         db.close()
 
 
-def ensure_schema_compatibility() -> None:
-    if not settings.database_url.startswith("sqlite"):
-        return
-    inspector = inspect(engine)
-    tables = set(inspector.get_table_names())
-    with engine.begin() as connection:
-        if "mteam_snapshots" in tables:
-            columns = {column["name"] for column in inspector.get_columns("mteam_snapshots")}
-            if "user_level" not in columns:
-                connection.execute(text("ALTER TABLE mteam_snapshots ADD COLUMN user_level VARCHAR(64) DEFAULT ''"))
-            if "seed_size" not in columns:
-                connection.execute(text("ALTER TABLE mteam_snapshots ADD COLUMN seed_size FLOAT DEFAULT 0"))
-        binding_columns = set()
-        if "wechat_claw_bindings" in tables:
-            binding_columns = {column["name"] for column in inspector.get_columns("wechat_claw_bindings")}
-        if binding_columns and "avatar_key" not in binding_columns:
-            connection.execute(text("ALTER TABLE wechat_claw_bindings ADD COLUMN avatar_key VARCHAR(32) DEFAULT 'mint'"))
+
+@asynccontextmanager
+async def app_lifespan(_: FastAPI):
+    ensure_legacy_default_credentials_state()
+    ensure_super_password()
+    capture_snapshots()
+    if not scheduler.running:
+        scheduler.start()
+    start_wechat_claw_polling()
+    try:
+        yield
+    finally:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+        stop_wechat_claw_polling()
 
 
 def create_app() -> FastAPI:
-    Base.metadata.create_all(bind=engine)
-    ensure_schema_compatibility()
-    ensure_default_admin()
+    upgrade_database(engine, settings.database_url)
+    ensure_legacy_default_credentials_state()
     ensure_super_password()
-    app = FastAPI(title=settings.app_name, version=settings.app_version)
+    app = FastAPI(title=settings.app_name, version=settings.app_version, lifespan=app_lifespan)
 
     @app.middleware("http")
     async def apply_client_timezone(request: Request, call_next):
@@ -99,22 +109,6 @@ def create_app() -> FastAPI:
     )
     app.include_router(router, prefix="/api")
 
-    @app.on_event("startup")
-    def startup() -> None:
-        Base.metadata.create_all(bind=engine)
-        ensure_schema_compatibility()
-        ensure_default_admin()
-        ensure_super_password()
-        capture_snapshots()
-        if not scheduler.running:
-            scheduler.start()
-        start_wechat_claw_polling()
-
-    @app.on_event("shutdown")
-    def shutdown() -> None:
-        if scheduler.running:
-            scheduler.shutdown(wait=False)
-        stop_wechat_claw_polling()
 
     @app.get("/health")
     def health() -> dict[str, str]:

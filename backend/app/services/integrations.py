@@ -17,6 +17,15 @@ PROVIDERS = ["mteam", "qb1", "qb2", "qb3", "tmdb", "ai", "wechat_claw"]
 TMDB_PROXY_DOMAIN_ALLOWLIST = ("api.themoviedb.org", "image.tmdb.org")
 
 
+def public_test_result(result: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(result, dict):
+        return None
+    cleaned = dict(result)
+    if cleaned.get("mode") in {"real", "mock", "config"}:
+        cleaned.pop("mode", None)
+    return cleaned
+
+
 def decode_saved_payload(value: str | None) -> tuple[dict[str, Any], bool]:
     if not value:
         return {}, False
@@ -258,7 +267,7 @@ def serialize_config(row: IntegrationConfig, include_plain_payload: bool = False
         "enabled": row.enabled,
         "redacted_summary": row.redacted_summary or {},
         "last_tested_at": utc_iso(row.last_tested_at) if row.last_tested_at else None,
-        "last_test_result": row.last_test_result,
+        "last_test_result": public_test_result(row.last_test_result),
         "updated_at": utc_iso(row.updated_at) if row.updated_at else None,
     }
     if include_plain_payload:

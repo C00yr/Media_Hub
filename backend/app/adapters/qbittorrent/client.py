@@ -50,9 +50,11 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
         active_uploads = sum(1 for item in torrent_values if _is_active_upload(item))
         paused = sum(1 for item in torrent_values if _is_paused_state(item.get("state")))
         errors = sum(1 for item in torrent_values if "error" in str(item.get("state") or "").lower())
+        captured_at = utc_iso()
         return {
             "id": downloader_id,
             "name": self.name or f"qB{downloader_id.replace('qb', '')}",
+            "webui_url": self.base_url,
             "online": True,
             "download_speed": _float(state.get("dl_info_speed")),
             "upload_speed": _float(state.get("up_info_speed")),
@@ -65,8 +67,11 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
             "free_space": _float(state.get("free_space_on_disk")),
             "total_space": _float(state.get("total_space") or state.get("total_disk_space")),
             "connection_status": state.get("connection_status"),
-            "source": "qB Web API 原始数据（Real）",
-            "updated_at": utc_iso(),
+            "source": "qB Web API",
+            "captured_at": captured_at,
+            "checked_at": captured_at,
+            "stale": False,
+            "updated_at": captured_at,
         }
 
     def get_torrents(self, downloader_id: str, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -93,14 +98,18 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
             files = []
         if not isinstance(trackers, list):
             trackers = []
+        captured_at = utc_iso()
         return {
             "downloader_id": downloader_id,
             "hash": torrent_hash,
             "properties": self._normalize_properties(properties),
             "files": [self._normalize_file(index, item) for index, item in enumerate(files) if isinstance(item, dict)],
             "trackers": [self._normalize_tracker(item) for item in trackers if isinstance(item, dict)],
-            "source": "qB Web API 原始数据（Real）",
-            "updated_at": utc_iso(),
+            "source": "qB Web API",
+            "captured_at": captured_at,
+            "checked_at": captured_at,
+            "stale": False,
+            "updated_at": captured_at,
         }
 
     def set_file_priority(self, downloader_id: str, torrent_hash: str, file_id: int, priority: int) -> dict[str, Any]:
@@ -238,7 +247,7 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
             "state": item.get("state") or "",
             "is_active_download": _is_active_download(item),
             "is_active_upload": _is_active_upload(item),
-            "source": "qB Web API 原始数据（Real）",
+            "source": "qB Web API",
         }
 
     def _normalize_properties(self, item: dict[str, Any]) -> dict[str, Any]:

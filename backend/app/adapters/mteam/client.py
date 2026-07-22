@@ -126,6 +126,7 @@ class MTeamAdapter(TrackerAdapter):
         seed_size = seeding_stats["seed_size"] or profile_seed_size
         joined_at = _string_from_any(member_status.get("createdDate") or _find_value(flat, "joinDate", "joinedAt", "createdAt", "createdDate", "registerDate"))
         user_level = _mteam_role_label(data.get("role")) or _string_from_any(_find_value(flat, "level", "memberLevel", "class", "className", "role")) or "User"
+        captured_at = utc_iso()
         return {
             "user_level": user_level,
             "username": _string_from_any(data.get("username")),
@@ -151,8 +152,11 @@ class MTeamAdapter(TrackerAdapter):
             "vip": bool(member_status.get("vip")),
             "warned": bool(member_status.get("warned")),
             "bonus_per_hour_label": "M-Team 原始数据",
-            "source": "M-Team 原始数据（Real API）",
-            "updated_at": utc_iso(),
+            "source": "M-Team API",
+            "captured_at": captured_at,
+            "checked_at": captured_at,
+            "stale": False,
+            "updated_at": captured_at,
             "traffic_history": _traffic_history(data),
             "seeding_info": seeding_stats["items"],
             "raw_summary": _compact_raw_summary(data),

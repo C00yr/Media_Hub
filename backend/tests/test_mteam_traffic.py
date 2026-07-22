@@ -67,6 +67,52 @@ def test_mteam_snapshot_history_is_not_truncated_to_5000_rows():
         db.close()
         engine.dispose()
 
+
+def test_mteam_snapshot_history_groups_each_hour_and_keeps_latest_state(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    MTeamSnapshot.__table__.create(bind=engine)
+    MTeamTrafficRollup.__table__.create(bind=engine)
+    TestSession = sessionmaker(bind=engine)
+    db = TestSession()
+    shanghai = ZoneInfo("Asia/Shanghai")
+
+    def shanghai_time(value=None):
+        source = value if value is not None else datetime(2026, 7, 21, 12, 0, tzinfo=shanghai)
+        if source.tzinfo is None:
+            source = source.replace(tzinfo=timezone.utc)
+        return source.astimezone(shanghai)
+
+    monkeypatch.setattr(routes, "system_datetime", shanghai_time)
+    monkeypatch.setattr(routes, "system_timezone_name", lambda: "Asia/Shanghai")
+    try:
+        db.add_all(
+            [
+                MTeamSnapshot(user_level="User", upload_total=100, download_total=20, bonus=10, ratio=2, seed_size=50, active_uploads=1, active_downloads=0, source="real", captured_at=datetime(2026, 7, 21, 0, 10)),
+                MTeamSnapshot(user_level="Power User", upload_total=130, download_total=25, bonus=12, ratio=2.1, seed_size=55, active_uploads=2, active_downloads=1, source="real", captured_at=datetime(2026, 7, 21, 0, 50)),
+                MTeamSnapshot(user_level="Power User", upload_total=180, download_total=35, bonus=15, ratio=2.2, seed_size=60, active_uploads=3, active_downloads=0, source="real", captured_at=datetime(2026, 7, 21, 1, 10)),
+            ]
+        )
+        db.commit()
+
+        hourly = routes.build_mteam_snapshot_history(db, "hour")
+        daily = routes.build_mteam_snapshot_history(db, "day")
+
+        assert [item["label"] for item in hourly] == ["07/21 09:00", "07/21 08:00"]
+        assert hourly[0]["upload_delta"] == 50.0
+        assert hourly[0]["download_delta"] == 10.0
+        assert hourly[1]["upload_delta"] == 30.0
+        assert hourly[1]["user_level"] == "Power User"
+        assert hourly[1]["cumulative_upload"] == 130.0
+        assert hourly[1]["active_downloads"] == 1
+        assert len(daily) == 1
+        assert daily[0]["upload_delta"] == 80.0
+        assert daily[0]["download_delta"] == 15.0
+        assert daily[0]["cumulative_upload"] == 180.0
+    finally:
+        db.close()
+        engine.dispose()
+
+
 def test_mteam_snapshot_compaction_keeps_anchor_and_does_not_double_count(monkeypatch):
     engine = create_engine("sqlite:///:memory:")
     MTeamSnapshot.__table__.create(bind=engine)

@@ -46,9 +46,23 @@ import { FormEvent, KeyboardEvent, MouseEvent, PointerEvent, ReactNode, RefObjec
 import { api, formatBytes, formatSpeed, getToken, normalizeApiErrorMessage, setToken } from "../api/client";
 
 type User = { id?: number; username: string; role: string; must_change_credentials?: boolean };
+type DownloaderTarget = {
+  id: string;
+  name?: string;
+  configured?: boolean;
+  enabled?: boolean;
+  webui_url?: string | null;
+};
 type SetupStatus = { initialized: boolean; default_credentials_pending?: boolean };
 type NavKey = "discover" | "favorites" | "dashboard" | "downloads" | "notifications" | "settings" | "diagnostics";
 type TrafficDimension = "year" | "month" | "week" | "day" | "hour";
+const TRAFFIC_DIMENSION_OPTIONS: Array<{ value: TrafficDimension; label: string }> = [
+  { value: "hour", label: "小时" },
+  { value: "day", label: "天" },
+  { value: "week", label: "周" },
+  { value: "month", label: "月" },
+  { value: "year", label: "年" },
+];
 type DiscoverMode = "home" | "dual" | "mteam";
 type DiscoverBrowseMode = "casual" | "filter";
 type DiscoverDetailHistoryEntry = { kind: "media" | "person"; item: any; scrollTop: number };
@@ -144,7 +158,6 @@ type IntegrationTestResult = {
   success?: boolean;
   state?: "draft";
   provider?: string;
-  mode?: string;
   message?: string;
   explanation?: string;
   next_step?: string;
@@ -304,7 +317,6 @@ function AssistantReply({ reply }: { reply: string }) {
   );
 }
 
-type NotificationPreferenceKey = "download_started" | "download_completed" | "resource_search" | "status_query" | "wechat_claw_push";
 
 const navItems: { key: NavKey; label: string; icon: typeof Film; admin?: boolean }[] = [
   { key: "discover", label: "发现", icon: Film },
@@ -549,12 +561,22 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    const handleInvalidSession = () => {
+      setAccountDialogOpen(false);
+      setToken(null);
+      setUser(null);
+    };
+    window.addEventListener("ptmh:auth-session-invalid", handleInvalidSession);
+    return () => window.removeEventListener("ptmh:auth-session-invalid", handleInvalidSession);
+  }, []);
+
+  useEffect(() => {
     if (user?.must_change_credentials) setAccountDialogOpen(true);
   }, [user?.must_change_credentials]);
 
   useEffect(() => {
     let alive = true;
-    if (!user) {
+    if (!user || user.must_change_credentials) {
       setFavoriteItems([]);
       setFavoritesError("");
       return () => { alive = false; };
@@ -590,6 +612,18 @@ export function App() {
       setDiscoverResetToken((value) => value + 1);
     }
     setActive(key);
+  }
+
+  async function signOut() {
+    try {
+      await api("/api/auth/logout", { method: "POST" });
+    } catch {
+      // Local logout must still complete if the server is unreachable or the session already expired.
+    } finally {
+      setAccountDialogOpen(false);
+      setToken(null);
+      setUser(null);
+    }
   }
 
   function isFavorite(item: any) {
@@ -657,7 +691,7 @@ export function App() {
             );
           })}
         </nav>
-        <button className="nav-item logout" onClick={() => { setAccountDialogOpen(false); setToken(null); setUser(null); }} title="退出登录">
+        <button className="nav-item logout" onClick={signOut} title="退出登录">
           <LogOut size={20} />
           <span>退出登录</span>
         </button>
@@ -680,18 +714,26 @@ export function App() {
             {user.username} / {user.role === "admin" ? "管理员" : "用户"}
           </button>
         </header>
-        <FavoritesContext.Provider value={{ items: favoriteItems, loading: favoritesLoading, error: favoritesError, isFavorite, isBusy: isFavoriteBusy, toggle: toggleFavorite }}>
-          <ActivePage
-            user={user}
-            resetToken={active === "discover" ? discoverResetToken : 0}
-            selectedDownloader={selectedDownloader}
-            onNavigate={openNav}
-            onOpenDownloader={(downloaderId) => {
-              setSelectedDownloader(downloaderId);
-              setActive("downloads");
-            }}
-          />
-        </FavoritesContext.Provider>
+        {user.must_change_credentials ? (
+          <section className="credential-update-required">
+            <ShieldCheck size={26} />
+            <h2>请先更新管理员账号</h2>
+            <p>完成用户名和密码更新后，即可继续使用 Media Hub。</p>
+          </section>
+        ) : (
+          <FavoritesContext.Provider value={{ items: favoriteItems, loading: favoritesLoading, error: favoritesError, isFavorite, isBusy: isFavoriteBusy, toggle: toggleFavorite }}>
+            <ActivePage
+              user={user}
+              resetToken={active === "discover" ? discoverResetToken : 0}
+              selectedDownloader={selectedDownloader}
+              onNavigate={openNav}
+              onOpenDownloader={(downloaderId) => {
+                setSelectedDownloader(downloaderId);
+                setActive("downloads");
+              }}
+            />
+          </FavoritesContext.Provider>
+        )}
       </main>
       <nav className="bottom-nav">
         {visibleNav.filter((item) => ["discover", "favorites", "dashboard", "downloads", "notifications", "settings", "diagnostics"].includes(item.key)).map((item) => {
@@ -703,8 +745,12 @@ export function App() {
             </button>
           );
         })}
+        <button className={accountDialogOpen ? "active mobile-account-item" : "mobile-account-item"} type="button" onClick={() => setAccountDialogOpen(true)} aria-label="账号设置">
+          <ShieldCheck size={20} />
+          <span>账号</span>
+        </button>
       </nav>
-      {accountDialogOpen && <AccountCredentialsDialog user={user} onClose={() => setAccountDialogOpen(false)} onUpdated={(nextUser) => setUser(nextUser)} />}
+      {(accountDialogOpen || user.must_change_credentials) && <AccountCredentialsDialog user={user} onClose={() => setAccountDialogOpen(false)} onLogout={signOut} onUpdated={(nextUser) => setUser(nextUser)} />}
     </div>
   );
 }
@@ -774,7 +820,7 @@ function SetupPage({ onDone }: { onDone: (user: User) => void }) {
     }
   }
 
-  return <AuthForm title="创建管理员" username={username} password={password} error={error} submitLabel="初始化" onUsername={setUsername} onPassword={setPassword} onSubmit={submit} />;
+  return <AuthForm title="创建管理员" description="首次使用，请创建专属管理员账号。账号信息仅用于登录当前 Media Hub。" username={username} password={password} error={error} submitLabel="创建并进入" onUsername={setUsername} onPassword={setPassword} onSubmit={submit} />;
 }
 
 function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
@@ -800,7 +846,7 @@ function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
   return <AuthForm title="登录" username={username} password={password} error={error} submitLabel="登录" onUsername={setUsername} onPassword={setPassword} onSubmit={submit} />;
 }
 
-function AccountCredentialsDialog({ user, onClose, onUpdated }: { user: User; onClose: () => void; onUpdated: (user: User) => void }) {
+function AccountCredentialsDialog({ user, onClose, onLogout, onUpdated }: { user: User; onClose: () => void; onLogout: () => void; onUpdated: (user: User) => void }) {
   const [username, setUsername] = useState(user.username);
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -831,20 +877,24 @@ function AccountCredentialsDialog({ user, onClose, onUpdated }: { user: User; on
     }
   }
 
-  return <div className="app-dialog-backdrop" role="presentation" onMouseDown={onClose}>
+  const updateRequired = Boolean(user.must_change_credentials);
+
+  return <div className="app-dialog-backdrop" role="presentation" onMouseDown={updateRequired ? undefined : onClose}>
     <form className="app-dialog account-dialog" role="dialog" aria-modal="true" aria-labelledby="account-dialog-title" onSubmit={submit} onMouseDown={(event) => event.stopPropagation()}>
       <span className="app-dialog-icon"><ShieldCheck size={20} /></span>
-      <h3 id="account-dialog-title">修改登录账号</h3>
-      {user.must_change_credentials && <p className="account-dialog-note">当前正在使用初始管理员账号，请及时修改用户名和密码。</p>}
+      <h3 id="account-dialog-title">{updateRequired ? "更新初始管理员账号" : "账号设置"}</h3>
+      {updateRequired && <p className="account-dialog-note">当前账号仍在使用旧版初始密码。为保护 Media Hub 中的服务凭据，请设置新的用户名和密码后继续使用。</p>}
       <div className="form-grid">
         <label>登录用户名<input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" /></label>
-        <label>当前密码<input type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" /></label>
-        <label>新密码<input type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" minLength={8} /></label>
-        <label>确认新密码<input type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" minLength={8} /></label>
+        <label>当前密码<SecretInput value={currentPassword} onChange={setCurrentPassword} autoComplete="current-password" name="current-password" /></label>
+        <label>新密码<SecretInput value={newPassword} onChange={setNewPassword} autoComplete="new-password" name="new-password" minLength={8} /></label>
+        <label>确认新密码<SecretInput value={confirmPassword} onChange={setConfirmPassword} autoComplete="new-password" name="confirm-password" minLength={8} /></label>
       </div>
+      <p className="account-dialog-help">忘记当前密码时，可在“当前密码”中填写超级密码，直接重设管理员账号和密码。使用超级密码登录时无需填写正确的用户名。</p>
       {error && <p className="error">{error}</p>}
       <div className="app-dialog-actions">
-        <button type="button" onClick={onClose} disabled={saving}>取消</button>
+        <button type="button" className="account-dialog-logout" onClick={onLogout} disabled={saving}>退出登录</button>
+        {!updateRequired && <button type="button" onClick={onClose} disabled={saving}>取消</button>}
         <button className="primary" disabled={saving || username.trim().length < 3 || currentPassword.length === 0 || newPassword.length < 8 || confirmPassword.length < 8}>{saving ? "保存中..." : "保存账号"}</button>
       </div>
     </form>
@@ -853,6 +903,7 @@ function AccountCredentialsDialog({ user, onClose, onUpdated }: { user: User; on
 
 function AuthForm(props: {
   title: string;
+  description?: string;
   username: string;
   password: string;
   error: string;
@@ -866,6 +917,7 @@ function AuthForm(props: {
       <form className="auth-card" onSubmit={props.onSubmit}>
         <BrandLogo subtitle="面向 NAS 的媒体管理应用" large />
         <h1>{props.title}</h1>
+        {props.description && <p className="auth-description">{props.description}</p>}
         <label>用户名<input value={props.username} onChange={(event) => props.onUsername(event.target.value)} /></label>
         <label>密码<input type="password" value={props.password} onChange={(event) => props.onPassword(event.target.value)} /></label>
         {props.error && <p className="error">{props.error}</p>}
@@ -892,7 +944,7 @@ function mergeDashboardQbs(current: any, realtime: any) {
   };
 }
 
-function DashboardPage({ onOpenDownloader }: { onOpenDownloader?: (downloaderId: string) => void }) {
+function DashboardPage({ onOpenDownloader, onNavigate }: { onOpenDownloader?: (downloaderId: string) => void; onNavigate?: (key: NavKey) => void }) {
   const initialDashboard = useMemo(() => readLocalSnapshot<any>("dashboard"), []);
   const { data, loading, setData } = useLoad<any>(() => api("/api/dashboard?cached=true"), [], initialDashboard, false);
   const [refreshingMTeam, setRefreshingMTeam] = useState(false);
@@ -900,38 +952,9 @@ function DashboardPage({ onOpenDownloader }: { onOpenDownloader?: (downloaderId:
   const [testingQbId, setTestingQbId] = useState("");
   const [mteamStatusOverride, setMteamStatusOverride] = useState<{ success: boolean; message: string } | null>(null);
   const [dashboardError, setDashboardError] = useState("");
-  const entryRefreshStarted = useRef(false);
-
-  async function loadDashboard(url: string, silent = false) {
-    try {
-      const value = await api<any>(url);
-      setData(value);
-      writeLocalSnapshot("dashboard", value);
-      if (!silent) setDashboardError("");
-      return value;
-    } catch (err) {
-      if (!silent) setDashboardError((err as Error).message);
-      return null;
-    }
-  }
 
   useEffect(() => {
     if (data) writeLocalSnapshot("dashboard", data);
-  }, [data]);
-
-  useEffect(() => {
-    if (!data || entryRefreshStarted.current) return;
-    const refreshOnEntry = () => {
-      if (document.hidden || entryRefreshStarted.current) return;
-      entryRefreshStarted.current = true;
-      void loadDashboard("/api/dashboard?refresh=true", true);
-    };
-    const timer = window.setTimeout(refreshOnEntry, 150);
-    document.addEventListener("visibilitychange", refreshOnEntry);
-    return () => {
-      window.clearTimeout(timer);
-      document.removeEventListener("visibilitychange", refreshOnEntry);
-    };
   }, [data]);
 
   useEffect(() => {
@@ -997,7 +1020,19 @@ function DashboardPage({ onOpenDownloader }: { onOpenDownloader?: (downloaderId:
     setRefreshingMTeam(true);
     setDashboardError("");
     try {
-      setData(await api("/api/dashboard?refresh=true"));
+      const result = await api<any>("/api/mteam/refresh", { method: "POST" });
+      setData((current: any) => current ? {
+        ...current,
+        mteam: result.mteam,
+        mteam_connection: result.mteam_connection,
+        updated_at: result.updated_at ?? current.updated_at,
+        _preload: {
+          ...(current._preload || {}),
+          preloaded: false,
+          cached_at: result.cached_at ?? current._preload?.cached_at,
+        },
+      } : current);
+      if (!result.success) setDashboardError(result.message || "M-Team 本轮采集失败，当前继续显示上次成功快照。");
       setMteamStatusOverride(null);
     } catch (err) {
       setDashboardError((err as Error).message);
@@ -1069,7 +1104,18 @@ function DashboardPage({ onOpenDownloader }: { onOpenDownloader?: (downloaderId:
             <span className={onlineDownloaders === enabledDownloaders.length && enabledDownloaders.length ? "dashboard-section-note online" : "dashboard-section-note"}>{onlineDownloaders}/{enabledDownloaders.length} 在线</span>
           </div>
           <div className="cards-row downloader-card-grid">
-            {data.qbs.map((qb: any) => qb.locked ? <LockedCard key={qb.id} title={downloaderDashboardTitle(qb)} message={qb.message} onOpen={() => onOpenDownloader?.(qb.id)} /> : <DownloaderCard key={qb.id} qb={qb} onOpen={onOpenDownloader} onTestConnection={testQbConnection} testingConnection={testingQbId === qb.id} />)}
+            {data.qbs.map((qb: any) => qb.locked ? (
+              <LockedCard
+                key={qb.id}
+                qb={qb}
+                title={downloaderDashboardTitle(qb)}
+                message={qb.message}
+                onOpen={() => onOpenDownloader?.(qb.id)}
+                onConfigure={(downloaderId) => navigateToDownloaderSettings(onNavigate, downloaderId)}
+              />
+            ) : (
+              <DownloaderCard key={qb.id} qb={qb} onOpen={onOpenDownloader} onConfigure={(downloaderId) => navigateToDownloaderSettings(onNavigate, downloaderId)} onTestConnection={testQbConnection} testingConnection={testingQbId === qb.id} />
+            ))}
           </div>
         </section>
       </div>
@@ -1082,7 +1128,7 @@ function DashboardPage({ onOpenDownloader }: { onOpenDownloader?: (downloaderId:
         onTestConnection={testMTeamConnection}
         testingConnection={testingMTeam}
         statusOverride={mteamStatusOverride}
-        updatedAt={data._preload?.cached_at || data.updated_at}
+        updatedAt={data.mteam?.captured_at}
       />
       {dashboardError && <p className="error">{dashboardError}</p>}
     </div>
@@ -1109,6 +1155,7 @@ function MTeamSnapshotPanel({
   updatedAt?: string;
 }) {
   const [trafficDimension, setTrafficDimension] = useState<TrafficDimension>("hour");
+  const [snapshotHistoryOpen, setSnapshotHistoryOpen] = useState(false);
   const history = limitTrafficHistory(mteam.traffic_series?.[trafficDimension] ?? mteam.traffic_history ?? [], trafficDimension);
   const connected = statusOverride ? statusOverride.success : Boolean(connection?.enabled && connection?.last_test_success);
   const statusLabel = testingConnection ? "正在测试" : refreshing ? "正在刷新" : connected ? "连接正常" : "连接异常";
@@ -1130,7 +1177,7 @@ function MTeamSnapshotPanel({
           <button className={refreshing ? "refresh-icon-button spinning" : "refresh-icon-button"} onClick={onRefresh} disabled={refreshing} title="重新抓取站点数据" aria-label="重新抓取站点数据">
             <RefreshCw size={17} />
           </button>
-          <small className="last-refresh">数据更新于：{formatDateLabel(updatedAt || mteam.updated_at)}</small>
+          <small className="last-refresh">{mteam.stale ? "上次成功数据更新于" : "数据更新于"}：{formatDateLabel(updatedAt || mteam.captured_at || mteam.updated_at)}</small>
         </div>
       </div>
       <div className="mteam-stat-grid">
@@ -1145,23 +1192,21 @@ function MTeamSnapshotPanel({
       </div>
       <div className="traffic-chart">
         <div className="traffic-chart-header">
-          <h3>历史流量</h3>
+          <button className="traffic-history-button" type="button" onClick={() => setSnapshotHistoryOpen(true)} title="查看全部 M-Team 统计快照">
+            <Clock3 size={15} />
+            <span>历史流量</span>
+            <small>查看全部快照</small>
+          </button>
           <div className="traffic-dimension-tools" aria-label="统计维度">
             <div className="segmented compact">
-              {[
-                ["hour", "小时"],
-                ["year", "年"],
-                ["month", "月"],
-                ["week", "周"],
-                ["day", "天"]
-              ].map(([value, label]) => (
+              {TRAFFIC_DIMENSION_OPTIONS.map((option) => (
                 <button
-                  className={trafficDimension === value ? "active" : ""}
+                  className={trafficDimension === option.value ? "active" : ""}
                   type="button"
-                  onClick={() => setTrafficDimension(value as TrafficDimension)}
-                  key={value}
+                  onClick={() => setTrafficDimension(option.value)}
+                  key={option.value}
                 >
-                  {label}
+                  {option.label}
                 </button>
               ))}
             </div>
@@ -1170,8 +1215,147 @@ function MTeamSnapshotPanel({
         <TrafficLineChart history={history} dimension={trafficDimension} />
         <div className="legend"><span className="dot upload" />上传量<span className="dot download" />下载量</div>
       </div>
+      {snapshotHistoryOpen && <MTeamSnapshotHistoryDialog onClose={() => setSnapshotHistoryOpen(false)} />}
     </section>
   );
+}
+
+function MTeamSnapshotHistoryDialog({ onClose }: { onClose: () => void }) {
+  const [dimension, setDimension] = useState<TrafficDimension>("hour");
+  const [data, setData] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [reloadToken, setReloadToken] = useState(0);
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [onClose]);
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError("");
+    setData(null);
+    api<any>(`/api/mteam/snapshots?dimension=${dimension}`)
+      .then((result) => {
+        if (active) setData(result);
+      })
+      .catch((err) => {
+        if (active) setError((err as Error).message);
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [dimension, reloadToken]);
+
+  const items = Array.isArray(data?.items) ? data.items : [];
+  const retentionDays = Number(data?.raw_snapshot_retention_days || 90);
+
+  return (
+    <div className="app-dialog-backdrop mteam-snapshot-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="app-dialog mteam-snapshot-dialog" role="dialog" aria-modal="true" aria-labelledby="mteam-snapshot-dialog-title" onMouseDown={(event) => event.stopPropagation()}>
+        <header className="mteam-snapshot-dialog-head">
+          <span className="mteam-snapshot-dialog-icon"><Database size={22} /></span>
+          <div>
+            <h3 id="mteam-snapshot-dialog-title">M-Team 统计快照</h3>
+            <p>查看每个统计周期的流量变化和周期末账户状态，最新数据排列在最前。</p>
+          </div>
+          <button className="download-dialog-close" type="button" onClick={onClose} aria-label="关闭统计快照">×</button>
+        </header>
+
+        <div className="mteam-snapshot-toolbar">
+          <div className="segmented compact" role="tablist" aria-label="快照统计周期">
+            {TRAFFIC_DIMENSION_OPTIONS.map((option) => (
+              <button
+                className={dimension === option.value ? "active" : ""}
+                type="button"
+                role="tab"
+                aria-selected={dimension === option.value}
+                onClick={() => setDimension(option.value)}
+                key={option.value}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+          <span>{loading ? "正在读取…" : `共 ${items.length} 条 · ${data?.timezone || "系统时区"}`}</span>
+        </div>
+
+        <p className="mteam-snapshot-note">
+          小时维度按自然小时合并，同一小时存在多次采集时取最后一次账户状态。原始快照保留 {retentionDays} 天；更早的数据按日/月汇总，因此早期记录的账户状态可能显示“—”。
+        </p>
+
+        {error && (
+          <div className="mteam-snapshot-error">
+            <CircleAlert size={17} />
+            <span>{error}</span>
+            <button type="button" onClick={() => setReloadToken((value) => value + 1)}>重试</button>
+          </div>
+        )}
+
+        <div className="mteam-snapshot-table-wrap" aria-busy={loading}>
+          <table className="mteam-snapshot-table" aria-label={`M-Team ${trafficDimensionLabel(dimension)}统计快照`}>
+            <thead>
+              <tr>
+                <th>统计时间</th>
+                <th>本期上传</th>
+                <th>本期下载</th>
+                <th>累计上传</th>
+                <th>累计下载</th>
+                <th>分享率</th>
+                <th>魔力值</th>
+                <th>做种体积</th>
+                <th>活跃 上/下</th>
+                <th>用户等级</th>
+                <th>快照采集时间</th>
+              </tr>
+            </thead>
+            <tbody>
+              {loading && <tr><td className="mteam-snapshot-table-state" colSpan={11}>正在读取 M-Team 统计快照…</td></tr>}
+              {!loading && !error && items.map((item: any) => (
+                <tr className={item.has_snapshot ? "" : "traffic-only"} key={item.period_start}>
+                  <td><strong>{item.label || item.period_start}</strong></td>
+                  <td className="upload-value">{mteamSnapshotBytes(item.upload_delta)}</td>
+                  <td className="download-value">{mteamSnapshotBytes(item.download_delta)}</td>
+                  <td>{mteamSnapshotBytes(item.cumulative_upload)}</td>
+                  <td>{mteamSnapshotBytes(item.cumulative_download)}</td>
+                  <td>{mteamSnapshotNumber(item.ratio, 3)}</td>
+                  <td>{mteamSnapshotNumber(item.bonus, 1)}</td>
+                  <td>{mteamSnapshotBytes(item.seed_size)}</td>
+                  <td>{item.has_snapshot ? `${Number(item.active_uploads || 0)} / ${Number(item.active_downloads || 0)}` : "—"}</td>
+                  <td>{item.user_level || "—"}</td>
+                  <td>{item.captured_at ? formatDateLabel(item.captured_at) : "历史汇总"}</td>
+                </tr>
+              ))}
+              {!loading && !error && !items.length && <tr><td className="mteam-snapshot-table-state" colSpan={11}>当前还没有可展示的统计快照。</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function mteamSnapshotBytes(value: unknown): string {
+  if (value === null || value === undefined || value === "") return "—";
+  return formatBytes(Number(value));
+}
+
+function mteamSnapshotNumber(value: unknown, digits: number): string {
+  if (value === null || value === undefined || value === "") return "—";
+  return numberLabel(Number(value), digits);
 }
 
 function TrafficLineChart({ history, dimension }: { history: any[]; dimension: TrafficDimension }) {
@@ -1387,8 +1571,8 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
     { title: "流行趋势", items: data.trending },
     { title: "热门电影", items: data.popular_movies },
     { title: "热门剧集", items: data.popular_tv },
-    { title: "Top Rated 电影", items: data.top_rated_movies },
-    { title: "Top Rated 剧集", items: data.top_rated_tv }
+    { title: "高分电影", items: data.top_rated_movies },
+    { title: "高分剧集", items: data.top_rated_tv }
   ] : [];
   const expandedDiscoverList = expandedDiscoverTitle ? lists.find((list) => list.title === expandedDiscoverTitle) : null;
   const filterViewActive = discoverMode === "home" && browseMode === "filter" && !selectedPerson && !selectedMedia && !expandedDiscoverTitle;
@@ -1739,6 +1923,7 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
       filterLoadingPageRef.current = page;
     } else {
       filterLoadingPageRef.current = null;
+      setFilterLoadingMore(false);
     }
     const requestId = append ? filterRequestId.current : filterRequestId.current + 1;
     if (!append) filterRequestId.current = requestId;
@@ -1808,6 +1993,8 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
     });
   }
 
+  const discoverReady = data?.status === "ready" || (!data?.status && data?.configured === true);
+
   return (
     <div className="grid-page">
       <button className="discover-scroll-top" type="button" onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })} aria-label="回到顶部" title="回到顶部">
@@ -1869,7 +2056,12 @@ function DiscoverPage({ resetToken = 0 }: { resetToken?: number }) {
             <>
               {loading && !data && <Panel title="发现"><p>正在从 TMDB 加载片单...</p></Panel>}
               {error && <Panel title="TMDB 获取失败"><p className="error">{error}</p></Panel>}
-              {data && !data.configured && <Panel title="需要配置媒体搜索"><p>{data.message}</p><p className="muted">进入“设置”的“媒体搜索”，填写 TMDB API Key 或 Bearer Token，保存并启用后再回到发现页。</p></Panel>}
+              {data && !discoverReady && (
+                <Panel title={data.status === "not_enabled" ? "TMDB 尚未启用" : "需要配置 TMDB"}>
+                  <p>{data.message}</p>
+                  <p className="muted">{data.status === "not_enabled" ? "进入“设置”的“媒体搜索”，完成连接测试并启用后再回到发现页。" : "进入“设置”的“媒体搜索”，填写 TMDB API Key 或 Bearer Token，完成保存、测试与启用后再回到发现页。"}</p>
+                </Panel>
+              )}
               {lists.map((list, index) => <PosterRail title={list.title} items={list.items} eagerLimit={index === 0 ? eagerPosterLimit() : 0} onMore={() => setExpandedDiscoverTitle(list.title)} onSelect={openMediaDetail} key={list.title} />)}
             </>
           )}
@@ -1962,6 +2154,7 @@ function DiscoverFilterPage({
   const yearOptions = discoverYearOptions();
   const loadedCount = items.length;
   const minRating = Number(filters.min_rating || 0);
+  const ready = payload?.status === "ready" || (!payload?.status && payload?.configured === true);
 
   return (
     <section className="discover-filter-page">
@@ -1993,10 +2186,10 @@ function DiscoverFilterPage({
       <div className="poster-grid discover-filter-grid">
         {loading && <SearchLoadingState title="正在筛选 TMDB" detail="正在按类型、题材、地区和评分刷新海报墙" />}
         {items.map((item: any, index: number) => <DiscoverPosterCard item={item} eager={index < eagerPosterLimit()} onSelect={onSelect} key={item.id} />)}
-        {!loading && !items.length && <p className="muted">没有符合条件的条目，可以放宽题材、地区或评分。</p>}
+        {!loading && !items.length && ready && <p className="muted">没有符合条件的条目，可以放宽题材、地区或评分。</p>}
       </div>
       <div className="discover-load-sentinel" ref={sentinelRef}>
-        {loadingMore ? <SearchLoadingState title="正在加载中" detail="请稍候" /> : hasMore ? <span>向下滚动加载更多</span> : loadedCount > 0 ? <span>已经到底了</span> : null}
+        {!loading && (loadingMore ? <SearchLoadingState title="正在加载中" detail="请稍候" /> : hasMore ? <span>向下滚动加载更多</span> : loadedCount > 0 ? <span>已经到底了</span> : null)}
       </div>
     </section>
   );
@@ -2084,14 +2277,17 @@ function discoverFilterKey(filters: DiscoverFilters) {
   ].join("|");
 }
 
-function DownloadsPage({ selectedDownloader = "qb1" }: { selectedDownloader?: string }) {
+function DownloadsPage({ selectedDownloader = "qb1", onNavigate }: { selectedDownloader?: string; onNavigate?: (key: NavKey) => void }) {
   const [downloader, setDownloader] = useState(selectedDownloader);
   const [grantOpen, setGrantOpen] = useState(false);
   const { data, error, loading, setData } = useLoad<any>(() => api(`/api/downloads/${downloader}/overview?cached=true`), [downloader]);
+  const downloaderTargets = useLoad<{ items: DownloaderTarget[] }>(() => api("/api/downloaders/targets"), []);
   const downloadRequestId = useRef(0);
-  const downloadOverviewInFlight = useRef(false);
+  const downloadOverviewInFlight = useRef<Set<string>>(new Set());
+  const downloadSummaryInFlight = useRef<Set<string>>(new Set());
   const [qb2Authorized, setQb2Authorized] = useState(false);
   const [refreshingDownload, setRefreshingDownload] = useState(false);
+  const [downloadConnectionIssue, setDownloadConnectionIssue] = useState("");
   const [addDialogMode, setAddDialogMode] = useState<"link" | "file" | null>(null);
 
   useEffect(() => {
@@ -2102,35 +2298,108 @@ function DownloadsPage({ selectedDownloader = "qb1" }: { selectedDownloader?: st
   }, [selectedDownloader]);
 
   useEffect(() => {
-    const poll = () => {
-      if (!document.hidden) refreshDownloadOverview(downloader);
+    setDownloadConnectionIssue("");
+  }, [downloader]);
+
+  useEffect(() => {
+    const refreshOnEntry = () => {
+      if (downloader === "qb2" && !document.hidden) void refreshQbSummary(downloader);
+      if (!document.hidden) void refreshDownloadOverview(downloader);
     };
-    poll();
-    const timer = window.setInterval(poll, 5000);
+    refreshOnEntry();
     const onVisibilityChange = () => {
-      if (!document.hidden) poll();
+      if (!document.hidden) void refreshQbSummary(downloader);
     };
     document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
-      window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, [downloader]);
 
+  useEffect(() => {
+    const pollSummary = () => {
+      if (!document.hidden) void refreshQbSummary(downloader);
+    };
+    const timer = window.setInterval(pollSummary, 5000);
+    return () => window.clearInterval(timer);
+  }, [downloader]);
+
+  function handleDownloadRefreshFailure(target: string, err: unknown) {
+    const status = (err as { status?: number })?.status;
+    if (target === "qb2" && status === 403) {
+      setQb2Authorized(false);
+      setAddDialogMode(null);
+      setDownloadConnectionIssue("");
+      setData((current: any) => current?.downloader_id === "qb2" ? {
+        ...current,
+        items: [],
+        tasks_captured_at: null,
+      } : current);
+      return;
+    }
+    const message = (err as Error)?.message || "\u4e0b\u8f7d\u5668\u8fde\u63a5\u5f02\u5e38\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5\u3002";
+    setDownloadConnectionIssue(message);
+    setData((current: any) => current?.downloader_id === target ? {
+      ...current,
+      stale: true,
+      summary: { ...current.summary, online: false, stale: true, message },
+    } : current);
+  }
+
+  function refreshQbSummary(target = downloader) {
+    if (downloadSummaryInFlight.current.has(target)) return Promise.resolve(undefined);
+    downloadSummaryInFlight.current.add(target);
+    return api<any>(`/api/qb/${target}/summary`)
+      .then((value) => {
+        setData((current: any) => {
+          const base = current?.downloader_id === target ? current : {
+            downloader_id: target,
+            items: [],
+            tasks_captured_at: null,
+          };
+          return {
+            ...base,
+            summary: { ...base.summary, ...value },
+            captured_at: value.captured_at ?? base.captured_at,
+            checked_at: value.checked_at ?? base.checked_at,
+            stale: Boolean(value.stale),
+            updated_at: value.updated_at ?? base.updated_at,
+          };
+        });
+        setDownloadConnectionIssue(value.stale ? (value.message || "\u4e0b\u8f7d\u5668\u8fde\u63a5\u5f02\u5e38\u3002") : "");
+        return value;
+      })
+      .catch((err) => {
+        handleDownloadRefreshFailure(target, err);
+        return undefined;
+      })
+      .finally(() => {
+        downloadSummaryInFlight.current.delete(target);
+      });
+  }
+
   function refreshDownloadOverview(target = downloader, refresh = true) {
-    if (downloadOverviewInFlight.current) return Promise.resolve(undefined);
-    downloadOverviewInFlight.current = true;
+    if (downloadOverviewInFlight.current.has(target)) return Promise.resolve(undefined);
+    downloadOverviewInFlight.current.add(target);
     const requestId = downloadRequestId.current + 1;
     downloadRequestId.current = requestId;
     return api<any>(`/api/downloads/${target}/overview?${refresh ? "refresh=true" : "cached=true"}`)
       .then((value) => {
-        if (downloadRequestId.current === requestId && value?.downloader_id === target) setData(value);
+        if (downloadRequestId.current === requestId && value?.downloader_id === target) {
+          setData(value);
+          setDownloadConnectionIssue(
+            value.stale ? (value.message || "\u4e0b\u8f7d\u5668\u8fde\u63a5\u5f02\u5e38\u3002") : ""
+          );
+        }
         if (target === "qb2") setQb2Authorized(true);
         return value;
       })
-      .catch(() => undefined)
+      .catch((err) => {
+        handleDownloadRefreshFailure(target, err);
+        return undefined;
+      })
       .finally(() => {
-        downloadOverviewInFlight.current = false;
+        downloadOverviewInFlight.current.delete(target);
       });
   }
 
@@ -2148,43 +2417,69 @@ function DownloadsPage({ selectedDownloader = "qb1" }: { selectedDownloader?: st
     await api("/api/auth/qb2-grant/revoke", { method: "POST" });
     setQb2Authorized(false);
     if (downloader === "qb2") {
-      setData(null);
+      setData((current: any) => current?.downloader_id === "qb2"
+        ? { ...current, items: [], tasks_captured_at: null }
+        : current);
+      void refreshQbSummary("qb2");
       setGrantOpen(false);
     }
   }
 
   const visibleData = data?.downloader_id === downloader ? data : null;
-  const qb2Locked = downloader === "qb2" && !qb2Authorized && (Boolean(error) || (!loading && !visibleData));
+  const qb2Locked = downloader === "qb2" && !qb2Authorized;
   const summary = visibleData?.summary;
   const items = visibleData?.items ?? [];
+  const selectedTarget = downloaderTargets.data?.items?.find((item) => item.id === downloader);
+  const downloaderTarget: DownloaderTarget = {
+    ...selectedTarget,
+    ...summary,
+    id: downloader,
+  };
+  const configureDownloader = (downloaderId: string) => navigateToDownloaderSettings(onNavigate, downloaderId);
+  const downloadPageError = downloader !== "qb2"
+    ? (error || (!visibleData ? downloadConnectionIssue : ""))
+    : (!visibleData ? downloadConnectionIssue : "");
+
 
   return (
     <div className="grid-page download-page">
       <div className="download-heading">
         <div>
-          <h1>下载</h1>
+          <h1>
+            <span>下载</span>
+            <DownloaderTitleLink target={downloaderTarget} label={downloaderShortLabel(downloader)} onConfigure={configureDownloader} loading={!summary && downloaderTargets.loading} className="download-heading-target" />
+          </h1>
           <p>查看和管理多个 qB 下载器中的真实任务。</p>
         </div>
         <div className="segmented">
           {["qb1", "qb2", "qb3"].map((id) => <button className={downloader === id ? "active" : ""} onClick={() => setDownloader(id)} key={id}>{downloaderShortLabel(id)}</button>)}
         </div>
       </div>
-      {summary && !qb2Locked && (
+      {summary && (
         <QbSummaryCards
           qb={summary}
-          count={items.length}
-          onRefresh={manualRefreshDownloadOverview}
-          refreshing={refreshingDownload}
+          target={downloaderTarget}
+          onConfigure={configureDownloader}
+          count={qb2Locked ? undefined : items.length}
+          onRefresh={qb2Locked ? () => { void refreshQbSummary(downloader); } : manualRefreshDownloadOverview}
+          refreshing={qb2Locked ? false : refreshingDownload}
+          allowTaskActions={!qb2Locked}
           onAddLink={() => setAddDialogMode("link")}
           onAddFile={() => setAddDialogMode("file")}
         />
       )}
       {downloader === "qb2" && qb2Authorized && !qb2Locked && <div className="qb-grant-strip"><span>qB2 隐私授权已开启</span><button type="button" onClick={revokeQb2Grant}>退出授权</button></div>}
-      {qb2Locked && <Panel title="qB2 已锁定"><p>私有下载器需要管理员验证。</p><button className="primary" onClick={() => setGrantOpen(true)}><Lock size={16} /> 验证管理员</button></Panel>}
-      {error && downloader !== "qb2" && <p className="error">{error}</p>}
+      {qb2Locked && <Panel title={"qB2 \u4efb\u52a1\u5217\u8868\u5df2\u9501\u5b9a"}><p>{"\u5177\u4f53\u4e0b\u8f7d\u4efb\u52a1\u9700\u8981\u7ba1\u7406\u5458\u9a8c\u8bc1\u540e\u67e5\u770b\u548c\u64cd\u4f5c\u3002"}</p><button className="primary" onClick={() => setGrantOpen(true)}><Lock size={16} /> {"\u9a8c\u8bc1\u7ba1\u7406\u5458"}</button></Panel>}
+      {downloadPageError && <p className="error">{downloadPageError}</p>}
       {grantOpen && <AdminGrant onDone={() => { setGrantOpen(false); setQb2Authorized(true); setData(null); refreshDownloadOverview("qb2"); }} />}
-      {loading && !visibleData && (!error || qb2Authorized) && <Panel title="下载器"><p>正在读取 qB 真实数据...</p></Panel>}
-      {visibleData && !qb2Locked && <QbTorrentTable key={downloader} items={items} downloader={downloader} onChanged={() => { refreshDownloadOverview(); }} />}
+      {loading && !visibleData && (!error || qb2Authorized) && <Panel title="下载器"><p>正在读取 qB 数据...</p></Panel>}
+      {summary && (
+        <div className="download-data-times">
+          <span>{"\u6570\u636e\u66f4\u65b0\u4e8e\uff1a"}{formatDateLabel(summary?.captured_at || visibleData?.captured_at)}</span>
+          {visibleData && !qb2Locked && <span>{"\u4efb\u52a1\u5217\u8868\u66f4\u65b0\u4e8e\uff1a"}{formatDateLabel(visibleData.tasks_captured_at)}</span>}
+        </div>
+      )}
+      {visibleData && !qb2Locked && <QbTorrentTable key={downloader} items={items} downloader={downloader} target={downloaderTarget} onConfigure={configureDownloader} onChanged={() => { refreshDownloadOverview(); }} />}
       {addDialogMode && !qb2Locked && (
         <DownloadTaskDialog
           key={`${downloader}-${addDialogMode}`}
@@ -2307,13 +2602,13 @@ function DownloadTaskDialog({ downloader, mode, onClose, onAdded }: { downloader
   );
 }
 
-function QbSummaryCards({ qb, count, onRefresh, refreshing, onAddLink, onAddFile }: { qb: any; count: number; onRefresh: () => void; refreshing: boolean; onAddLink: () => void; onAddFile: () => void }) {
+function QbSummaryCards({ qb, target, count, onConfigure, onRefresh, refreshing, allowTaskActions = true, onAddLink, onAddFile }: { qb: any; target: DownloaderTarget; count?: number; onConfigure: (downloaderId: string) => void; onRefresh: () => void; refreshing: boolean; allowTaskActions?: boolean; onAddLink: () => void; onAddFile: () => void }) {
   return (
     <div className="qb-summary-cards">
       <SummaryCard
         icon={Database}
         label="当前下载器"
-        value={downloaderDisplayName(qb)}
+        value={<DownloaderTitleLink target={target} label={downloaderDisplayName(qb)} onConfigure={onConfigure} />}
         helper={qb.online ? "在线" : "离线"}
         tone="mint"
         action={(
@@ -2321,16 +2616,16 @@ function QbSummaryCards({ qb, count, onRefresh, refreshing, onAddLink, onAddFile
             <RefreshCw size={15} />
           </button>
         )}
-        footerAction={(
+        footerAction={allowTaskActions ? (
           <span className="summary-card-quick-actions" aria-label="添加下载任务">
             <button type="button" onClick={onAddLink} title="通过链接添加" aria-label="通过链接添加下载任务"><Link2 size={15} /></button>
             <button type="button" onClick={onAddFile} title="添加种子文件" aria-label="通过种子文件添加下载任务"><UploadCloud size={15} /></button>
           </span>
-        )}
+        ) : undefined}
       />
       <SummaryCard icon={Download} label="下载速度" value={formatSpeed(qb.download_speed ?? 0)} helper="qB 实时速度" tone="teal" />
       <SummaryCard icon={Upload} label="上传速度" value={formatSpeed(qb.upload_speed ?? 0)} helper="qB 实时速度" tone="orange" />
-      <SummaryCard icon={Activity} label="活跃上传/下载" value={<ActiveTransferCounts upload={qb.active_uploads ?? 0} download={qb.active_downloads ?? 0} />} helper={`活跃共 ${(qb.active_downloads ?? 0) + (qb.active_uploads ?? 0)} 个 / 总 ${count} 个任务`} tone="blue" />
+      <SummaryCard icon={Activity} label={"\u6d3b\u8dc3\u4e0a\u4f20/\u4e0b\u8f7d"} value={<ActiveTransferCounts upload={qb.active_uploads ?? 0} download={qb.active_downloads ?? 0} />} helper={count === undefined ? `\u6d3b\u8dc3\u5171 ${(qb.active_downloads ?? 0) + (qb.active_uploads ?? 0)} \u4e2a` : `\u6d3b\u8dc3\u5171 ${(qb.active_downloads ?? 0) + (qb.active_uploads ?? 0)} \u4e2a / \u603b\u8ba1 ${count} \u4e2a\u4efb\u52a1`} tone="blue" />
       <span><strong>{qb.name}</strong>{qb.online ? "在线" : "离线"}</span>
       <span><Download size={14} /> {formatSpeed(qb.download_speed)}</span>
       <span><Upload size={14} /> {formatSpeed(qb.upload_speed)}</span>
@@ -2353,7 +2648,7 @@ function SummaryCard({ icon: Icon, label, value, helper, tone, action, footerAct
   );
 }
 
-function QbTorrentTable({ items, downloader, onChanged }: { items: any[]; downloader: string; onChanged: () => void }) {
+function QbTorrentTable({ items, downloader, target, onConfigure, onChanged }: { items: any[]; downloader: string; target: DownloaderTarget; onConfigure: (downloaderId: string) => void; onChanged: () => void }) {
   const [selectedHash, setSelectedHash] = useState("");
   const [detail, setDetail] = useState<any | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -2434,7 +2729,7 @@ function QbTorrentTable({ items, downloader, onChanged }: { items: any[]; downlo
     setDeletingTorrent(true);
     setDetailError("");
     try {
-      const confirmResult = await api<{ confirm_token: string }>(`/api/qb/${downloader}/torrents/${encodeURIComponent(item.hash)}/delete-confirm`, { method: "POST" });
+      const confirmResult = await api<{ confirm_token: string }>(`/api/qb/${downloader}/torrents/${encodeURIComponent(item.hash)}/delete-confirm?delete_files=true`, { method: "POST" });
       await api(`/api/qb/${downloader}/torrents/${encodeURIComponent(item.hash)}?confirm_token=${encodeURIComponent(confirmResult.confirm_token)}&delete_files=true`, { method: "DELETE" });
       setDeleteTorrentConfirm(null);
       setDetail(null);
@@ -2472,7 +2767,7 @@ function QbTorrentTable({ items, downloader, onChanged }: { items: any[]; downlo
       <section className="qb-table-panel">
         <div className="qb-table-header">
           <div>
-            <h2>{downloaderShortLabel(downloader)} 任务</h2>
+            <h2><DownloaderTitleLink target={target} label={downloaderShortLabel(downloader) + " 任务"} onConfigure={onConfigure} /></h2>
             <small>手机端长按任务可操作</small>
           </div>
           <span>{items.length} 条任务</span>
@@ -2623,14 +2918,11 @@ function NotificationsAssistantPage({ onNavigate }: { onNavigate?: (key: NavKey)
             {turns.length === 0 && <div className="assistant-empty">还没有消息。试试“帮我找几部高分科幻片”，或者直接聊聊你的观影计划。</div>}
             {turns.map((turn, index) => (
               <div className={"assistant-message " + turn.role} key={turn.role + "-" + index}>
-                <strong>{turn.role === "user" ? "你" : "影视中枢"}</strong>
+                <strong>{turn.role === "user" ? "你" : "影视中枢 Agent"}</strong>
                 <AssistantReply reply={turn.content} />
-                {turn.role === "assistant" && Boolean(turn.tools?.length) && (
-                  <small>本轮调用：{turn.tools!.map((tool) => wechatClawStageLabel(tool)).join(" · ")}</small>
-                )}
               </div>
             ))}
-            {busy && <div className="assistant-message assistant pending"><strong>影视中枢</strong><span>正在理解并调用需要的功能…</span></div>}
+            {busy && <div className="assistant-message assistant pending"><strong>影视中枢 Agent</strong><span>正在处理你的请求…</span></div>}
           </div>
           <label>消息
             <textarea
@@ -2647,60 +2939,6 @@ function NotificationsAssistantPage({ onNavigate }: { onNavigate?: (key: NavKey)
         </form>
       </Panel>
     </div>
-  );
-}
-
-function NotificationPreferencesCard() {
-  const { data, reload } = useLoad<any>(() => api("/api/notification-preferences"), []);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
-  const preferences: Record<NotificationPreferenceKey, boolean> = {
-    download_started: true,
-    download_completed: true,
-    resource_search: false,
-    status_query: false,
-    wechat_claw_push: true,
-    ...(data?.preferences ?? {}),
-  };
-  const labels: Record<NotificationPreferenceKey, { title: string; help: string }> = {
-    download_started: { title: "下载开始通知", help: "AI 或微信 claw 记录下载开始，并按成员偏好推送。" },
-    download_completed: { title: "下载完成通知", help: "AI 或微信 claw 记录下载完成，并按成员偏好推送。" },
-    resource_search: { title: "资源查询提醒", help: "开启后，资源查询完成时会按成员偏好推送。" },
-    status_query: { title: "状态查询提醒", help: "开启后，各板块状态查询完成时会按成员偏好推送。" },
-    wechat_claw_push: { title: "推送到 WeChat claw", help: "将允许的通知发送给已绑定的微信成员。" },
-  };
-
-  async function toggle(key: NotificationPreferenceKey) {
-    setSaving(true);
-    setError("");
-    try {
-      await api("/api/notification-preferences", {
-        method: "PUT",
-        body: JSON.stringify({ preferences: { ...preferences, [key]: !preferences[key] } }),
-      });
-      await reload();
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return (
-    <Panel title="通知偏好">
-      <div className="preference-list">
-        {(Object.keys(labels) as NotificationPreferenceKey[]).map((key) => (
-          <label className="preference-row" key={key}>
-            <input type="checkbox" checked={Boolean(preferences[key])} disabled={saving || !data} onChange={() => toggle(key)} />
-            <span>
-              <strong>{labels[key].title}</strong>
-              <small>{labels[key].help}</small>
-            </span>
-          </label>
-        ))}
-        {error && <p className="error">{error}</p>}
-      </div>
-    </Panel>
   );
 }
 
@@ -2851,7 +3089,7 @@ function MemberManagementCard({ onNavigate }: { onNavigate?: (key: NavKey) => vo
   const exceptionOptions = [
     ["mteam_exception", "站点模块异常"],
     ["qb_exception", "qB 下载器异常"],
-    ["ai_exception", "AI 模块异常"],
+    ["ai_exception", "影视中枢 Agent 异常"],
     ["tmdb_exception", "TMDB 模块异常"],
     ["wechat_claw_exception", "WeChat claw 模块异常"],
   ] as const;
@@ -2932,7 +3170,9 @@ function MemberManagementCard({ onNavigate }: { onNavigate?: (key: NavKey) => vo
                 <span>后通知</span>
               </label>}
             </div>
-            <div className="wechat-interactions member-interaction-diagnostics">
+            <details className="advanced-diagnostics">
+              <summary>高级诊断详情</summary>
+              <div className="wechat-interactions member-interaction-diagnostics">
               <div className="wechat-interactions-head">
                 <strong>最近手机端交互诊断</strong>
                 <small>{selectedInteractions.length ? `${selectedInteractions.length} 条` : "暂无记录"}</small>
@@ -2951,7 +3191,8 @@ function MemberManagementCard({ onNavigate }: { onNavigate?: (key: NavKey) => vo
                 </div>
               ))}
               {!selectedInteractions.length && <p className="muted">手机端发起交互后，这里会保留最近 5 条的耗时与失败阶段。</p>}
-            </div>
+              </div>
+            </details>
           </div>
         )}
         {error && <p className="error">{error}</p>}
@@ -3076,11 +3317,11 @@ function PersonalWechatClawCard() {
   }
 
   return (
-    <Panel title="我的微信 claw">
+    <Panel title="我的 WeChat claw">
       <div className="integration wechat-config">
         <div className={`notice ${setup.data?.connected ? "success" : "info"}`}>
           <strong>{setup.data?.connected ? "已连接" : "等待绑定"}</strong>
-          <span>此二维码只绑定当前登录账号。你的微信消息、会话 token 和自动重试队列不会与其他成员共享。</span>
+          <span>此二维码只绑定当前登录账号，不会与其他成员共享登录状态和消息记录。</span>
         </div>
         <div className="wechat-setup-card">
           <div className="wechat-setup-main">
@@ -3092,9 +3333,9 @@ function PersonalWechatClawCard() {
             </div>
           </div>
           <div className="wechat-setup-side">
-            <div className="field-help compact-help"><strong>绑定状态</strong><span>账号：<code>{setup.data?.account_id || "-"}</code></span><span>二维码：<code>{qrcode.status || "waiting"}</code></span></div>
+            <div className="field-help compact-help"><strong>绑定状态</strong><span>账号：<code>{setup.data?.account_id || "-"}</code></span><span>二维码：<code>{qrcode.status === "confirmed" ? "已确认" : qrcode.status === "expired" ? "已过期" : "等待扫码"}</code></span></div>
             <div className={lastPoll.success ? "field-help compact-help success" : "field-help compact-help"}>
-              <strong>最近处理</strong><span>原始 {lastPoll.raw_count ?? 0} / 解析 {lastPoll.parsed_count ?? 0} / 回发 {lastPoll.reply_sent_count ?? 0} / 待重试 {lastPoll.pending_count ?? 0}</span>{lastPoll.message && <span>{lastPoll.message}</span>}
+              <strong>最近处理</strong><span>收到 {lastPoll.raw_count ?? 0} / 已处理 {lastPoll.parsed_count ?? 0} / 已回复 {lastPoll.reply_sent_count ?? 0} / 待重试 {lastPoll.pending_count ?? 0}</span>{lastPoll.message && <span>{lastPoll.message}</span>}
             </div>
           </div>
         </div>
@@ -3102,31 +3343,6 @@ function PersonalWechatClawCard() {
       </div>
     </Panel>
   );
-}
-
-function AdminUserManagementCard() {
-  const members = useLoad<any>(() => api("/api/admin/users"), []);
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
-
-  async function createMember() {
-    setSaving(true);
-    setError("");
-    try {
-      await api("/api/admin/users", { method: "POST", body: JSON.stringify({ username, password }) });
-      setUsername("");
-      setPassword("");
-      await members.reload();
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return <Panel title="成员账号"><div className="integration"><div className="settings-grid"><label>用户名<input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="成员用户名" /></label><label>初始密码<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="至少 8 位" /></label></div><div className="actions"><button type="button" className="primary" disabled={saving || username.trim().length < 3 || password.length < 8} onClick={createMember}>{saving ? "创建中..." : "创建成员"}</button></div><div className="field-help"><strong>已有成员</strong><span>{Array.isArray(members.data?.items) ? members.data.items.map((item: any) => `${item.username}（${item.role}）`).join(" / ") || "暂无" : "加载中..."}</span></div>{error && <p className="error">{error}</p>}</div></Panel>;
 }
 
 function SettingsPage({ user }: { user: User }) {
@@ -3139,6 +3355,17 @@ function SettingsPage({ user }: { user: User }) {
     if (["qb1", "qb2", "qb3"].includes(saved)) return "downloaders";
     return saved === "tmdb" ? "media_search" : saved;
   });
+  useEffect(() => {
+    if (user.role !== "admin" || activeStep !== "downloaders" || !data) return;
+    const downloaderId = window.sessionStorage.getItem("ptmh.settings.downloaderId");
+    if (!downloaderId) return;
+    const frame = window.requestAnimationFrame(() => {
+      document.getElementById("downloader-settings-" + downloaderId)?.scrollIntoView({ behavior: "smooth", block: "start" });
+      window.sessionStorage.removeItem("ptmh.settings.downloaderId");
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeStep, data, user.role]);
+
   if (user.role !== "admin") return <div className="grid-page"><PersonalWechatClawCard /></div>;
   if (!data) return (
     <Panel title="设置">
@@ -3158,14 +3385,14 @@ function SettingsPage({ user }: { user: User }) {
   const providers = data.providers.filter((provider: any) => ["mteam", "qb1", "qb2", "qb3", "tmdb", "ai", "wechat_claw"].includes(provider.provider));
   const providerById = Object.fromEntries(providers.map((provider: any) => [provider.provider, provider]));
   const unreadableProviders = providers.filter((provider: any) => provider.configuration_unreadable);
-  const settingsProviderNames: Record<string, string> = { mteam: "M-Team", qb1: "qB1", qb2: "qB2", qb3: "qB3", tmdb: "TMDB", ai: "AI", wechat_claw: "WeChat claw" };
+  const settingsProviderNames: Record<string, string> = { mteam: "M-Team", qb1: "qB1", qb2: "qB2", qb3: "qB3", tmdb: "TMDB", ai: "影视中枢 Agent", wechat_claw: "WeChat claw" };
   const wechatClawConnected = Array.isArray(wechatBindings.data?.items) && wechatBindings.data.items.some((binding: any) => binding.connected);
   const steps = [
     { id: "storage", label: "NAS 存储", ready: Boolean(storage.data?.nas_storage_readable) },
     { id: "mteam", label: "M-Team", ready: providerStepReady(providerById.mteam) },
-    { id: "downloaders", label: "下载器", ready: ["qb1", "qb2", "qb3"].every((id) => providerStepReady(providerById[id])) },
+    { id: "downloaders", label: "下载器", ready: ["qb1", "qb2", "qb3"].some((id) => providerStepReady(providerById[id])) },
     { id: "media_search", label: "媒体搜索", ready: providerStepReady(providerById.tmdb) },
-    { id: "ai", label: "AI", ready: providerStepReady(providerById.ai) },
+    { id: "ai", label: "影视中枢 Agent", ready: providerStepReady(providerById.ai) },
     { id: "wechat_claw", label: "WeChat claw", ready: providerStepReady(providerById.wechat_claw) && wechatClawConnected },
   ];
   const activeProvider = providerById[activeStep];
@@ -3225,7 +3452,7 @@ function DownloadersSettingsCard({ providers, defaultDownloader, onChanged }: { 
     <div className="downloaders-settings-section">
       <div className="notice info default-downloader-notice">
         <strong>默认下载器</strong>
-        <span>M-Team、Media Hub AI 和 WeChat Claw 发起的下载都会发送到这里。请在已测试并启用的下载器中选择。</span>
+        <span>至少完成一个下载器的连接测试并启用。M-Team、影视中枢 Agent 和 WeChat claw 发起的下载都会发送到你选择的默认下载器。</span>
       </div>
       {error && <p className="error">{error}</p>}
       <div className="downloaders-settings-grid">
@@ -3278,34 +3505,7 @@ function IntegrationEditor({ provider, onChanged }: { provider: any; onChanged: 
   if (provider.provider === "ai") return <AiIntegrationEditor provider={provider} onChanged={onChanged} />;
   if (provider.provider === "wechat_claw") return <WechatClawIntegrationEditor provider={provider} onChanged={onChanged} />;
   if (["qb1", "qb2", "qb3"].includes(provider.provider)) return <QbIntegrationEditor provider={provider} onChanged={onChanged} />;
-
-  const providerNames: Record<string, string> = { ai: "AI" };
-  const [text, setText] = useState(String(provider.saved_payload?.endpoint ?? ""));
-  const payload = useMemo(() => ({ endpoint: text || "mock://service", timeout: 10 }), [text]);
-
-  async function save(path = "") {
-    const body = path === "/enable" || path === "/disable" ? undefined : JSON.stringify({ payload });
-    await api(`/api/admin/integrations/${provider.provider}${path}`, { method: "POST", body });
-    onChanged();
-  }
-
-  async function draft() {
-    await api(`/api/admin/integrations/${provider.provider}`, { method: "PUT", body: JSON.stringify({ payload }) });
-    onChanged();
-  }
-
-  return (
-    <Panel title={`${providerNames[provider.provider] ?? provider.provider} 配置`}>
-      <div className="integration">
-        <CopyableTextarea value={text} onChange={setText} placeholder="粘贴接口地址、请求头、密钥或 webhook 配置" />
-        <div className="actions">
-          <button onClick={draft}>保存草稿</button>
-          <button onClick={() => save("/test")}>保存并测试</button>
-          <button onClick={() => save(provider.enabled ? "/disable" : "/enable")}>{provider.enabled ? "停用" : "启用"}</button>
-        </div>
-      </div>
-    </Panel>
-  );
+  return <Panel title="暂不支持"><p className="muted">当前模块没有可用的配置界面。</p></Panel>;
 }
 
 function AiIntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
@@ -3325,7 +3525,7 @@ function AiIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
   const [localError, setLocalError] = useState("");
   const [localResult, setLocalResult] = useState<IntegrationTestResult | null>(provider.last_test_result);
   const result = localResult ?? provider.last_test_result;
-  const canEnable = result?.provider === "ai" && result?.mode === "real" && result?.success === true;
+  const canEnable = result?.provider === "ai" && result?.success === true && result?.can_enable === true;
 
   function updateField<K extends keyof AiForm>(key: K, value: AiForm[K]) {
     setForm((current) => ({ ...current, [key]: value }));
@@ -3353,8 +3553,7 @@ function AiIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
         success: false,
         state: "draft",
         provider: "ai",
-        mode: "real",
-        message: "AI 助手设置已保存。",
+        message: "影视中枢 Agent 设置已保存。",
         explanation: "请完成连接测试后再启用。",
         next_step: "点击“保存并测试”。",
       });
@@ -3394,10 +3593,10 @@ function AiIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
   }
 
   return (
-    <Panel title="AI 助手">
+    <Panel title="影视中枢 Agent">
       <div className="integration tmdb-editor">
         <div className="notice info">
-          <strong>影视中枢助手</strong>
+          <strong>影视中枢 Agent</strong>
           <span>配置后，可在通知页和微信中用自然语言查询影视、资源与下载状态。</span>
         </div>
         <div className="settings-grid">
@@ -3442,9 +3641,9 @@ function AiIntegrationEditor({ provider, onChanged }: { provider: any; onChanged
           <button className="primary" onClick={saveAndTest} disabled={busy !== ""}>{busy === "test" ? "正在测试..." : "保存并测试"}</button>
           <button onClick={toggleEnabled} disabled={busy !== "" || (!provider.enabled && !canEnable)}>{provider.enabled ? "停用" : "启用"}</button>
         </div>
-        {!provider.enabled && !canEnable && <p className="muted">请先保存并测试，测试成功后再启用 AI 模块。</p>}
+        {!provider.enabled && !canEnable && <p className="muted">请先保存并测试，测试成功后再启用影视中枢 Agent。</p>}
         {localError && <p className="error">{localError}</p>}
-        <TestResultCard result={result} emptyProvider="AI 助手" />
+        <TestResultCard result={result} emptyProvider="影视中枢 Agent" />
       </div>
     </Panel>
   );
@@ -3571,7 +3770,6 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
         success: false,
         state: "draft",
         provider: "wechat_claw",
-        mode: "real",
         message: "微信连接设置已保存。",
         explanation: "请完成连接测试后再启用。",
         next_step: "测试并启用后，刷新二维码并用微信扫码绑定。",
@@ -3751,137 +3949,6 @@ function WechatClawIntegrationEditor({ provider, onChanged }: { provider: any; o
   );
 }
 
-function LegacyWechatClawIntegrationEditor({ provider, onChanged }: { provider: any; onChanged: () => void }) {
-  const saved = provider.saved_payload ?? {};
-  const [form, setForm] = useState<WechatClawForm>({
-    mode: saved.mode === "direct" ? "direct" : "ilink",
-    name: String(saved.name ?? "通知1"),
-    base_url: String(saved.base_url ?? "https://ilinkai.weixin.qq.com"),
-    default_target: String(saved.default_target ?? ""),
-    admin_user_ids: String(saved.admin_user_ids ?? ""),
-    poll_timeout: String(saved.poll_timeout ?? saved.timeout ?? "25"),
-    public_base_url: String(saved.public_base_url ?? ""),
-    inbound_token: String(saved.inbound_token ?? ""),
-    webhook_url: String(saved.webhook_url ?? ""),
-    webhook_secret: String(saved.webhook_secret ?? ""),
-    timeout: String(saved.timeout ?? "10"),
-  });
-  const [busy, setBusy] = useState("");
-  const [localError, setLocalError] = useState("");
-  const [localResult, setLocalResult] = useState<IntegrationTestResult | null>(provider.last_test_result);
-  const result = localResult ?? provider.last_test_result;
-  const canEnable = result?.provider === "wechat_claw" && result?.success === true && result?.can_enable === true;
-
-  function updateField<K extends keyof WechatClawForm>(key: K, value: WechatClawForm[K]) {
-    setForm((current) => ({ ...current, [key]: value }));
-  }
-
-  function payload() {
-    return {
-      public_base_url: form.public_base_url.trim(),
-      inbound_token: form.inbound_token.trim(),
-      webhook_url: form.webhook_url.trim(),
-      webhook_secret: form.webhook_secret.trim(),
-      timeout: Number(form.timeout) || 10,
-    };
-  }
-
-  async function saveDraft() {
-    setBusy("draft");
-    setLocalError("");
-    try {
-      await api(`/api/admin/integrations/wechat_claw`, { method: "PUT", body: JSON.stringify({ payload: payload() }) });
-      setLocalResult({
-        success: false,
-        state: "draft",
-        provider: "wechat_claw",
-        mode: "real",
-        message: "WeChat claw 草稿已保存。",
-        explanation: "入口密钥和 webhook secret 已加密保存。启用前请先测试。",
-        next_step: "确认公网或局域网手机可访问地址后，点击保存并测试。",
-      });
-      onChanged();
-    } catch (err) {
-      setLocalError((err as Error).message);
-    } finally {
-      setBusy("");
-    }
-  }
-
-  async function saveAndTest() {
-    setBusy("test");
-    setLocalError("");
-    try {
-      const updated = await api<any>(`/api/admin/integrations/wechat_claw/test`, { method: "POST", body: JSON.stringify({ payload: payload() }) });
-      setLocalResult(updated.last_test_result);
-      onChanged();
-    } catch (err) {
-      setLocalError((err as Error).message);
-    } finally {
-      setBusy("");
-    }
-  }
-
-  async function toggleEnabled() {
-    setBusy("enable");
-    setLocalError("");
-    try {
-      await api(`/api/admin/integrations/wechat_claw${provider.enabled ? "/disable" : "/enable"}`, { method: "POST" });
-      onChanged();
-    } catch (err) {
-      setLocalError((err as Error).message);
-    } finally {
-      setBusy("");
-    }
-  }
-
-  const publicBaseUrl = form.public_base_url.trim().replace(/\/+$/, "");
-  const endpoint = publicBaseUrl ? `${publicBaseUrl}/api/wechat-claw/message` : "/api/wechat-claw/message";
-  const capabilitiesEndpoint = publicBaseUrl ? `${publicBaseUrl}/api/wechat-claw/capabilities` : "/api/wechat-claw/capabilities";
-
-  return (
-    <Panel title="WeChat claw 配置">
-      <div className="integration tmdb-editor">
-        <div className="notice info">
-          <strong>手机端 AI 对话与通知入口</strong>
-          <span>WeChat claw 调用后端入口后，会复用 DeepSeek 配置完成自然语言资源查询、下载通知记录和各板块状态查询。公开访问地址可以是内网穿透、反向代理或手机能访问的局域网地址。</span>
-        </div>
-        <div className="settings-grid">
-          <label>APP 公开访问地址
-            <CopyableInput value={form.public_base_url} onChange={(value) => updateField("public_base_url", value)} placeholder="例如 https://media.example.com 或 http://192.168.1.20:8000" inputMode="url" />
-          </label>
-          <label>Inbound token
-            <SecretInput value={form.inbound_token} onChange={(value) => updateField("inbound_token", value)} placeholder="手机端调用 /api/wechat-claw/message 时携带" autoComplete="off" />
-          </label>
-          <label>Webhook URL（可选）
-            <CopyableInput value={form.webhook_url} onChange={(value) => updateField("webhook_url", value)} placeholder="WeChat claw 接收主动通知的 webhook" inputMode="url" />
-          </label>
-          <label>Webhook secret（可选）
-            <SecretInput value={form.webhook_secret} onChange={(value) => updateField("webhook_secret", value)} placeholder="作为 X-Wechat-Claw-Secret 发送" autoComplete="off" />
-          </label>
-          <label>超时秒数
-            <CopyableInput value={form.timeout} onChange={(value) => updateField("timeout", value)} inputMode="numeric" placeholder="10" />
-          </label>
-        </div>
-        <div className="field-help">
-          <strong>手机端请求地址</strong>
-          <span><code>{endpoint}</code></span>
-          <span>Capabilities: <code>{capabilitiesEndpoint}</code></span>
-          <span>请求头携带 <code>X-Wechat-Claw-Token</code>，请求体使用 <code>{`{"message":"帮我查一下 qB 状态"}`}</code>。</span>
-        </div>
-        <div className="actions">
-          <button onClick={saveDraft} disabled={busy !== ""}>{busy === "draft" ? "正在保存..." : "保存草稿"}</button>
-          <button className="primary" onClick={saveAndTest} disabled={busy !== ""}>{busy === "test" ? "正在测试..." : "保存并测试"}</button>
-          <button onClick={toggleEnabled} disabled={busy !== "" || (!provider.enabled && !canEnable)}>{provider.enabled ? "停用" : "启用"}</button>
-        </div>
-        {!provider.enabled && !canEnable && <p className="muted">请先保存并测试，测试成功后再启用 WeChat claw。</p>}
-        {localError && <p className="error">{localError}</p>}
-        <TestResultCard result={result} emptyProvider="WeChat claw" />
-      </div>
-    </Panel>
-  );
-}
-
 function QbIntegrationEditor({ provider, onChanged, isDefault, defaultBusy, onSetDefault }: { provider: any; onChanged: () => void; isDefault?: boolean; defaultBusy?: boolean; onSetDefault?: () => void }) {
   const label = downloaderShortLabel(provider.provider);
   const saved = provider.saved_payload ?? {};
@@ -3920,7 +3987,6 @@ function QbIntegrationEditor({ provider, onChanged, isDefault, defaultBusy, onSe
         success: false,
         state: "draft",
         provider: provider.provider,
-        mode: "real",
         message: "草稿已保存。",
         explanation: "连接信息已保存。",
         next_step: "点击“保存并测试”确认连接。"
@@ -3961,7 +4027,7 @@ function QbIntegrationEditor({ provider, onChanged, isDefault, defaultBusy, onSe
   }
 
   return (
-    <Panel title={`${label} 配置`}>
+    <Panel id={"downloader-settings-" + provider.provider} title={`${label} 配置`}>
       <div className="integration tmdb-editor">
         <div className="downloader-default-control">
           {isDefault ? (
@@ -3974,7 +4040,7 @@ function QbIntegrationEditor({ provider, onChanged, isDefault, defaultBusy, onSe
         </div>
         <div className="notice info">
           <strong>连接下载器</strong>
-          <span>连接成功并启用后，可查看下载任务和运行状态，也可手动设为 M-Team、AI 与 WeChat Claw 的默认下载目标。</span>
+          <span>连接成功并启用后，可查看下载任务和运行状态，也可手动设为 M-Team、影视中枢 Agent 与 WeChat claw 的默认下载目标。</span>
         </div>
         <div className="settings-grid">
           <label>qB WebUI 地址（必填）
@@ -4051,7 +4117,6 @@ function MTeamIntegrationEditor({ provider, onChanged }: { provider: any; onChan
         success: false,
         state: "draft",
         provider: "mteam",
-        mode: "mock",
         message: "草稿已保存。",
         explanation: "连接信息已保存。",
         next_step: "点击“保存并测试”确认连接。"
@@ -4158,7 +4223,7 @@ function MediaSearchSettingsCard({ provider, onChanged }: { provider: any; onCha
   const [enabled, setEnabled] = useState(Boolean(provider.enabled));
   useEffect(() => setEnabled(Boolean(provider.enabled)), [provider.enabled]);
   const result = localResult ?? provider.last_test_result;
-  const canEnable = result?.provider === "tmdb" && result?.mode === "real" && result?.can_enable === true;
+  const canEnable = result?.provider === "tmdb" && result?.success === true && result?.can_enable === true;
 
   function updateField<K extends keyof TmdbForm>(key: K, value: TmdbForm[K]) {
     setForm((current) => ({ ...current, [key]: value }));
@@ -4203,7 +4268,6 @@ function MediaSearchSettingsCard({ provider, onChanged }: { provider: any; onCha
         success: false,
         state: "draft",
         provider: "tmdb",
-        mode: "real",
         can_enable: false,
         message: "草稿已保存。",
         explanation: "TMDB 凭据和网络设置已保存。",
@@ -4475,7 +4539,12 @@ function TestResultCard({ result, emptyProvider }: { result?: IntegrationTestRes
           <b className={domainRoutes[option.domain] === "proxy" ? "proxy" : "direct"}>{domainRoutes[option.domain] === "proxy" ? "Mihomo" : "DoH 直连"}</b>
         </span>)}
       </div>}
-      {result.trace_id && <small>诊断编号：{result.trace_id}</small>}
+      {result.trace_id && (
+        <details className="technical-details">
+          <summary>高级诊断详情</summary>
+          <small>诊断编号：{result.trace_id}</small>
+        </details>
+      )}
     </div>
   );
 }
@@ -4502,6 +4571,8 @@ function SecretInput(props: {
   onChange: (value: string) => void;
   placeholder?: string;
   autoComplete?: string;
+  name?: string;
+  minLength?: number;
 }) {
   const [visible, setVisible] = useState(false);
   return (
@@ -4512,6 +4583,8 @@ function SecretInput(props: {
         onChange={(event) => props.onChange(event.target.value)}
         placeholder={props.placeholder}
         autoComplete={props.autoComplete}
+        name={props.name}
+        minLength={props.minLength}
       />
       <div className="input-tools">
         <button className="icon-tool" type="button" onClick={() => setVisible((current) => !current)} title={visible ? "隐藏明文" : "显示明文"} aria-label={visible ? "隐藏明文" : "显示明文"}>
@@ -4574,7 +4647,7 @@ function diagnosticModuleName(module: string): string {
     qb2: "qB下载器2",
     qb3: "qB下载器3",
     tmdb: "TMDB",
-    ai: "AI 模块",
+    ai: "影视中枢 Agent",
     wechat_claw: "WeChat claw",
     nas_disk: "NAS 存储",
   };
@@ -4730,8 +4803,8 @@ function DiagnosticsPage() {
     </div>
   );
 }
-function Panel({ title, children }: { title: string; children: ReactNode }) {
-  return <section className="panel"><h2>{title}</h2>{children}</section>;
+function Panel({ title, children, id }: { title: string; children: ReactNode; id?: string }) {
+  return <section className="panel" id={id}><h2>{title}</h2>{children}</section>;
 }
 
 function Metric({ icon: Icon, title, value, source, tone }: { icon?: typeof Film; title: string; value: ReactNode; source: string; tone?: "download" | "upload" | "activity" }) {
@@ -4758,6 +4831,56 @@ function StorageMetric({ overview }: { overview: any }) {
   );
 }
 
+function navigateToDownloaderSettings(onNavigate: ((key: NavKey) => void) | undefined, downloaderId: string) {
+  window.sessionStorage.setItem("ptmh.settings.activeStep", "downloaders");
+  window.sessionStorage.setItem("ptmh.settings.downloaderId", downloaderId);
+  onNavigate?.("settings");
+}
+
+
+function downloaderWebuiHref(target: DownloaderTarget): string {
+  const value = String(target?.webui_url || "").trim();
+  if (!value) return "";
+  try {
+    const parsed = new URL(value);
+    return ["http:", "https:"].includes(parsed.protocol) ? parsed.toString() : "";
+  } catch {
+    return "";
+  }
+}
+
+
+function DownloaderTitleLink({
+  target,
+  label,
+  onConfigure,
+  loading = false,
+  className = "",
+}: {
+  target: DownloaderTarget;
+  label: string;
+  onConfigure: (downloaderId: string) => void;
+  loading?: boolean;
+  className?: string;
+}) {
+  const href = downloaderWebuiHref(target);
+  const classes = ["downloader-title-link", className, loading ? "loading" : ""].filter(Boolean).join(" ");
+  if (loading) return <span className={classes}>{label}</span>;
+  if (href) {
+    return (
+      <a className={classes} href={href} target="_blank" rel="noreferrer noopener" title={"打开 " + label + " WebUI"}>
+        <span>{label}</span>
+      </a>
+    );
+  }
+  return (
+    <button className={classes} type="button" onClick={() => onConfigure(target.id)} title={"配置 " + label}>
+      <span>{label}</span>
+    </button>
+  );
+}
+
+
 function downloaderDisplayName(qb: any): string {
   const id = String(qb?.id ?? "");
   const match = id.match(/^qb(\d+)$/i);
@@ -4781,11 +4904,13 @@ function downloaderShortLabel(value: string): string {
 function DownloaderCard({
   qb,
   onOpen,
+  onConfigure,
   onTestConnection,
   testingConnection = false,
 }: {
   qb: any;
   onOpen?: (downloaderId: string) => void;
+  onConfigure: (downloaderId: string) => void;
   onTestConnection?: (downloaderId: string) => void;
   testingConnection?: boolean;
 }) {
@@ -4797,29 +4922,22 @@ function DownloaderCard({
   const connectionError = configured && enabled && !online;
   const statusLabel = !configured ? "未配置" : connectionError ? "连接异常" : online ? "连接正常" : "未启用";
   const statusTitle = qb.message || statusLabel;
-  const updatedAt = qb.updated_at;
+  const updatedAt = qb.captured_at || qb.updated_at;
 
   function openDownloader() {
     if (qb.id) onOpen?.(qb.id);
   }
 
-  function handleStatusTest(event: MouseEvent<HTMLButtonElement>) {
-    event.stopPropagation();
+  function handleStatusTest() {
     if (qb.id && configured) onTestConnection?.(qb.id);
   }
 
-  function handleCardKeyDown(event: KeyboardEvent<HTMLElement>) {
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      openDownloader();
-    }
-  }
-
   return (
-    <article className={`downloader-node ${configured ? "" : "empty"} ${online ? "online" : "offline"}`.trim()} role="button" tabIndex={0} onClick={openDownloader} onKeyDown={handleCardKeyDown}>
+    <article className={`downloader-node ${configured ? "" : "empty"} ${online ? "online" : "offline"}`.trim()}>
+      <button className="downloader-card-open" type="button" onClick={openDownloader} aria-label={`查看 ${displayName} 下载任务`} />
       <div className="downloader-node-top">
         <div className="downloader-node-title" title={statusTitle}>
-          <h3>{displayName}</h3>
+          <h3><DownloaderTitleLink target={qb} label={displayName} onConfigure={onConfigure} /></h3>
           <span className={connectionError ? "downloader-status-label error" : "downloader-status-label"}>
             <button className={testingConnection ? "downloader-status-button spinning" : "downloader-status-button"} type="button" onClick={handleStatusTest} disabled={testingConnection || !configured} title={`测试 ${displayName} 连通性`} aria-label={`测试 ${displayName} 连通性`}>
               <span className={online ? "status-dot online" : "status-dot offline"} />
@@ -4827,7 +4945,7 @@ function DownloaderCard({
             {statusLabel}
           </span>
         </div>
-        <small className="downloader-updated-at">数据更新于：{formatDateLabel(updatedAt)}</small>
+        <small className="downloader-updated-at">{"\u6570\u636e\u66f4\u65b0\u4e8e\uff1a"}{formatDateLabel(updatedAt)}</small>
       </div>
       {!configured ? (
         <div className="downloader-empty-body">请去设置里配置这个下载器</div>
@@ -4850,8 +4968,20 @@ function DownloaderCard({
   );
 }
 
-function LockedCard({ title, message, onOpen }: { title: string; message: string; onOpen?: () => void }) {
-  return <button className="downloader-node locked" type="button" onClick={onOpen}><div className="downloader-node-head"><div className="downloader-node-title"><h3>{title}</h3></div><Lock size={16} /></div><p>{message}</p><small className="downloader-node-helper">需要管理员验证</small></button>;
+function LockedCard({ qb, title, message, onOpen, onConfigure }: { qb: DownloaderTarget; title: string; message: string; onOpen?: () => void; onConfigure: (downloaderId: string) => void }) {
+  return (
+    <article className="downloader-node locked">
+      <button className="downloader-card-open" type="button" onClick={onOpen} aria-label={`查看 ${title}`} />
+      <div className="downloader-node-head">
+        <div className="downloader-node-title">
+          <h3><DownloaderTitleLink target={qb} label={title} onConfigure={onConfigure} /></h3>
+        </div>
+        <Lock size={16} />
+      </div>
+      <p>{message}</p>
+      <small className="downloader-node-helper">需要管理员验证</small>
+    </article>
+  );
 }
 
 function MediaSearchResults({ items = [], onSelect, loading, error }: { items: any[]; onSelect: (item: any) => void; loading?: boolean; error?: string }) {
@@ -5048,7 +5178,7 @@ function MTeamResourceCard({ item }: { item: any }) {
         setPushNotice({ status: "running", title: "正在推送下载", step: "正在下载种子文件", detail: item.title });
       }, 700),
       window.setTimeout(() => {
-        setPushNotice({ status: "running", title: "正在推送下载", step: "等待后端完成推送闭环", detail: item.title });
+        setPushNotice({ status: "running", title: "正在推送下载", step: "正在等待下载器确认任务", detail: item.title });
       }, 1700),
     ];
     try {
@@ -5422,14 +5552,6 @@ function PersonDetailPage({
       </section>
     </section>
   );
-}
-
-function ResourceRow({ item }: { item: any }) {
-  async function download() {
-    await api(`/api/mteam/torrents/${encodeURIComponent(item.id)}/download`, { method: "POST", body: JSON.stringify({ payload: item }) });
-  }
-
-  return <div className="row"><strong>{item.title}</strong><span>{item.resolution} / {item.codec} / {item.size} / 做种 {item.seeders}</span><button className="resource-download-button" onClick={download}><Download size={16} />下载</button></div>;
 }
 
 function QbTorrentTableRow({
@@ -5976,7 +6098,7 @@ function FavoritesPage() {
     <div className="grid-page favorites-page">
       <section className="favorites-toolbar">
         <div>
-          <span className="favorites-eyebrow">MY COLLECTION</span>
+          <span className="favorites-eyebrow">收藏片单</span>
           <h2>我的收藏</h2>
           <p>{favorites.items.length ? `已收藏 ${favorites.items.length} 部作品` : "喜欢的影片会在这里汇集"}</p>
         </div>
@@ -6106,7 +6228,7 @@ function resourceChips(item: any): string[] {
 function promotionTitle(item: any): string {
   const parts = [];
   if (item.promotion_until) parts.push(`截止：${formatDateLabel(item.promotion_until)}`);
-  if (item.discount) parts.push(`原始枚举：${item.discount}`);
+  if (item.discount) parts.push(`促销类型：${item.discount}`);
   return parts.join(" / ") || "促销";
 }
 

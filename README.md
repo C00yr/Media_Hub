@@ -1,4 +1,4 @@
-# PT Media Hub MVP
+# PT Media Hub
 
 PT Media Hub is a NAS-first Docker Web App for media discovery, PT download monitoring, statistics, runtime credential management, and diagnostics.
 
@@ -6,11 +6,11 @@ PT Media Hub is a NAS-first Docker Web App for media discovery, PT download moni
 
 - React + TypeScript + Vite frontend.
 - FastAPI backend.
-- SQLite WAL, SQLAlchemy models, and Alembic wiring.
+- SQLite WAL, SQLAlchemy models, and automatic Alembic upgrades.
 - First-run administrator setup wizard.
 - JWT login, admin role, and qB 2 temporary admin grant.
 - Runtime credential center with encrypted storage, redacted summaries, audit logs, enable/disable, and connection tests.
-- Real adapters for M-Team, qBittorrent, and TMDB, with mock fallbacks for unfinished areas.
+- Real adapters for M-Team, qBittorrent, TMDB, AI, and WeChat claw.
 - Dashboard, Discover, Search, Downloads, Stats, Notifications, Settings, and Diagnostics UI.
 
 ## Local Development
@@ -87,6 +87,52 @@ The dashboard storage card scans fixed container paths: `/mnt/storage1`, `/mnt/s
 ```
 
 If the three folders are on the same NAS storage pool, the backend deduplicates them by device ID and counts the capacity only once. The Settings page shows the detected pool and folder count.
+
+## 首次部署与初始化
+
+1. 在 NAS 上创建一个仅供本应用使用的目录，将仓库内容放入其中。
+2. 确认 `docker-compose.yml` 中三个媒体目录左侧路径对应真实 NAS 目录，右侧 `/mnt/storage1~3` 保持不变。
+3. 执行 `docker compose up -d --build`，健康检查通过后访问 `http://NAS地址:8000`。
+4. 按首次启动向导创建管理员账号，再到设置页填写 M-Team、qBittorrent、TMDB、AI 和 WeChat claw 配置。
+
+首次启动会在持久化的 `data` 目录中创建 SQLite 数据库和 `runtime-secrets.json`。两者是一套数据，缺少其中任意一个都可能导致已保存的服务凭据无法解密。
+
+### ????
+
+??????????????????????????????????
+
+```text
+Recovery super password generated. Store it securely: <????>
+```
+
+??? `docker compose logs pt-media-hub` ?????????????????????????????????????????????????????????????????????
+
+?????????? NAS ?????????????????????????????????????? NAS ??????? `data` ??????????????????????????????????????????Tailscale ????????????????????????????????????????????????????
+
+
+## 升级、备份与回滚
+
+升级前先停止容器，并同时备份数据库、运行时密钥和 Compose 配置：
+
+```bash
+docker compose down
+cp -a data data-backup-$(date +%Y%m%d-%H%M%S)
+cp docker-compose.yml docker-compose.yml.backup
+docker compose up -d --build
+```
+
+应用启动时会执行 Alembic 迁移。首次接管旧版本数据库时，会在数据库旁额外生成一个 `.pre-alembic-时间.bak` 文件。升级完成后检查 `/health`、仪表盘、诊断页以及各下载器连接。
+
+如需回滚，先停止容器，恢复与旧镜像同一时刻备份的整个 `data` 目录和 Compose 文件，再启动旧镜像。不要只恢复数据库或只恢复 `runtime-secrets.json`，也不要对正式数据库手工执行 Alembic downgrade。
+
+## 时区
+
+浏览器页面、请求时的日期标签和网页内 AI 回复使用当前设备报告的 IANA 时区；无人访问时的后台任务和 WeChat claw 回复使用 `APP_TIMEZONE`。Compose 默认把 `APP_TIMEZONE` 和容器 `TZ` 都设为 `Asia/Shanghai`。更换地区时在 `.env` 中设置同一个 IANA 时区名称，例如 `Asia/Tokyo`，然后重建容器。历史时间始终按 UTC 存储。
+
+## Mihomo 连接
+
+Mihomo 不由本项目自动启动。先确认 Media Hub 容器能访问 Mihomo 的 HTTP 代理端口，再在“设置 > 媒体搜索 > 网络连接”中填写地址并保存测试。Mihomo 与 Media Hub 在同一 Compose 网络时可使用 `http://mihomo:7890`；Mihomo 暴露在 NAS 主机时可尝试 `http://host.docker.internal:7890`。只有界面勾选的 TMDB 域名会走代理，其余业务流量保持直连。
+
 
 ## Deployment Notes
 
