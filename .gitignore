@@ -11,6 +11,12 @@ frontend/pnpm-lock.yaml
 frontend/pnpm-workspace.yaml
 data/
 backend/data/
+**/runtime-secrets.json
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.sqlite
+**/*.sqlite3
 backend/.pytest_cache/
 backend/.venv/
 backend/pytest-cache-files-*/

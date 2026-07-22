@@ -13,20 +13,6 @@ PT Media Hub is a NAS-first Docker Web App for media discovery, PT download moni
 - Real adapters for M-Team, qBittorrent, TMDB, AI, and WeChat claw.
 - Dashboard, Discover, Search, Downloads, Stats, Notifications, Settings, and Diagnostics UI.
 
-## Local Development
-
-### Windows one-click start (recommended)
-
-1. Double-click `start-dev.cmd` in the project root.
-2. Open `http://127.0.0.1:5173`.
-3. Double-click `stop-dev.cmd` when finished.
-
-The launcher always stores local development data in `data/local`, while NAS/Docker stores its data in the mounted `/data` directory. It refuses to replace an existing frontend on port 5173, automatically selects a backend port from 18001-18010, and does not use Uvicorn `--reload`. This prevents a local development process from sharing the NAS SQLite database or generating an uncontrolled Windows reload log.
-
-On the first run, the launcher creates `backend/.venv` and installs the backend and frontend dependencies automatically. If Python 3.12+ or Node.js LTS is missing, it uses Windows `winget` to install it and continues in the same launch. The first run therefore needs an internet connection. Windows 10/11 with App Installer (`winget`) is required only when the prerequisite is not already installed.
-
-For manual advanced startup, use the same `APP_RUNTIME_PROFILE=local`, `APP_DATA_DIR=<project>/data/local`, database, and secret-file values used by `scripts/start-dev.ps1`. Do not use the NAS `/data` path and do not add `--reload` on Windows.
-
 ## Docker
 
 For NAS or Docker Compose deployment, create a persistent `data` folder and start the stack:
@@ -42,10 +28,7 @@ The app generates its runtime encryption/JWT secrets on first start and stores t
 `data/runtime-secrets.json`. Keep the `data` folder when upgrading or recreating containers.
 Advanced users can still create `.env` from `.env.example` to override network/storage defaults.
 
-Browser timestamps, request-time calendar labels, and AI replies use the viewer device's current IANA timezone. Background jobs and WeChat replies without a browser context use `APP_TIMEZONE` (for example, `Asia/Shanghai`). The local launcher detects the development computer's timezone automatically. The bundled Compose file defaults both `APP_TIMEZONE` and the container `TZ` to `Asia/Shanghai`; set `APP_TIMEZONE` in `.env` when the NAS should use another timezone. Timestamps remain stored in UTC so changing the display timezone does not rewrite historical data.
-
-
-Source-code development and NAS deployment are separate application instances. Do not copy the NAS database into `data/local`, and do not point local `DATABASE_URL` at a NAS share. The backend validates this at startup and rejects accidental cross-profile SQLite paths.
+Browser timestamps, request-time calendar labels, and AI replies use the viewer device's current IANA timezone. Background jobs and WeChat replies without a browser context use `APP_TIMEZONE` (for example, `Asia/Shanghai`). The bundled Compose file defaults both `APP_TIMEZONE` and the container `TZ` to `Asia/Shanghai`; set `APP_TIMEZONE` in `.env` when the NAS should use another timezone. Timestamps remain stored in UTC so changing the display timezone does not rewrite historical data.
 
 ## Media Search Proxy
 
@@ -137,6 +120,7 @@ Mihomo 不由本项目自动启动。先确认 Media Hub 容器能访问 Mihomo 
 ## Deployment Notes
 
 - Keep the `data` folder private and persistent. It contains the app database and generated runtime secrets.
+- Never commit the `data` directory, databases, runtime secrets, logs, exports, or packaged archives. The repository ignores these files by default.
 - You do not need to create `.env` for a normal single-NAS deployment.
 - Do not put M-Team, qB, TMDB, AI, or WeChat Claw business credentials in Docker `.env`.
 - For remote access, prefer Tailscale or another private tunnel. Do not expose this app directly to the public internet.
