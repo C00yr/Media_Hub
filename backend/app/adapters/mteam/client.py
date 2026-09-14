@@ -95,6 +95,7 @@ class MTeamAdapter(TrackerAdapter):
         self.api_key = self._pick_api_key(config)
         self.base_url = self._api_base(str(config.get("api_base_url") or config.get("base_url") or MTEAM_API_BASE))
         self.timeout = int(config.get("timeout") or 10)
+        self.last_search_meta: dict[str, Any] = {}
         self.opener = build_opener(ProxyHandler({}))
         if not self.api_key:
             raise MTeamConfigError("M-Team API Key 未配置")
@@ -181,16 +182,36 @@ class MTeamAdapter(TrackerAdapter):
     def search_torrents(self, query: str, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         if not query.strip():
             return []
-        request_payload = {
-            "mode": "normal",
-            "keyword": query.strip(),
-            "pageNumber": 1,
-            "pageSize": int((filters or {}).get("page_size") or 20),
+        options = dict(filters or {})
+        page_size = max(1, min(int(options.get("page_size") or 20), 100))
+        max_pages = max(1, min(int(options.get("max_pages") or 1), 5))
+        raw_items: list[dict[str, Any]] = []
+        complete = False
+        pages_scanned = 0
+        for page_number in range(1, max_pages + 1):
+            request_payload = {
+                "mode": "normal",
+                "keyword": query.strip(),
+                "pageNumber": page_number,
+                "pageSize": page_size,
+            }
+            payload = self._request("POST", "/api/torrent/search", request_payload)
+            data = payload.get("data") if isinstance(payload, dict) else payload
+            page_items = _extract_items(data)
+            raw_items.extend(page_items)
+            pages_scanned = page_number
+            total = _search_total(data)
+            if not page_items or len(page_items) < page_size or (total is not None and len(raw_items) >= total):
+                complete = True
+                break
+        self.last_search_meta = {
+            "query": query.strip(),
+            "pages_scanned": pages_scanned,
+            "scanned_count": len(raw_items),
+            "complete": complete,
+            "budget_reached": bool(not complete and pages_scanned >= max_pages),
         }
-        payload = self._request("POST", "/api/torrent/search", request_payload)
-        data = payload.get("data") if isinstance(payload, dict) else payload
-        items = _extract_items(data)
-        return [self._normalize_torrent(item) for item in items]
+        return [self._normalize_torrent(item) for item in raw_items]
 
     def get_download_payload(self, torrent_id: str) -> dict[str, Any]:
         return {"torrent_id": torrent_id, "download_url": f"{self.base_url}/api/torrent/genDlToken", "download_method": "POST"}
@@ -337,6 +358,11 @@ class MTeamAdapter(TrackerAdapter):
         category = _category_label(_pick(item, "category", "categoryName", "browseType") or _find_value(flat, "categoryName", "browseType", "category"))
         labels = _torrent_labels(item, title, subtitle, flat)
         promotion = _promotion_info(item, flat)
+        official_value = (
+            _pick(item, "official", "isOfficial", "officialTorrent", "officialFlag")
+            or status.get("official")
+            or status.get("isOfficial")
+        )
         resolution = _enum_label(_pick(item, "standard", "resolution"), MTEAM_STANDARD_LABELS) or _guess_resolution(title)
         codec = _enum_label(_pick(item, "videoCodec", "codec"), MTEAM_VIDEO_CODEC_LABELS) or _guess_codec(title)
         audio_codec = _enum_label(_pick(item, "audioCodec", "audio"), MTEAM_AUDIO_CODEC_LABELS) or _guess_audio(title)
@@ -358,6 +384,9 @@ class MTeamAdapter(TrackerAdapter):
             "promotion_label": promotion["label"],
             "promotion_until": promotion["until"],
             "promotion_remaining": promotion["remaining"],
+            "download_factor": promotion["download_factor"],
+            "upload_multiplier": 1.0,
+            "is_official": _bool_from_any(official_value),
             "imdb_rating": _rating_label(_pick(item, "imdbRating", "imdb_rate") or _find_value(flat, "imdbRating", "imdbRate")),
             "douban_rating": _rating_label(_pick(item, "doubanRating", "douban_rate") or _find_value(flat, "doubanRating", "doubanRate")),
             "seeders": int(_float_from_any(_pick(item, "seeders", "seedCount", default=status.get("seeders"))) or 0),
@@ -678,7 +707,7 @@ def _torrent_labels(item: dict[str, Any], title: str, subtitle: str, flat: dict[
     return result[:8]
 
 
-def _promotion_info(item: dict[str, Any], flat: dict[str, Any]) -> dict[str, str]:
+def _promotion_info(item: dict[str, Any], flat: dict[str, Any]) -> dict[str, Any]:
     status = item.get("status") if isinstance(item.get("status"), dict) else {}
     promotion_rule = status.get("promotionRule") if isinstance(status.get("promotionRule"), dict) else {}
     mall_single_free = status.get("mallSingleFree") if isinstance(status.get("mallSingleFree"), dict) else {}
@@ -705,31 +734,46 @@ def _promotion_info(item: dict[str, Any], flat: dict[str, Any]) -> dict[str, str
     remaining = _time_left_label(generic_until)
     normalized = raw_type.upper().replace("-", "_").replace(" ", "_")
 
-    if rule_type.upper() == "FREE" or explicit_free_until or normalized in {"FREE", "PERCENT_100", "FREE_100", "FREE100", "ZERO", "PERCENT_0"}:
-        label = "FREE"
+    if rule_type.upper() == "FREE" or explicit_free_until or normalized in {"FREE", "FREE_100", "FREE100", "ZERO", "PERCENT_0"}:
+        label = "免费"
         promo_type = "free"
+        download_factor = 0.0
     elif normalized.startswith("PERCENT_"):
         percent = normalized.removeprefix("PERCENT_")
-        label = f"{percent}%"
-        promo_type = "percent"
+        percent_value = max(0.0, min(100.0, _float_from_any(percent) or 100))
+        if percent_value in {30.0, 50.0}:
+            label = f"{int(percent_value)}%"
+            promo_type = "percent"
+            download_factor = percent_value / 100
+        else:
+            label = ""
+            promo_type = ""
+            download_factor = 1.0
     elif normalized in {"HALF", "HALF_DOWN", "HALFDOWNLOAD"}:
         label = "50%"
         promo_type = "percent"
-    elif normalized in {"DOUBLE", "TWO_X", "X2", "DOUBLE_UPLOAD"}:
-        label = "2X"
-        promo_type = "multiplier"
+        download_factor = 0.5
     elif normalized and normalized not in {"NORMAL", "NONE", "NO"}:
-        label = raw_type
-        promo_type = "custom"
+        label = ""
+        promo_type = ""
+        download_factor = 1.0
     else:
         label = ""
         promo_type = ""
+        download_factor = 1.0
 
-    if label == "FREE" and remaining:
-        label = f"FREE {remaining}"
+    if label == "免费" and remaining:
+        label = f"免费 {remaining}"
     elif label and remaining and promo_type != "custom":
         label = f"{label} {remaining}"
-    return {"raw_type": raw_type, "type": promo_type, "label": label, "until": until, "remaining": remaining}
+    return {
+        "raw_type": raw_type,
+        "type": promo_type,
+        "label": label,
+        "until": until,
+        "remaining": remaining,
+        "download_factor": download_factor,
+    }
 
 
 def _iso_datetime_label(value: Any) -> str:
@@ -792,6 +836,31 @@ def _extract_items(data: Any) -> list[dict[str, Any]]:
                 if nested:
                     return nested
     return []
+
+
+def _search_total(data: Any) -> int | None:
+    if isinstance(data, dict):
+        for key in ("total", "totalElements", "totalCount", "count"):
+            value = data.get(key)
+            if value not in (None, ""):
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    pass
+        for key in ("data", "page", "pagination"):
+            nested = data.get(key)
+            value = _search_total(nested)
+            if value is not None:
+                return value
+    return None
+
+
+def _bool_from_any(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().lower() in {"1", "true", "yes", "official", "官种"}
 
 
 def _looks_like_json(content: bytes, content_type: str) -> bool:

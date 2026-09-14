@@ -14,10 +14,6 @@ services:
       # APP_TIMEZONE controls backend/AI fallbacks; TZ keeps the container OS aligned.
       APP_TIMEZONE: ${APP_TIMEZONE:-Asia/Shanghai}
       TZ: ${APP_TIMEZONE:-Asia/Shanghai}
-    extra_hosts:
-      # Optional hostname users may enter for a proxy published by the NAS host.
-      # The proxy address and port are configured only in the Media Hub UI.
-      - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
     volumes:

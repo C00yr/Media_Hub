@@ -11,9 +11,15 @@ def test_new_database_is_created_at_alembic_head():
     upgrade_database(engine, "sqlite:///:memory:")
 
     tables = set(inspect(engine).get_table_names())
-    assert {"users", "media_favorites", "mteam_traffic_rollups", "qb_delete_confirmations"} <= tables
+    assert {
+        "users",
+        "media_favorites",
+        "mteam_traffic_rollups",
+        "qb_delete_confirmations",
+        "agent_download_operations",
+    } <= tables
     with engine.connect() as connection:
-        assert connection.exec_driver_sql("select version_num from alembic_version").scalar_one() == "20260722_0004"
+        assert connection.exec_driver_sql("select version_num from alembic_version").scalar_one() == "20260729_0005"
 
 
 def test_complete_legacy_database_is_adopted_without_data_loss(tmp_path):
@@ -32,7 +38,7 @@ def test_complete_legacy_database_is_adopted_without_data_loss(tmp_path):
     assert backup is not None and backup.is_file()
     with engine.connect() as connection:
         assert connection.exec_driver_sql("select username from users").scalar_one() == "legacy-admin"
-        assert connection.exec_driver_sql("select version_num from alembic_version").scalar_one() == "20260722_0004"
+        assert connection.exec_driver_sql("select version_num from alembic_version").scalar_one() == "20260729_0005"
     backup_engine = create_engine(f"sqlite:///{backup.as_posix()}")
     with backup_engine.connect() as connection:
         assert connection.exec_driver_sql("select username from users").scalar_one() == "legacy-admin"

@@ -1,0 +1,11 @@
+services:
+  pt-media-hub:
+    networks:
+      - default
+      - media-hub-egress
+
+networks:
+  default: {}
+  media-hub-egress:
+    external: true
+    name: ${MEDIA_HUB_EGRESS_NETWORK:-media-hub-egress}

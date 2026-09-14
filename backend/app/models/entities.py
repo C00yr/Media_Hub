@@ -120,6 +120,25 @@ class DownloadAction(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class AgentDownloadOperation(Base):
+    __tablename__ = "agent_download_operations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    operation_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    session_key: Mapped[str] = mapped_column(String(96), index=True)
+    torrent_id: Mapped[str] = mapped_column(String(96), index=True)
+    actor_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    downloader_id: Mapped[str | None] = mapped_column(String(16))
+    state: Mapped[str] = mapped_column(String(32), default="awaiting_confirmation", index=True)
+    candidate: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    constraints: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class MTeamSnapshot(Base):
     __tablename__ = "mteam_snapshots"
 

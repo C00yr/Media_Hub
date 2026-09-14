@@ -79,7 +79,8 @@ class QbittorrentWebAdapter(QbittorrentAdapter):
         items = self._json_request("GET", "/api/v2/torrents/info", query=query)
         if not isinstance(items, list):
             return []
-        return [self._normalize_torrent(item) for item in items if isinstance(item, dict)]
+        normalized_items = [self._normalize_torrent(item) for item in items if isinstance(item, dict)]
+        return sorted(normalized_items, key=lambda item: item.get("added_at") or "", reverse=True)
 
     def summarize_torrents(self, torrents: list[dict[str, Any]]) -> dict[str, int]:
         return {

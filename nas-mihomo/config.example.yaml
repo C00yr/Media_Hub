@@ -1,14 +1,16 @@
-# Media Hub 专用 Mihomo 配置模板
+# Media Hub 接入现有 Mihomo 时的参考配置
 #
 # 使用方法：
 # 1. 复制为 config.yaml（config.yaml 已被 git 忽略）。
 # 2. 替换下面的订阅地址和代理密码。
-# 3. 让 Mihomo 与 Media Hub 位于同一个 Docker 网络。
-# 4. 在 Media Hub「设置 > 媒体搜索 > 代理配置」中填写：
-#    http://mediahub:你的代理密码@mihomo:7890
+# 3. 让 Mihomo 与 Media Hub 同时加入 media-hub-egress 网络，并给 Mihomo
+#    设置网络别名 tmdb-egress-proxy。
+# 4. 在 Media Hub「设置 > 媒体搜索 > 网络连接」中分别填写：
+#    协议 http、主机 tmdb-egress-proxy、端口 7890，以及可选用户名和密码。
 #
-# Media Hub 已经负责判断哪些域名允许使用代理，因此这里不需要再写
-# api.themoviedb.org / image.tmdb.org 规则，也不要开启 TUN 或透明代理。
+# Media Hub 已经负责判断哪些应用请求允许进入代理。此模板最后使用 MATCH
+# 指向代理组，因此不必重复写 TMDB 域名；如果合并到已有配置且现有规则会把
+# TMDB 判为 DIRECT，请按部署手册增加两条 DOMAIN 规则。
 
 mixed-port: 7890
 allow-lan: true

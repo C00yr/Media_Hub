@@ -1,6 +1,7 @@
 import json
 import os
 from types import SimpleNamespace
+from urllib.error import URLError
 
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 os.environ["APP_CONFIG_ENCRYPTION_KEY"] = "test-key"
@@ -61,6 +62,63 @@ class FakeTmdbAdapter:
             "director": "Test Director",
             "cast": ["Actor A", "Actor B"],
         }
+
+
+class FuzzyTmdbAdapter:
+    detail_calls = []
+
+    def __init__(self, _config):
+        pass
+
+    def search_people(self, query, limit=5):
+        mapping = {"梁朝伟": 1, "汤唯": 2}
+        return [{"person_id": mapping[query], "name": query}] if query in mapping else []
+
+    def get_person_details(self, person_id):
+        return {
+            "person_id": int(person_id),
+            "name": "梁朝伟" if str(person_id) == "1" else "汤唯",
+            "credits": [
+                {
+                    "id": "movie-4347",
+                    "tmdb_id": 4347,
+                    "media_type": "movie",
+                    "title": "色，戒",
+                    "year": "2007",
+                    "popularity": 30,
+                }
+            ],
+        }
+
+    def get_media_details(self, media_id, media_type):
+        self.detail_calls.append((str(media_id), media_type))
+        return {
+            "id": f"{media_type}-{media_id}",
+            "tmdb_id": int(media_id),
+            "media_type": media_type,
+            "title": "色，戒",
+            "year": "2007",
+            "director": "李安",
+            "cast": ["梁朝伟", "汤唯"],
+            "genres": ["剧情", "爱情"],
+            "production_countries": ["中国", "美国"],
+            "rating": 7.3,
+            "vote_count": 8200,
+            "overview": "抗战时期，一名女子被安排接近情报头目。",
+            "popularity": 30,
+        }
+
+    def search_media(self, query):
+        return [self.get_media_details("4347", "movie")] if query in {"色，戒", "色戒"} else []
+
+
+class MemoryAgent(ScriptedAgent):
+    def __init__(self, decisions, candidate):
+        super().__init__(decisions)
+        self.candidate = candidate
+
+    def guess_media_from_memory(self, _user_text, history=None):
+        return dict(self.candidate)
 
 
 class FakeMTeamAdapter:
@@ -486,3 +544,307 @@ def test_dashboard_qb2_summary_uses_the_same_privacy_grant(monkeypatch):
     assert [item["id"] for item in allowed["qbs"]] == ["qb1", "qb2"]
     assert [item["id"] for item in allowed["downloads"]] == ["qb1", "qb2"]
     assert allowed["qb2"]["id"] == "qb2"
+
+
+def test_contextual_chinese_ordinal_uses_recent_tmdb_list_without_model_guessing(monkeypatch):
+    FakeTmdbAdapter.detail_calls = []
+    monkeypatch.setattr(routes, "TmdbAdapter", FakeTmdbAdapter)
+    monkeypatch.setattr(routes, "get_config", lambda _db, _provider: SimpleNamespace(enabled=True))
+    monkeypatch.setattr(routes, "get_decrypted_config", lambda _db, _provider: {})
+    user = SimpleNamespace(id=1)
+    with SessionLocal() as db:
+        clear_agent_state(db)
+        run_media_hub_agent(
+            db,
+            ScriptedAgent([
+                {"decision": "tool", "tool": "tmdb_lookup", "arguments": {"query": "Movie", "limit": 5}},
+                {"decision": "final", "reply": "ignored"},
+            ]),
+            WechatClawMessageRequest(message="帮我搜一下 Movie", user_id="ordinal", conversation_id="ordinal"),
+            user,
+        )
+        should_not_be_called = ScriptedAgent([])
+        result = run_media_hub_agent(
+            db,
+            should_not_be_called,
+            WechatClawMessageRequest(message="第二部的演员有哪些", user_id="ordinal", conversation_id="ordinal"),
+            user,
+        )
+    assert should_not_be_called.calls == []
+    assert FakeTmdbAdapter.detail_calls == [("2", "movie")]
+    assert "Actor A / Actor B" in result["reply"]
+
+
+def test_fuzzy_identification_and_detail_follow_up_cannot_loop_in_conversation(monkeypatch):
+    FuzzyTmdbAdapter.detail_calls = []
+    monkeypatch.setattr(routes, "TmdbAdapter", FuzzyTmdbAdapter)
+    monkeypatch.setattr(routes, "get_config", lambda _db, _provider: SimpleNamespace(enabled=True))
+    monkeypatch.setattr(routes, "get_decrypted_config", lambda _db, _provider: {})
+    request = WechatClawMessageRequest(
+        message="有一部电影，梁朝伟演的，女主是汤唯，这是哪部电影？",
+        user_id="fuzzy-agent",
+        conversation_id="fuzzy-agent",
+    )
+    user = SimpleNamespace(id=1)
+    with SessionLocal() as db:
+        clear_agent_state(db)
+        first = run_media_hub_agent(
+            db,
+            ScriptedAgent(
+                [
+                    {"decision": "final", "reply": "我印象里是《色，戒》。需要我查吗？"},
+                    {"decision": "final", "reply": "需要我帮你查详情还是资源吗？"},
+                ]
+            ),
+            request,
+            user,
+        )
+        follow_up = run_media_hub_agent(
+            db,
+            ScriptedAgent(
+                [
+                    {"decision": "final", "reply": "需要我帮您查一下吗？"},
+                    {"decision": "final", "reply": "您确认要查吗？"},
+                ]
+            ),
+            WechatClawMessageRequest(
+                message="给我这部电影的详细信息",
+                user_id="fuzzy-agent",
+                conversation_id="fuzzy-agent",
+            ),
+            user,
+        )
+        session = routes.get_assistant_agent_session(db, request)
+        trace = db.query(routes.DebugTrace).filter(routes.DebugTrace.event_type == "agent_run").order_by(
+            routes.DebugTrace.id.desc()
+        ).first()
+
+    assert first["intent"]["tools_used"] == ["resolve_media_from_clues"]
+    assert "《色，戒》（2007）" in first["reply"]
+    assert follow_up["intent"]["tools_used"] == ["tmdb_media_details"]
+    assert "抗战时期" in follow_up["reply"]
+    assert session["current_work"]["title"] == "色，戒"
+    assert trace.timeline[0]["obligation_violations"] == 2
+    assert trace.timeline[0]["deterministic_takeover"] is True
+
+
+def test_bare_lookup_uses_current_verified_work(monkeypatch):
+    FuzzyTmdbAdapter.detail_calls = []
+    monkeypatch.setattr(routes, "TmdbAdapter", FuzzyTmdbAdapter)
+    monkeypatch.setattr(routes, "get_config", lambda _db, _provider: SimpleNamespace(enabled=True))
+    monkeypatch.setattr(routes, "get_decrypted_config", lambda _db, _provider: {})
+    user = SimpleNamespace(id=1)
+    request = WechatClawMessageRequest(message="查", user_id="current-work", conversation_id="current-work")
+    with SessionLocal() as db:
+        clear_agent_state(db)
+        session = {
+            "history": [],
+            "recent_results": {},
+            "references": {},
+            "current_list": {},
+            "current_work": {
+                "tmdb_id": "4347",
+                "media_type": "movie",
+                "title": "色，戒",
+                "year": "2007",
+                "verified_at": routes.utc_iso(),
+            },
+        }
+        routes.save_assistant_agent_session(db, request, session)
+        result = run_media_hub_agent(
+            db,
+            ScriptedAgent(
+                [
+                    {"decision": "final", "reply": "你想查详情还是资源？"},
+                    {"decision": "final", "reply": "请再说清楚一点。"},
+                ]
+            ),
+            request,
+            user,
+        )
+    assert result["intent"]["tools_used"] == ["tmdb_media_details"]
+    assert "色，戒" in result["reply"]
+
+
+def test_subjective_chat_has_no_tool_obligation():
+    obligations = routes.determine_agent_tool_obligations(
+        "你觉得李安的电影风格怎么样？",
+        {"current_work": {}, "pending_request": {}},
+    )
+    assert obligations == []
+
+
+def test_live_status_and_resource_requests_have_backend_tool_obligations():
+    current = {
+        "current_work": {"tmdb_id": "4347", "media_type": "movie", "title": "色，戒", "year": "2007"},
+        "pending_request": {},
+    }
+    assert routes.determine_agent_tool_obligations("馒头站点现在状态怎么样？", current)[0]["tool"] == "dashboard_query"
+    assert routes.determine_agent_tool_obligations("查一下这部电影的资源", current)[0]["tool"] == "mteam_search"
+    assert routes.determine_agent_tool_obligations("不用查，聊聊这部电影", current) == []
+
+
+def test_conflicting_fuzzy_clue_is_explained_and_one_confirmation_sets_current_work(monkeypatch):
+    monkeypatch.setattr(routes, "TmdbAdapter", FuzzyTmdbAdapter)
+    monkeypatch.setattr(routes, "get_config", lambda _db, _provider: SimpleNamespace(enabled=True))
+    monkeypatch.setattr(routes, "get_decrypted_config", lambda _db, _provider: {})
+    user = SimpleNamespace(id=1)
+    request = WechatClawMessageRequest(
+        message="梁朝伟和汤唯主演、王家卫导演的是哪部电影？",
+        user_id="conflict-agent",
+        conversation_id="conflict-agent",
+    )
+    with SessionLocal() as db:
+        clear_agent_state(db)
+        result = run_media_hub_agent(
+            db,
+            ScriptedAgent(
+                [
+                    {"decision": "final", "reply": "可能是色戒。"},
+                    {"decision": "final", "reply": "你要我查吗？"},
+                ]
+            ),
+            request,
+            user,
+        )
+        accepted = run_media_hub_agent(
+            db,
+            ScriptedAgent([]),
+            WechatClawMessageRequest(
+                message="是的",
+                user_id="conflict-agent",
+                conversation_id="conflict-agent",
+            ),
+            user,
+        )
+        session = routes.get_assistant_agent_session(db, request)
+    assert "导演是 李安" in result["reply"]
+    assert "不是 王家卫" in result["reply"]
+    assert "已按《色，戒》" in accepted["reply"]
+    assert session["current_work"]["title"] == "色，戒"
+
+
+def test_memory_guess_is_friendly_when_tmdb_network_verification_fails(monkeypatch):
+    class OfflineTmdbAdapter:
+        def __init__(self, _config):
+            pass
+
+        def search_people(self, _query, limit=5):
+            raise URLError("network unavailable")
+
+    monkeypatch.setattr(routes, "TmdbAdapter", OfflineTmdbAdapter)
+    monkeypatch.setattr(routes, "get_config", lambda _db, _provider: SimpleNamespace(enabled=True))
+    monkeypatch.setattr(routes, "get_decrypted_config", lambda _db, _provider: {})
+    request = WechatClawMessageRequest(
+        message="梁朝伟和汤唯演的是哪部电影？",
+        user_id="memory-agent",
+        conversation_id="memory-agent",
+    )
+    agent = MemoryAgent(
+        [
+            {"decision": "final", "reply": "是色戒。"},
+            {"decision": "final", "reply": "需要查吗？"},
+        ],
+        {"title": "色，戒", "year": "2007", "reason": "演员线索"},
+    )
+    with SessionLocal() as db:
+        clear_agent_state(db)
+        result = run_media_hub_agent(db, agent, request, SimpleNamespace(id=1))
+        session = routes.get_assistant_agent_session(db, request)
+    assert "最可能是《色，戒》（2007）" in result["reply"]
+    assert "连接 TMDB 时遇到网络问题" in result["reply"]
+    assert "未核验猜测" not in result["reply"]
+    assert session["current_work"] == {}
+
+
+def test_promotion_filters_are_hard_and_include_30_percent_as_better_than_half():
+    items = [
+        {"id": "normal", "download_factor": 1.0, "seeders": 100},
+        {"id": "half", "download_factor": 0.5, "seeders": 10},
+        {"id": "thirty", "download_factor": 0.3, "seeders": 8},
+        {"id": "free", "download_factor": 0.0, "seeders": 2},
+    ]
+    ranked, _ = routes.rank_mteam_search_items(items, {"download_factor_max": 0.5})
+    assert {item["id"] for item in ranked} == {"half", "thirty", "free"}
+    assert ranked[0]["id"] == "free"
+
+
+def test_composite_template_reports_requested_count_without_padding():
+    reply = routes.format_composite_media_reply(
+        {
+            "target_count": 5,
+            "checked_works": 12,
+            "complete": True,
+            "queried_at": "2026-07-29T12:00:00Z",
+            "matches": [
+                {
+                    "work": {"title": "作品一", "year": "2025", "rating": 8.2, "vote_count": 500},
+                    "resource": {"title": "Release", "size": "20 GB", "seeders": 12, "promotion_label": "50%"},
+                }
+            ],
+        }
+    )
+    assert "要找 5 部，目前只找到 1 部" in reply
+    assert "没有拿不符合条件的资源凑数" in reply
+    assert "| # | 作品 | TMDB | M-Team 资源 |" in reply
+
+
+def test_download_dispatch_is_idempotent_and_only_reports_verified_start(monkeypatch):
+    class DownloadMTeam:
+        def download_torrent_file(self, _torrent_id):
+            return {"filename": "movie.torrent", "content": b"torrent"}
+
+    class DownloadQb:
+        add_calls = 0
+        list_calls = 0
+
+        def add_torrent_file(self, *_args):
+            self.add_calls += 1
+            return {"accepted": True, "trace_id": "DL-idempotent"}
+
+        def get_torrents(self, _downloader_id, _filters=None):
+            self.list_calls += 1
+            if self.list_calls == 1:
+                return []
+            return [{"hash": "task-hash", "name": "电影版本", "progress": 0.1, "state": "queuedDL"}]
+
+    qb = DownloadQb()
+    monkeypatch.setattr(routes, "resolve_agent_downloader", lambda _db, _requested=None: "qb1")
+    monkeypatch.setattr(routes, "get_mteam_adapter_or_error", lambda _db: DownloadMTeam())
+    monkeypatch.setattr(routes, "get_qb_adapter_or_error", lambda _db, _downloader_id: qb)
+    monkeypatch.setattr(routes, "save_qb_task_metadata", lambda *_args, **_kwargs: ["task-hash"])
+    request = WechatClawMessageRequest(message="确认", user_id="idempotent", conversation_id="idempotent")
+    candidate = {"id": "torrent-1", "title": "电影版本", "resolution": "1080p", "size": "10 GB"}
+    with SessionLocal() as db:
+        operation = routes.save_wechat_claw_pending_download(db, request, candidate, actor_user_id=None)
+        first = routes.download_wechat_claw_selected_torrent(db, "torrent-1", SimpleNamespace(id=None), candidate, operation)
+        second = routes.download_wechat_claw_selected_torrent(db, "torrent-1", SimpleNamespace(id=None), candidate, operation)
+        db.refresh(operation)
+    assert first["state"] == "started"
+    assert second["state"] == "started"
+    assert qb.add_calls == 1
+    assert operation.state == "started"
+
+
+def test_download_state_rejects_paused_and_error_but_accepts_real_download_states():
+    assert routes.qb_download_state_started({"state": "pausedDL", "progress": 0.2}) is False
+    assert routes.qb_download_state_started({"state": "error", "progress": 0.2}) is False
+    assert routes.qb_download_state_started({"state": "metaDL", "progress": 0}) is True
+    assert routes.qb_download_state_started({"state": "stalledDL", "progress": 0.2}) is True
+
+
+def test_knowledge_reply_has_versioned_source_and_sensitive_task_hash_is_hidden():
+    result = routes.search_knowledge("50% 促销", 1)
+    reply = routes.format_knowledge_reply(result)
+    assert "来源：" in reply and "更新：" in reply
+    assert "task-hash-secret" not in json.dumps(
+        routes.agent_safe_payload({"task_hash": "task-hash-secret", "state": "started"}),
+        ensure_ascii=False,
+    )
+
+
+def test_only_cross_source_queries_trigger_the_long_running_progress_notice():
+    assert routes.agent_request_needs_progress(
+        "帮我找5部近三年的高分科幻电影，M-Team上要有50%或更好的资源"
+    ) is True
+    assert routes.agent_request_needs_progress("帮我搜一下痴迷") is False

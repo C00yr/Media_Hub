@@ -1,7 +1,7 @@
 import json
 from datetime import datetime
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from cryptography.fernet import InvalidToken
 from sqlalchemy.orm import Session
@@ -15,6 +15,8 @@ from app.utils.time import utc_iso, utc_now_naive
 
 PROVIDERS = ["mteam", "qb1", "qb2", "qb3", "tmdb", "ai", "wechat_claw"]
 TMDB_PROXY_DOMAIN_ALLOWLIST = ("api.themoviedb.org", "image.tmdb.org")
+TMDB_PROXY_DEFAULT_HOST = "tmdb-egress-proxy"
+TMDB_PROXY_DEFAULT_PORT = 7890
 
 
 def public_test_result(result: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -60,12 +62,25 @@ def normalize_payload(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
             normalized["timeout"] = 10
         normalized = {key: value for key, value in normalized.items() if value not in ("", None, [], {})}
     if provider == "tmdb":
+        proxy_password_supplied = "proxy_password" in normalized
+        supplied_proxy_password = str(normalized.get("proxy_password") or "")
         raw_settings = normalized.pop("raw_settings", "")
         if raw_settings:
             normalized.update(parse_raw_headers(raw_settings))
         if "bearer" in normalized and "bearer_token" not in normalized:
             normalized["bearer_token"] = normalized.pop("bearer")
-        for key in ["api_key", "bearer_token", "language", "region", "endpoint", "mode", "proxy_url"]:
+        for key in [
+            "api_key",
+            "bearer_token",
+            "language",
+            "region",
+            "endpoint",
+            "mode",
+            "proxy_url",
+            "proxy_scheme",
+            "proxy_host",
+            "proxy_username",
+        ]:
             if key in normalized and isinstance(normalized[key], str):
                 normalized[key] = normalized[key].strip()
         for key in ["gateway_url", "gateway_key", "worker_name"]:
@@ -74,21 +89,47 @@ def normalize_payload(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
             proxy_enabled = normalized.get("proxy_enabled") is True
         else:
             proxy_enabled = normalized.get("mode") == "proxy"
-        raw_proxy_domains = normalized.get("proxy_domains")
-        if raw_proxy_domains is None:
-            raw_proxy_domains = list(TMDB_PROXY_DOMAIN_ALLOWLIST)
-        if not isinstance(raw_proxy_domains, list):
-            raw_proxy_domains = []
-        proxy_domains = [domain for domain in TMDB_PROXY_DOMAIN_ALLOWLIST if domain in raw_proxy_domains]
+        legacy_proxy_url = str(normalized.get("proxy_url") or "").strip()
+        if legacy_proxy_url and not normalized.get("proxy_host"):
+            try:
+                parsed_proxy = urlparse(legacy_proxy_url)
+                parsed_port = parsed_proxy.port
+            except ValueError as exc:
+                raise ValueError("旧版代理地址无法解析，请重新填写代理主机和端口") from exc
+            if parsed_proxy.scheme in {"http", "https"} and parsed_proxy.hostname:
+                normalized["proxy_scheme"] = parsed_proxy.scheme
+                normalized["proxy_host"] = parsed_proxy.hostname
+                normalized["proxy_port"] = parsed_port or (443 if parsed_proxy.scheme == "https" else TMDB_PROXY_DEFAULT_PORT)
+                if parsed_proxy.username and not normalized.get("proxy_username"):
+                    normalized["proxy_username"] = unquote(parsed_proxy.username)
+                if parsed_proxy.password and not normalized.get("proxy_password"):
+                    normalized["proxy_password"] = unquote(parsed_proxy.password)
+            else:
+                raise ValueError("旧版代理地址无法解析，请重新填写代理主机和端口")
         normalized.pop("mode", None)
+        normalized.pop("proxy_url", None)
+        normalized.pop("proxy_domains", None)
         normalized["proxy_enabled"] = proxy_enabled
-        normalized["proxy_domains"] = proxy_domains
+        proxy_scheme = str(normalized.get("proxy_scheme") or "http").lower()
+        proxy_host = str(normalized.get("proxy_host") or TMDB_PROXY_DEFAULT_HOST).strip()
+        try:
+            proxy_port = int(normalized.get("proxy_port") or TMDB_PROXY_DEFAULT_PORT)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("代理端口必须是 1 到 65535 之间的数字") from exc
+        if proxy_scheme not in {"http", "https"}:
+            raise ValueError("代理协议必须是 HTTP 或 HTTPS")
+        if not proxy_host or any(character in proxy_host for character in "/?#@ "):
+            raise ValueError("代理主机必须是有效的容器名称、域名或 IP 地址")
+        if not 1 <= proxy_port <= 65535:
+            raise ValueError("代理端口必须是 1 到 65535 之间的数字")
+        normalized["proxy_scheme"] = proxy_scheme
+        normalized["proxy_host"] = proxy_host
+        normalized["proxy_port"] = proxy_port
         if proxy_enabled:
-            parsed_proxy = urlparse(str(normalized.get("proxy_url") or ""))
-            if parsed_proxy.scheme not in {"http", "https"} or not parsed_proxy.hostname:
-                raise ValueError("代理地址必须是有效的 http:// 或 https:// 地址")
-            if not proxy_domains:
-                raise ValueError("启用代理时至少选择一个需要代理的网站")
+            if not proxy_host:
+                raise ValueError("启用代理时必须填写代理主机")
+            if normalized.get("proxy_password") and not normalized.get("proxy_username"):
+                raise ValueError("填写代理密码时必须同时填写代理用户名")
         if not normalized.get("language"):
             normalized["language"] = "zh-CN"
         if not normalized.get("region"):
@@ -96,6 +137,8 @@ def normalize_payload(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
         if not normalized.get("timeout"):
             normalized["timeout"] = 12
         normalized = {key: value for key, value in normalized.items() if value not in ("", None)}
+        if proxy_password_supplied:
+            normalized["proxy_password"] = supplied_proxy_password
     if provider == "ai":
         for key in ["base_url", "api_key", "model", "thinking", "reasoning_effort"]:
             if key in normalized and isinstance(normalized[key], str):
@@ -165,7 +208,7 @@ def upsert_config(
         row.config_version += 1
         previous, _ = decode_saved_payload(row.encrypted_payload)
         if provider == "tmdb":
-            for key in ("api_key", "bearer_token", "proxy_url"):
+            for key in ("api_key", "bearer_token", "proxy_password"):
                 if key not in normalized and previous.get(key):
                     normalized[key] = previous[key]
         if provider == "mteam":

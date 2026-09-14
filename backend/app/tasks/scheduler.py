@@ -141,6 +141,19 @@ def refresh_content_preload_caches() -> None:
         db.close()
 
 
+def reconcile_agent_downloads() -> None:
+    from app.api.routes import reconcile_agent_download_operations
+
+    db: Session = SessionLocal()
+    try:
+        reconcile_agent_download_operations(db)
+    except Exception:
+        db.rollback()
+        logger.exception("Agent download verification failed")
+    finally:
+        db.close()
+
+
 def _wechat_claw_poll_loop() -> None:
     while not _wechat_claw_stop_event.is_set():
         db: Session | None = None
@@ -217,4 +230,12 @@ def build_scheduler(interval_minutes: int) -> BackgroundScheduler:
     scheduler.add_job(capture_snapshots, "interval", minutes=interval_minutes, id="app_snapshots", replace_existing=True)
     scheduler.add_job(check_external_module_health, "interval", hours=1, id="external_module_health", replace_existing=True, next_run_time=system_now())
     scheduler.add_job(refresh_content_preload_caches, "interval", hours=1, id="content_preload_caches", replace_existing=True, next_run_time=system_now())
+    scheduler.add_job(
+        reconcile_agent_downloads,
+        "interval",
+        seconds=15,
+        id="agent_download_verification",
+        replace_existing=True,
+        max_instances=1,
+    )
     return scheduler

@@ -1,4 +1,5 @@
 from app.models.entities import (
+    AgentDownloadOperation,
     ConfigAuditLog,
     DebugTrace,
     DownloadAction,
@@ -19,6 +20,7 @@ from app.models.entities import (
 )
 
 __all__ = [
+    "AgentDownloadOperation",
     "ConfigAuditLog",
     "DebugTrace",
     "DownloadAction",

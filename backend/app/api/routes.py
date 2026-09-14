@@ -30,6 +30,7 @@ from app.adapters.tmdb.client import (
     TmdbConfigError,
     TmdbDohError,
     TmdbImageError,
+    TmdbProxyError,
     open_tmdb_network_request,
     resolve_tmdb_proxy_settings,
     tmdb_network_detail,
@@ -48,6 +49,7 @@ from app.config.settings import get_settings
 from app.db.session import SessionLocal, get_db
 from app.diagnostics.tracing import TraceRecorder
 from app.models.entities import (
+    AgentDownloadOperation,
     ConfigAuditLog,
     DebugTrace,
     DownloadAction,
@@ -63,6 +65,7 @@ from app.models.entities import (
     UserSession,
     WechatClawBinding,
 )
+from app.services.knowledge import search_knowledge
 from app.services.integrations import (
     PROVIDERS,
     decode_saved_payload,
@@ -88,6 +91,8 @@ _WECHAT_CLAW_POLL_LOCKS: dict[int, Lock] = {}
 _WECHAT_CLAW_POLL_LOCK_GUARD = Lock()
 _WECHAT_CLAW_BINDING_CREATE_LOCK = Lock()
 _QB_TASK_METADATA_LOCK = Lock()
+_AGENT_DOWNLOAD_LOCK_GUARD = Lock()
+_AGENT_DOWNLOAD_LOCKS: dict[str, Lock] = {}
 _WECHAT_CLAW_ACTIVE_USER_ID: ContextVar[int | None] = ContextVar("wechat_claw_active_user_id", default=None)
 PRELOAD_PREFIX = "preload."
 TMDB_IMAGE_SIZES = {"w92", "w154", "w185", "w342", "w500", "w780", "w1280", "original"}
@@ -210,6 +215,9 @@ ASSISTANT_AGENT_SESSIONS_KEY = "assistant.agent_sessions"
 ASSISTANT_AGENT_SESSION_TTL_SECONDS = 24 * 60 * 60
 ASSISTANT_AGENT_HISTORY_LIMIT = 12
 ASSISTANT_AGENT_MAX_TOOL_STEPS = 6
+AGENT_DOWNLOAD_CONFIRM_TTL_SECONDS = 30 * 60
+AGENT_DOWNLOAD_VERIFY_TIMEOUT_SECONDS = 4.0
+AGENT_DOWNLOAD_VERIFY_INTERVAL_SECONDS = 0.35
 MTEAM_INITIAL_DISPLAY_LIMIT = 5
 MTEAM_SHOW_ALL_RESULTS_RE = re.compile(r"(?:查看|显示|展示|给我).*(?:全部|完整)(?:资源|结果|列表|信息)?|(?:全部|完整).*(?:资源|结果|列表|信息)", re.IGNORECASE)
 MTEAM_SITE_DATA_RE = re.compile(r"(?:馒头|m[-\s]?team).*(?:站点|账号|数据|信息|状态)|(?:站点|账号|数据|信息|状态).*(?:馒头|m[-\s]?team)", re.IGNORECASE)
@@ -227,6 +235,11 @@ SUPER_PASSWORD_SETTING_KEY = "auth.super_password"
 
 AGENT_TOOL_CATALOG: list[dict[str, Any]] = [
     {
+        "name": "resolve_media_from_clues",
+        "description": "Identify a movie or TV work from people, director, year, plot or other fuzzy clues. Every returned identity is verified against TMDB; model memory is only a search hypothesis.",
+        "arguments": {"query": "the user's complete clue sentence", "people": "explicit person names", "director": "explicit director clue", "year": "explicit year", "media_type": "movie|tv|all", "title_hypotheses": "possible titles used only for TMDB lookup", "wants_details": "boolean", "wants_resources": "boolean"},
+    },
+    {
         "name": "tmdb_lookup",
         "description": "Find movies or TV shows by title, or discover them by type, region, language, genre, year, rating and sort order. This is the former TMDB intent template.",
         "arguments": {"query": "title or keywords; may be empty for discovery", "media_type": "movie|tv|all", "region": "two-letter region code", "language": "language code", "genre": "genre", "year": "year or decade", "min_rating": "0-10", "sort_by": "vote_average.desc|popularity.desc|release_date.desc", "limit": "1-10"},
@@ -243,8 +256,8 @@ AGENT_TOOL_CATALOG: list[dict[str, Any]] = [
     },
     {
         "name": "mteam_search",
-        "description": "Search M-Team releases and rank by resolution, size, promotion and recommendation preferences. This is the former M-Team intent template.",
-        "arguments": {"query": "movie or release keywords", "resolution": "2160p|1080p|empty", "min_size_gb": "minimum size", "max_size_gb": "maximum size", "promotion": "free|discount|any", "recommend": "boolean", "limit": "1-10"},
+        "description": "Search M-Team (馒头, 馒头站点, or PT站 in this app) with strict canonical resource constraints.",
+        "arguments": {"query": "movie or release keywords", "resolutions": "array such as 2160p or 1080p", "min_size_gb": "minimum size", "max_size_gb": "maximum size", "download_factor_max": "0 to 1; FREE=0, 30%=0.3, 50%=0.5", "min_seeders": "minimum seeders", "official_only": "boolean", "has_chinese_subtitles": "boolean or null", "promotion_expires_after_minutes": "minimum remaining promotion minutes", "limit": "1-10"},
     },
     {
         "name": "mteam_result_details",
@@ -269,12 +282,22 @@ AGENT_TOOL_CATALOG: list[dict[str, Any]] = [
     {
         "name": "prepare_mteam_download",
         "description": "Select a numbered recent M-Team result and ask for confirmation. This never starts a download.",
-        "arguments": {"result_index": "one-based index in recent M-Team results"},
+        "arguments": {"result_index": "one-based index in recent M-Team results", "downloader_id": "optional qb1|qb2|qb3 override; otherwise use the configured default"},
     },
     {
         "name": "confirm_mteam_download",
         "description": "Send the prepared M-Team release to the default qB downloader. Use only when the current user message explicitly confirms.",
         "arguments": {},
+    },
+    {
+        "name": "find_media_with_mteam",
+        "description": "Find TMDB works and verify matching M-Team resources in a bounded workflow. Use for requests combining movie qualities such as genre, rating, or release dates with torrent constraints.",
+        "arguments": {"query": "optional title keywords", "media_type": "movie|tv|all", "genre": "genre name", "release_date_from": "YYYY-MM-DD", "release_date_to": "YYYY-MM-DD", "min_rating": "0-10; high-rated defaults to 7.5", "min_vote_count": "default 200 for high-rated", "target_count": "1-10; default 3", "max_size_gb": "maximum resource size", "download_factor_max": "0 to 1", "min_seeders": "minimum seeders", "official_only": "boolean", "resolutions": "array"},
+    },
+    {
+        "name": "knowledge_search",
+        "description": "Search versioned local Media Hub and M-Team explanatory knowledge. Never use it for current site, torrent, or downloader facts.",
+        "arguments": {"query": "rule, terminology, manual, privacy, or troubleshooting question", "limit": "1-5"},
     },
 ]
 AGENT_TOOL_NAMES = frozenset(item["name"] for item in AGENT_TOOL_CATALOG)
@@ -1159,6 +1182,37 @@ def tmdb_test_result(success: bool, trace: str, message: str, explanation: str, 
 
 
 def classify_tmdb_test_error(exc: Exception, trace: str) -> dict[str, Any]:
+    if isinstance(exc, TmdbProxyError):
+        messages = {
+            "proxy_dns_error": (
+                "找不到 NAS Mihomo 容器。",
+                "Media Hub 无法解析代理主机名，通常是两个容器尚未加入同一个 Docker 网络，或 Mihomo 缺少固定网络别名。",
+                "检查 media-hub-egress 网络，并确认 Mihomo 的网络别名是 tmdb-egress-proxy。",
+            ),
+            "proxy_tcp_error": (
+                "无法连接 NAS Mihomo 代理端口。",
+                "代理主机可以找到，但指定端口没有接受连接。",
+                "检查 Mihomo 的 mixed-port、监听地址和 Media Hub 中填写的端口。",
+            ),
+            "proxy_tunnel_error": (
+                "NAS Mihomo 无法连接 TMDB。",
+                "代理端口可访问，但 Mihomo 没有成功建立到 TMDB 的代理隧道。",
+                "在 Mihomo 面板检查当前节点、代理组和节点健康状态。",
+            ),
+        }
+        message, explanation, next_step = messages.get(
+            exc.error_type,
+            ("NAS Mihomo 代理测试失败。", "代理链路未能完成连接。", "检查 Mihomo 状态后重新测试。"),
+        )
+        return tmdb_test_result(
+            False,
+            trace,
+            message,
+            explanation,
+            next_step,
+            exc.error_type,
+            detail=exc.network_detail or None,
+        )
     if isinstance(exc, TmdbConfigError):
         return tmdb_test_result(
             False,
@@ -1198,6 +1252,16 @@ def classify_tmdb_test_error(exc: Exception, trace: str) -> dict[str, Any]:
         )
     if isinstance(exc, HTTPError):
         status_code = int(exc.code)
+        if status_code == 407:
+            return tmdb_test_result(
+                False,
+                trace,
+                "NAS Mihomo 代理认证失败。",
+                "Media Hub 已连接到代理端口，但用户名或密码没有通过验证。",
+                "检查代理用户名和密码后重新测试；未启用认证时请将两项留空。",
+                "proxy_auth_error",
+                status_code,
+            )
         if status_code in (401, 403):
             return tmdb_test_result(
                 False,
@@ -1630,6 +1694,7 @@ AGENT_HIDDEN_RESULT_KEYS = frozenset({
     "save_path", "content_path", "path", "hash", "tracker", "trackers", "context_token",
     "credential", "credentials", "username", "user_id", "account_id", "email", "phone",
     "base_url", "endpoint", "host", "ip", "session_id",
+    "task_hash",
 })
 
 
@@ -1674,10 +1739,26 @@ def get_assistant_agent_session(db: Session, request: WechatClawMessageRequest) 
     session = dict(entry) if isinstance(entry, dict) else {}
     updated_at = parse_datetime(session.get("updated_at"))
     if updated_at is None or (utc_now() - updated_at).total_seconds() > ASSISTANT_AGENT_SESSION_TTL_SECONDS:
-        return {"history": [], "recent_results": {}, "references": {}}
+        return {
+            "history": [],
+            "recent_results": {},
+            "references": {},
+            "current_list": {},
+            "current_work": {},
+            "pending_request": {},
+            "pending_confirmation": {},
+            "memory_candidate": {},
+        }
     session["history"] = session.get("history") if isinstance(session.get("history"), list) else []
     session["recent_results"] = session.get("recent_results") if isinstance(session.get("recent_results"), dict) else {}
     session["references"] = session.get("references") if isinstance(session.get("references"), dict) else {}
+    session["current_list"] = session.get("current_list") if isinstance(session.get("current_list"), dict) else {}
+    session["current_work"] = session.get("current_work") if isinstance(session.get("current_work"), dict) else {}
+    session["pending_request"] = session.get("pending_request") if isinstance(session.get("pending_request"), dict) else {}
+    session["pending_confirmation"] = (
+        session.get("pending_confirmation") if isinstance(session.get("pending_confirmation"), dict) else {}
+    )
+    session["memory_candidate"] = session.get("memory_candidate") if isinstance(session.get("memory_candidate"), dict) else {}
     return session
 
 
@@ -1695,6 +1776,11 @@ def save_assistant_agent_session(db: Session, request: WechatClawMessageRequest,
         "history": list(session.get("history") or [])[-ASSISTANT_AGENT_HISTORY_LIMIT:],
         "recent_results": dict(session.get("recent_results") or {}),
         "references": dict(session.get("references") or {}),
+        "current_list": dict(session.get("current_list") or {}),
+        "current_work": dict(session.get("current_work") or {}),
+        "pending_request": dict(session.get("pending_request") or {}),
+        "pending_confirmation": dict(session.get("pending_confirmation") or {}),
+        "memory_candidate": dict(session.get("memory_candidate") or {}),
     }
     sessions[assistant_agent_session_key(request)] = stored
     if len(sessions) > 100:
@@ -1713,24 +1799,95 @@ def remember_assistant_agent_result(session: dict[str, Any], tool: str, result: 
     result_key = f"qb_list_torrents:{arguments.get('downloader_id')}" if tool == "qb_list_torrents" else tool
     if tool not in {"tmdb_media_details", "tmdb_person_details", "mteam_result_details", "qb_torrent_details", "prepare_mteam_download", "confirm_mteam_download"}:
         recent_results[result_key] = agent_safe_payload(result)
+    if tool == "find_media_with_mteam":
+        composite_filters = result.get("filters") if isinstance(result.get("filters"), dict) else {}
+        recent_results["mteam_search"] = {
+            **agent_safe_payload(result),
+            "filters": agent_safe_payload(composite_filters.get("mteam") or {}),
+        }
+    if tool == "resolve_media_from_clues":
+        item = result.get("item") if isinstance(result.get("item"), dict) else {}
+        if result.get("state") in {"resolved", "memory_verified"} and item:
+            session["current_work"] = {
+                "tmdb_id": str(item.get("tmdb_id") or item.get("id") or ""),
+                "media_type": str(item.get("media_type") or ""),
+                "title": str(item.get("title") or "")[:160],
+                "year": str(item.get("year") or "")[:12],
+                "verified_at": utc_iso(),
+            }
+            session["pending_confirmation"] = {}
+            session["memory_candidate"] = {}
+        elif result.get("state") == "needs_confirmation" and item:
+            session["pending_confirmation"] = {
+                "kind": "media_candidate",
+                "candidate": agent_safe_payload(item),
+                "created_at": utc_iso(),
+            }
+        elif result.get("state") == "memory_unverified":
+            session["memory_candidate"] = {
+                "title": str(result.get("title") or "")[:160],
+                "year": str(result.get("year") or "")[:12],
+                "created_at": utc_iso(),
+            }
+        elif result.get("state") == "multiple":
+            resolution_items = result.get("items") if isinstance(result.get("items"), list) else []
+            references["media_resolution"] = [
+                {
+                    "tmdb_id": str(value.get("tmdb_id") or value.get("id") or ""),
+                    "media_type": str(value.get("media_type") or ""),
+                    "title": str(value.get("title") or "")[:160],
+                    "year": str(value.get("year") or "")[:12],
+                }
+                for value in resolution_items[:10]
+                if isinstance(value, dict)
+            ]
+            session["current_list"] = {
+                "kind": "media_resolution",
+                "count": len(resolution_items),
+                "updated_at": utc_iso(),
+            }
     items = result.get("items") if isinstance(result.get("items"), list) else []
     if tool == "tmdb_lookup":
         references["tmdb_lookup"] = [
-            {"tmdb_id": str(item.get("tmdb_id") or item.get("id") or ""), "media_type": str(item.get("media_type") or "")}
+            {
+                "tmdb_id": str(item.get("tmdb_id") or item.get("id") or ""),
+                "media_type": str(item.get("media_type") or ""),
+                "title": str(item.get("title") or item.get("name") or "")[:160],
+            }
             for item in items[:10] if isinstance(item, dict)
         ]
-    elif tool == "mteam_search":
+        session["current_list"] = {"kind": "tmdb", "count": len(items), "updated_at": utc_iso()}
+    elif tool == "tmdb_media_details":
+        item = result.get("item") if isinstance(result.get("item"), dict) else {}
+        if item:
+            session["current_work"] = {
+                "tmdb_id": str(item.get("tmdb_id") or item.get("id") or ""),
+                "media_type": str(item.get("media_type") or ""),
+                "title": str(item.get("title") or "")[:160],
+                "year": str(item.get("year") or "")[:12],
+                "verified_at": utc_iso(),
+            }
+    elif tool in {"mteam_search", "find_media_with_mteam"}:
         references["mteam_search"] = {
             "query": str(result.get("query") or ""),
             "recommended_index": int(result.get("recommended_index") or 0),
-            "items": [{"id": str(item.get("id") or ""), "title": str(item.get("title") or "")[:240]} for item in items[:10] if isinstance(item, dict)],
+            "items": [
+                {
+                    "id": str(item.get("id") or ""),
+                    "title": str(item.get("title") or "")[:240],
+                    "_search_query": str(item.get("_search_query") or "")[:160],
+                }
+                for item in items[:10] if isinstance(item, dict)
+            ],
         }
+        session["current_list"] = {"kind": "mteam", "count": len(items), "updated_at": utc_iso()}
     elif tool == "qb_list_torrents":
         downloader_id = str(arguments.get("downloader_id") or "")
         references[result_key] = [
             {"hash": str(item.get("hash") or ""), "name": str(item.get("name") or "")[:240]}
             for item in items[:10] if isinstance(item, dict)
         ]
+        session["current_list"] = {"kind": result_key, "count": len(items), "updated_at": utc_iso()}
     session["recent_results"] = recent_results
     session["references"] = references
 
@@ -1772,12 +1929,16 @@ def save_wechat_claw_mobile_candidates(
             "promotion_type": str(item.get("promotion_type") or "").strip(),
             "promotion_until": str(item.get("promotion_until") or "").strip(),
             "promotion_remaining": str(item.get("promotion_remaining") or "").strip(),
+            "download_factor": mteam_download_factor(item),
+            "upload_multiplier": 1.0,
+            "is_official": item.get("is_official") is True,
             "codec": str(item.get("codec") or "").strip(),
             "hdr": str(item.get("hdr") or "").strip(),
             "audio_codec": str(item.get("audio_codec") or "").strip(),
             "imdb_rating": str(item.get("imdb_rating") or "").strip(),
             "douban_rating": str(item.get("douban_rating") or "").strip(),
             "group": str(item.get("group") or "").strip(),
+            "_search_query": str(item.get("_search_query") or query or "").strip()[:160],
             "presentation": (presentation or {}).get(str(item.get("id") or ""), {}),
         }
         for item in items[:WECHAT_CLAW_MOBILE_SELECTION_LIMIT]
@@ -1839,14 +2000,92 @@ def wechat_claw_mobile_key(request: WechatClawMessageRequest) -> str:
     return str(request.user_id or request.conversation_id or "default").strip() or "default"
 
 
-def save_wechat_claw_pending_download(db: Session, request: WechatClawMessageRequest, candidate: dict[str, Any]) -> None:
+def agent_download_lock(operation_id: str) -> Lock:
+    with _AGENT_DOWNLOAD_LOCK_GUARD:
+        return _AGENT_DOWNLOAD_LOCKS.setdefault(operation_id, Lock())
+
+
+def latest_agent_download_operation(
+    db: Session,
+    request: WechatClawMessageRequest,
+    *,
+    active_only: bool = False,
+) -> AgentDownloadOperation | None:
+    query = (
+        db.query(AgentDownloadOperation)
+        .filter(AgentDownloadOperation.session_key == assistant_agent_session_key(request))
+        .order_by(AgentDownloadOperation.created_at.desc())
+    )
+    if active_only:
+        query = query.filter(
+            AgentDownloadOperation.state.in_(
+                ["awaiting_confirmation", "confirming", "pending_verification", "started"]
+            )
+        )
+    row = query.first()
+    if row and row.expires_at < utc_now_naive():
+        if row.state == "awaiting_confirmation":
+            row.state = "expired"
+            row.updated_at = utc_now_naive()
+            db.commit()
+            return None
+        if row.state == "started":
+            return None
+    return row
+
+
+def save_wechat_claw_pending_download(
+    db: Session,
+    request: WechatClawMessageRequest,
+    candidate: dict[str, Any],
+    *,
+    query: str = "",
+    constraints: dict[str, Any] | None = None,
+    downloader_id: str = "",
+    actor_user_id: int | None = None,
+) -> AgentDownloadOperation:
+    previous = latest_agent_download_operation(db, request, active_only=True)
+    if previous and previous.state == "awaiting_confirmation":
+        previous.state = "replaced"
+        previous.updated_at = utc_now_naive()
+    operation = AgentDownloadOperation(
+        operation_id=trace_id("AGDL"),
+        session_key=assistant_agent_session_key(request),
+        torrent_id=str(candidate.get("id") or ""),
+        actor_user_id=actor_user_id,
+        downloader_id=downloader_id or None,
+        state="awaiting_confirmation",
+        candidate=agent_safe_payload(candidate),
+        constraints={
+            "query": query,
+            "filters": agent_safe_payload(constraints or {}),
+            "origin": {
+                "mobile_key": wechat_claw_mobile_key(request),
+                "binding_user_id": _WECHAT_CLAW_ACTIVE_USER_ID.get(),
+                "is_web": str(request.user_id or "").startswith("web-"),
+            },
+        },
+        result={},
+        expires_at=utc_now_naive() + timedelta(seconds=AGENT_DOWNLOAD_CONFIRM_TTL_SECONDS),
+    )
+    db.add(operation)
+    db.commit()
+    db.refresh(operation)
     state = get_wechat_claw_ilink_state(db)
     pending = state.get("mobile_pending_downloads") if isinstance(state.get("mobile_pending_downloads"), dict) else {}
-    pending[wechat_claw_mobile_key(request)] = {"created_at": utc_iso(), "candidate": candidate}
+    pending[wechat_claw_mobile_key(request)] = {
+        "created_at": utc_iso(),
+        "candidate": candidate,
+        "operation_id": operation.operation_id,
+    }
     update_wechat_claw_ilink_state(db, mobile_pending_downloads=pending)
+    return operation
 
 
 def get_wechat_claw_pending_download(db: Session, request: WechatClawMessageRequest) -> dict[str, Any] | None:
+    operation = latest_agent_download_operation(db, request, active_only=True)
+    if operation and operation.state in {"awaiting_confirmation", "confirming", "pending_verification", "started"}:
+        return {**dict(operation.candidate or {}), "_operation_id": operation.operation_id}
     state = get_wechat_claw_ilink_state(db)
     pending = state.get("mobile_pending_downloads") if isinstance(state.get("mobile_pending_downloads"), dict) else {}
     item = pending.get(wechat_claw_mobile_key(request)) if isinstance(pending.get(wechat_claw_mobile_key(request)), dict) else {}
@@ -1866,6 +2105,18 @@ def clear_wechat_claw_pending_download(db: Session, request: WechatClawMessageRe
     pending = state.get("mobile_pending_downloads") if isinstance(state.get("mobile_pending_downloads"), dict) else {}
     pending.pop(wechat_claw_mobile_key(request), None)
     update_wechat_claw_ilink_state(db, mobile_pending_downloads=pending)
+
+
+def cancel_wechat_claw_pending_download(db: Session, request: WechatClawMessageRequest) -> bool:
+    operation = latest_agent_download_operation(db, request, active_only=True)
+    if operation is None or operation.state != "awaiting_confirmation":
+        clear_wechat_claw_pending_download(db, request)
+        return False
+    operation.state = "cancelled"
+    operation.updated_at = utc_now_naive()
+    db.commit()
+    clear_wechat_claw_pending_download(db, request)
+    return True
 
 
 def grant_wechat_claw_privacy_access(db: Session, request: WechatClawMessageRequest) -> None:
@@ -1922,6 +2173,89 @@ def resolve_default_downloader(db: Session) -> str:
     return downloader_id
 
 
+def resolve_agent_downloader(db: Session, requested: str | None = None) -> str:
+    downloader_id = str(requested or "").strip().lower()
+    if not downloader_id:
+        return resolve_default_downloader(db)
+    if downloader_id not in DOWNLOADER_IDS:
+        raise HTTPException(status_code=400, detail="下载器必须是 qB1、qB2 或 qB3。")
+    row = get_config(db, downloader_id)
+    if not row or not row.enabled or not row.encrypted_payload:
+        raise HTTPException(status_code=409, detail=f"{downloader_label(downloader_id)} 当前不可用，请检查配置。")
+    return downloader_id
+
+
+def refresh_agent_download_candidate(
+    db: Session,
+    operation: AgentDownloadOperation,
+) -> tuple[dict[str, Any] | None, str | None]:
+    constraints = dict(operation.constraints or {})
+    query = str(constraints.get("query") or "").strip()
+    candidate = dict(operation.candidate or {})
+    if not query:
+        return candidate, None
+    items = search_mteam_with_budget(get_mteam_adapter_or_error(db), query)
+    fresh = next((item for item in items if str(item.get("id") or "") == operation.torrent_id), None)
+    if fresh is None:
+        return None, "unavailable"
+    filters = constraints.get("filters") if isinstance(constraints.get("filters"), dict) else {}
+    matched, _ = rank_mteam_search_items([fresh], filters)
+    if not matched:
+        return fresh, "conditions_changed"
+    original_presentation = (
+        candidate.get("presentation") if isinstance(candidate.get("presentation"), dict) else {}
+    )
+    fresh["presentation"] = {
+        **(fresh.get("presentation") if isinstance(fresh.get("presentation"), dict) else {}),
+        **original_presentation,
+    }
+    fresh["_search_query"] = query
+    return fresh, None
+
+
+def qb_download_state_started(item: dict[str, Any]) -> bool:
+    state = str(item.get("state") or "").strip().lower()
+    if any(token in state for token in ("error", "missing", "paused", "stopped")):
+        return False
+    if float(item.get("progress") or 0) >= 1:
+        return True
+    return any(token in state for token in ("download", "dl", "meta", "queued", "stalled", "allocat", "check"))
+
+
+def qb_torrents_by_hash(adapter: Any, downloader_id: str, task_hashes: list[str]) -> list[dict[str, Any]]:
+    if not task_hashes:
+        return []
+    try:
+        return adapter.get_torrents(downloader_id, {"hashes": "|".join(task_hashes)})
+    except TypeError:
+        items = adapter.get_torrents(downloader_id)
+        hashes = {value.lower() for value in task_hashes}
+        return [item for item in items if str(item.get("hash") or "").lower() in hashes]
+
+
+def verify_agent_download_started(
+    adapter: Any,
+    downloader_id: str,
+    task_hashes: list[str],
+    *,
+    timeout_seconds: float = AGENT_DOWNLOAD_VERIFY_TIMEOUT_SECONDS,
+) -> dict[str, Any] | None:
+    if not task_hashes or not hasattr(adapter, "get_torrents"):
+        return None
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        try:
+            items = qb_torrents_by_hash(adapter, downloader_id, task_hashes)
+        except (QbittorrentApiError, AttributeError):
+            items = []
+        started = next((item for item in items if qb_download_state_started(item)), None)
+        if started is not None:
+            return started
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(min(AGENT_DOWNLOAD_VERIFY_INTERVAL_SECONDS, max(0.0, deadline - time.monotonic())))
+
+
 def save_default_downloader(db: Session, downloader_id: str) -> dict[str, Any]:
     normalized = str(downloader_id or "").strip().lower()
     if normalized not in DOWNLOADER_IDS:
@@ -1945,8 +2279,17 @@ def download_wechat_claw_selected_torrent(
     torrent_id: str,
     actor: User,
     candidate: dict[str, Any] | None = None,
+    operation: AgentDownloadOperation | None = None,
 ) -> dict[str, Any]:
-    downloader_id = resolve_default_downloader(db)
+    if operation and operation.state == "started":
+        return dict(operation.result or {})
+    downloader_id = resolve_agent_downloader(db, operation.downloader_id if operation else None)
+    if operation:
+        operation.state = "confirming"
+        operation.downloader_id = downloader_id
+        operation.confirmed_at = operation.confirmed_at or utc_now_naive()
+        operation.updated_at = utc_now_naive()
+        db.commit()
     stage = "mteam_download_torrent"
     try:
         torrent_file = get_mteam_adapter_or_error(db).download_torrent_file(torrent_id)
@@ -1957,57 +2300,226 @@ def download_wechat_claw_selected_torrent(
             candidate or {"id": torrent_id},
         )
         stage = "qb_add_torrent_file"
-        result = get_qb_adapter_or_error(db, downloader_id).add_torrent_file(
-            downloader_id,
-            torrent_file["filename"],
-            torrent_file["content"],
-            {},
+        qb_adapter = get_qb_adapter_or_error(db, downloader_id)
+        existing_tasks = (
+            qb_torrents_by_hash(qb_adapter, downloader_id, task_hashes)
+            if hasattr(qb_adapter, "get_torrents") else []
         )
+        if existing_tasks:
+            result = {
+                "accepted": True,
+                "trace_id": operation.operation_id if operation else trace_id("DL"),
+                "already_present": True,
+            }
+        else:
+            result = qb_adapter.add_torrent_file(
+                downloader_id,
+                torrent_file["filename"],
+                torrent_file["content"],
+                {},
+            )
     except MTeamApiError as exc:
+        if operation:
+            operation.state = "failed"
+            operation.result = {"state": "failed", "stage": stage, "message": "M-Team 没有返回可用的种子文件。"}
+            operation.updated_at = utc_now_naive()
+            db.commit()
         raise HTTPException(status_code=502, detail=f"下载种子失败：{exc}") from exc
     except QbittorrentApiError as exc:
+        if operation:
+            operation.state = "failed"
+            operation.result = {"state": "failed", "stage": stage, "message": f"提交到 {downloader_id} 失败。"}
+            operation.updated_at = utc_now_naive()
+            db.commit()
         raise HTTPException(status_code=502, detail=f"推送到 {downloader_id} 失败：{exc}") from exc
     task_hash = task_hashes[0] if task_hashes else torrent_id
     db.add(DownloadAction(trace_id=result["trace_id"], downloader_id=downloader_id, action="add_mteam_mobile", target_hash=task_hash, actor_user_id=actor.id, status="accepted"))
-    db.commit()
-    return {
+    started_task = verify_agent_download_started(qb_adapter, downloader_id, task_hashes)
+    operation_state = "started" if started_task else "pending_verification"
+    operation_result = {
         **result,
+        "state": operation_state,
         "torrent_id": torrent_id,
         "task_hash": task_hash,
         "filename": torrent_file["filename"],
         "downloader_id": downloader_id,
+        "candidate": agent_safe_payload(candidate or {"id": torrent_id}),
+        "task_state": str((started_task or {}).get("state") or ""),
+        "verified_at": utc_iso() if started_task else None,
     }
+    if operation:
+        operation.state = operation_state
+        operation.candidate = agent_safe_payload(candidate or {"id": torrent_id})
+        # The hash is retained only in this internal operation record so the
+        # background verifier can identify the exact qB task. API/model payloads
+        # still pass through agent_safe_payload(), which removes it.
+        operation.result = operation_result
+        operation.expires_at = utc_now_naive() + timedelta(
+            minutes=5 if operation_state == "started" else 24 * 60
+        )
+        operation.updated_at = utc_now_naive()
+    db.commit()
+    return operation_result
+
+
+def notify_agent_download_started(db: Session, operation: AgentDownloadOperation) -> None:
+    result = dict(operation.result or {})
+    if result.get("notified_at"):
+        return
+    candidate = dict(operation.candidate or {})
+    message = format_mobile_agent_reply(
+        {"intent_type": "download_selected"},
+        {"state": "started", "candidate": candidate},
+    )
+    db.add(Notification(
+        title=f"{candidate.get('title') or '下载任务'}已开始下载"[:200],
+        message=message,
+        level="success",
+        source="agent",
+    ))
+    origin = (operation.constraints or {}).get("origin")
+    origin = origin if isinstance(origin, dict) else {}
+    if not origin.get("is_web"):
+        binding_user_id = origin.get("binding_user_id")
+        state = get_wechat_claw_ilink_state(db, binding_user_id)
+        selections = state.get("mobile_selections") if isinstance(state.get("mobile_selections"), dict) else {}
+        mobile_key = str(origin.get("mobile_key") or "")
+        selection = selections.get(mobile_key) if isinstance(selections.get(mobile_key), dict) else {}
+        context_token = str(selection.get("context_token") or "")
+        if mobile_key and context_token:
+            try:
+                config = get_decrypted_config(db, "wechat_claw") or {}
+                WechatClawAdapter(wechat_claw_config_with_state(config, state)).send_text(
+                    mobile_key, message, context_token
+                )
+            except Exception:
+                # The verified state and in-app notification are authoritative;
+                # a transient push failure must not revert the operation.
+                pass
+    operation.result = {**result, "notified_at": utc_iso()}
+    operation.updated_at = utc_now_naive()
+    db.commit()
+
+
+def reconcile_agent_download_operations(db: Session) -> int:
+    operations = (
+        db.query(AgentDownloadOperation)
+        .filter(AgentDownloadOperation.state == "pending_verification")
+        .order_by(AgentDownloadOperation.confirmed_at.asc())
+        .limit(50)
+        .all()
+    )
+    started_count = 0
+    for operation in operations:
+        confirmed_at = operation.confirmed_at or operation.updated_at or operation.created_at
+        if confirmed_at and (utc_now_naive() - confirmed_at).total_seconds() > 24 * 60 * 60:
+            operation.state = "verification_timeout"
+            operation.result = {**dict(operation.result or {}), "state": "verification_timeout"}
+            operation.updated_at = utc_now_naive()
+            db.commit()
+            continue
+        result = dict(operation.result or {})
+        task_hash = str(result.get("task_hash") or "")
+        downloader_id = str(operation.downloader_id or "")
+        if not task_hash or downloader_id not in DOWNLOADER_IDS:
+            continue
+        try:
+            task = verify_agent_download_started(
+                get_qb_adapter_or_error(db, downloader_id),
+                downloader_id,
+                [task_hash],
+                timeout_seconds=0,
+            )
+        except (HTTPException, QbittorrentApiError):
+            continue
+        if task is None:
+            continue
+        operation.state = "started"
+        operation.result = {
+            **result,
+            "state": "started",
+            "task_state": str(task.get("state") or ""),
+            "verified_at": utc_iso(),
+        }
+        operation.updated_at = utc_now_naive()
+        operation.expires_at = utc_now_naive() + timedelta(minutes=5)
+        db.commit()
+        notify_agent_download_started(db, operation)
+        started_count += 1
+    return started_count
+
+
+def mteam_download_factor(item: dict[str, Any]) -> float:
+    if item.get("download_factor") not in (None, ""):
+        return max(0.0, min(1.0, float(item.get("download_factor"))))
+    promotion_type = str(item.get("promotion_type") or "").strip().lower()
+    if promotion_type in {"free", "percent_0"}:
+        return 0.0
+    if promotion_type in {"30%", "percent_30"}:
+        return 0.3
+    if promotion_type in {"50%", "half", "percent_50"}:
+        return 0.5
+    return 1.0
 
 
 def rank_mteam_search_items(items: list[dict[str, Any]], filters: dict[str, Any]) -> tuple[list[dict[str, Any]], int | None]:
     resolution = str(filters.get("resolution") or "").lower()
+    resolutions_source = filters.get("resolutions") if isinstance(filters.get("resolutions"), list) else []
+    resolutions = {str(value).strip().lower() for value in resolutions_source if str(value).strip()}
+    if resolution:
+        resolutions.add(resolution)
     promotion = str(filters.get("promotion") or "any").lower()
     # M-Team search always exposes a ranked recommendation. The model may omit
     # this optional preference, but it must not make the recommendation vanish.
     recommend = True
     min_size = max(0.0, float(filters.get("min_size_gb") or 0))
     max_size = max(0.0, float(filters.get("max_size_gb") or 0))
+    min_seeders = max(0, int(float(filters.get("min_seeders") or 0)))
+    factor_value = filters.get("download_factor_max")
+    download_factor_max = None if factor_value in (None, "") else max(0.0, min(1.0, float(factor_value)))
+    official_only = bool(filters.get("official_only"))
+    chinese_filter = filters.get("has_chinese_subtitles")
+    promotion_minutes = max(0, int(float(filters.get("promotion_expires_after_minutes") or 0)))
     filtered = list(items)
-    if resolution:
-        matched = [item for item in filtered if resolution in str(item.get("resolution") or "").lower() or resolution in " ".join(item.get("labels") or []).lower()]
-        if matched:
-            filtered = matched
+    if resolutions:
+        filtered = [
+            item for item in filtered
+            if any(
+                requested in str(item.get("resolution") or "").lower()
+                or requested in " ".join(item.get("labels") or []).lower()
+                for requested in resolutions
+            )
+        ]
     if promotion in {"free", "discount"}:
-        matched = [item for item in filtered if promotion == str(item.get("promotion_type") or "").lower() or (promotion == "discount" and bool(item.get("promotion_label")))]
-        if matched:
-            filtered = matched
+        filtered = [
+            item for item in filtered
+            if (promotion == "free" and mteam_download_factor(item) == 0)
+            or (promotion == "discount" and mteam_download_factor(item) <= 0.5)
+        ]
+    if download_factor_max is not None:
+        filtered = [item for item in filtered if mteam_download_factor(item) <= download_factor_max]
     if min_size or max_size:
-        matched = []
+        matched: list[dict[str, Any]] = []
         for item in filtered:
             size_gb = float(item.get("size_bytes") or 0) / (1024 ** 3)
             if (not min_size or size_gb >= min_size) and (not max_size or size_gb <= max_size):
                 matched.append(item)
-        if matched:
-            filtered = matched
+        filtered = matched
+    if min_seeders:
+        filtered = [item for item in filtered if int(float(item.get("seeders") or 0)) >= min_seeders]
+    if official_only:
+        filtered = [item for item in filtered if item.get("is_official") is True]
+    if isinstance(chinese_filter, bool):
+        filtered = [item for item in filtered if mteam_has_chinese_subtitles(item) is chinese_filter]
+    if promotion_minutes:
+        minimum_until = utc_now() + timedelta(minutes=promotion_minutes)
+        filtered = [
+            item for item in filtered
+            if (parse_datetime(item.get("promotion_until")) or utc_now()) >= minimum_until
+        ]
 
     def recommendation_score(item: dict[str, Any]) -> tuple[float, ...]:
-        promo_type = str(item.get("promotion_type") or "").lower()
-        promo_rank = 3 if promo_type == "free" or "FREE" in str(item.get("promotion_label") or "").upper() else 2 if promo_type or item.get("promotion_label") else 1
+        promo_rank = 1.0 - mteam_download_factor(item)
         resolution_text = f"{item.get('resolution') or ''} {' '.join(item.get('labels') or [])}".lower()
         four_k = 1 if any(value in resolution_text for value in ("2160", "4k", "uhd")) else 0
         size_gb = float(item.get("size_bytes") or 0) / (1024 ** 3)
@@ -2217,11 +2729,26 @@ def execute_mobile_agent_intent(db: Session, intent: dict[str, Any], request: We
         if not query:
             raise HTTPException(status_code=400, detail="M-Team 搜索需要影片或资源关键词。")
         try:
-            raw_items = get_mteam_adapter_or_error(db).search_torrents(query)[:30]
+            adapter = get_mteam_adapter_or_error(db)
+            raw_items = search_mteam_with_budget(adapter, query)[:100]
         except MTeamApiError as exc:
             raise HTTPException(status_code=502, detail=f"M-Team 搜索失败：{exc}") from exc
         items, recommended_index = rank_mteam_search_items(raw_items, intent.get("mteam_filters") or {})
-        return {"intent_type": intent_type, "query": query, "filters": intent.get("mteam_filters"), "items": items, "count": len(items), "recommended_index": recommended_index}
+        search_meta = dict(getattr(adapter, "last_search_meta", {}) or {})
+        return {
+            "intent_type": intent_type,
+            "query": query,
+            "filters": intent.get("mteam_filters"),
+            "items": items,
+            "count": len(items),
+            "recommended_index": recommended_index,
+            "scanned_count": int(search_meta.get("scanned_count") or len(raw_items)),
+            "pages_scanned": int(search_meta.get("pages_scanned") or 1),
+            "complete": bool(search_meta.get("complete", True)),
+            "budget_reached": bool(search_meta.get("budget_reached")),
+            "source": "M-Team API",
+            "queried_at": utc_iso(),
+        }
     if intent_type == "dashboard_query":
         sections = intent.get("dashboard_sections") or []
         if sections == ["overview"] and MTEAM_SITE_DATA_RE.search(request.message or ""):
@@ -2246,7 +2773,27 @@ def build_mobile_dashboard_result(
         result["qbs"] = dashboard_qbs
         result["updated_at"] = dashboard.get("updated_at")
     elif dashboard and "mteam" in selected:
-        result["mteam"] = dashboard.get("mteam") or {}
+        historical = dict(dashboard.get("mteam") or {})
+        try:
+            live_mteam = collect_mteam_snapshot(db)
+            db.commit()
+            apply_mteam_five_hour_deltas(db, live_mteam)
+            live_mteam["traffic_series"] = build_mteam_traffic_series(db)
+            live_mteam["traffic_history"] = live_mteam["traffic_series"]["day"]
+            live_mteam["live_query"] = True
+            result["mteam"] = live_mteam
+            result["updated_at"] = live_mteam.get("captured_at")
+        except Exception as exc:
+            db.rollback()
+            historical["stale"] = True
+            historical["live_query"] = False
+            historical["live_error"] = live_diagnostic_error(exc)
+            historical["historical_age_seconds"] = max(
+                0,
+                int((utc_now() - (parse_datetime(historical.get("captured_at")) or utc_now())).total_seconds()),
+            )
+            result["mteam"] = historical
+            result["updated_at"] = historical.get("captured_at")
     if dashboard and "nas" in selected:
         result["nas"] = dashboard.get("overview") or {}
     for downloader_id in ("qb1", "qb2", "qb3"):
@@ -2300,6 +2847,393 @@ def agent_cached_result_item(session: dict[str, Any], result_key: str, index: in
     return dict(item) if item else None
 
 
+def canonical_mteam_filters(arguments: dict[str, Any]) -> dict[str, Any]:
+    resolutions = arguments.get("resolutions") if isinstance(arguments.get("resolutions"), list) else []
+    legacy_resolution = str(arguments.get("resolution") or "").strip()
+    if legacy_resolution and not resolutions:
+        resolutions = [legacy_resolution]
+    factor_value = arguments.get("download_factor_max")
+    try:
+        download_factor_max = max(0.0, min(1.0, float(factor_value))) if factor_value is not None else None
+    except (TypeError, ValueError):
+        download_factor_max = None
+    return {
+        "resolutions": [str(value).lower() for value in resolutions if str(value).strip()],
+        "min_size_gb": max(0.0, float(arguments.get("min_size_gb") or 0)),
+        "max_size_gb": max(0.0, float(arguments.get("max_size_gb") or 0)),
+        "promotion": str(arguments.get("promotion") or "any").lower(),
+        "download_factor_max": download_factor_max,
+        "min_seeders": max(0, int(float(arguments.get("min_seeders") or 0))),
+        "official_only": bool(arguments.get("official_only")),
+        "has_chinese_subtitles": arguments.get("has_chinese_subtitles")
+        if isinstance(arguments.get("has_chinese_subtitles"), bool) else None,
+        "promotion_expires_after_minutes": max(
+            0, int(float(arguments.get("promotion_expires_after_minutes") or 0))
+        ),
+        "recommend": True,
+    }
+
+
+def media_work_search_terms(item: dict[str, Any]) -> list[str]:
+    terms: list[str] = []
+    for value in (item.get("title"), item.get("original_title")):
+        text = str(value or "").strip()
+        if text and text.casefold() not in {term.casefold() for term in terms}:
+            terms.append(text)
+    return terms[:2]
+
+
+def execute_bounded_media_mteam_search(
+    db: Session,
+    arguments: dict[str, Any],
+    request: WechatClawMessageRequest,
+) -> dict[str, Any]:
+    try:
+        requested_count = max(1, int(arguments.get("target_count") or 3))
+    except (TypeError, ValueError):
+        requested_count = 3
+    target_count = min(requested_count, 10)
+    query = str(arguments.get("query") or "").strip()
+    media_type = str(arguments.get("media_type") or "movie").strip().lower()
+    if media_type not in {"movie", "tv", "all"}:
+        media_type = "movie"
+    min_rating = max(0.0, min(10.0, float(arguments.get("min_rating") or 7.5)))
+    min_vote_count = max(0, int(float(arguments.get("min_vote_count") or 200)))
+    release_date_to = str(arguments.get("release_date_to") or utc_now().date().isoformat()).strip()
+    tmdb_filters = {
+        "media_type": media_type,
+        "genre": str(arguments.get("genre") or "").strip(),
+        "release_date_from": str(arguments.get("release_date_from") or "").strip(),
+        "release_date_to": release_date_to,
+        "min_rating": min_rating,
+        "min_vote_count": min_vote_count,
+        "sort_by": "vote_average.desc",
+        "pages": 4,
+        "limit": 20,
+        "hydrate": False,
+    }
+    row = get_config(db, "tmdb")
+    if not row or not row.enabled:
+        raise HTTPException(status_code=409, detail="请先在设置中启用 TMDB。")
+    tmdb = TmdbAdapter(get_decrypted_config(db, "tmdb") or {})
+    works = tmdb.lookup_media(query, tmdb_filters)
+    release_date_from = str(tmdb_filters.get("release_date_from") or "")
+    works = [
+        item for item in works
+        if float(item.get("rating") or 0) >= min_rating
+        and int(item.get("vote_count") or 0) >= min_vote_count
+        and bool(str(item.get("release_date") or ""))
+        and (not release_date_from or str(item.get("release_date") or "") >= release_date_from)
+        and (not release_date_to or str(item.get("release_date") or "") <= release_date_to)
+    ][:20]
+    mteam = get_mteam_adapter_or_error(db)
+    mteam_filters = canonical_mteam_filters(arguments)
+    matches: list[dict[str, Any]] = []
+    checked_works = 0
+    queries_used = 0
+    pages_scanned = 0
+    complete = True
+    for work in works:
+        if len(matches) >= target_count or queries_used >= 20:
+            break
+        checked_works += 1
+        best_resource: dict[str, Any] | None = None
+        for term in media_work_search_terms(work):
+            if queries_used >= 20:
+                complete = False
+                break
+            queries_used += 1
+            raw_items = search_mteam_with_budget(mteam, term, max_pages=5)[:100]
+            meta = dict(getattr(mteam, "last_search_meta", {}) or {})
+            pages_scanned += int(meta.get("pages_scanned") or (1 if raw_items else 0))
+            if meta.get("complete") is False:
+                complete = False
+            ranked, _ = rank_mteam_search_items(raw_items, mteam_filters)
+            if ranked:
+                best_resource = ranked[0]
+                break
+        if best_resource is not None:
+            work_label = tmdb_title_label(work)
+            presentation = best_resource.get("presentation") if isinstance(best_resource.get("presentation"), dict) else {}
+            best_resource["presentation"] = {**presentation, "work_title": work_label}
+            best_resource["_search_query"] = media_work_search_terms(work)[0]
+            matches.append({"work": work, "resource": best_resource})
+    if checked_works < len(works) and len(matches) < target_count:
+        complete = False
+    resources = [dict(item["resource"]) for item in matches]
+    presentation = mteam_model_rows(resources)
+    mobile_selection = save_wechat_claw_mobile_candidates(
+        db,
+        request,
+        resources,
+        query=" / ".join(str(item["work"].get("title") or "") for item in matches),
+        recommended_index=1 if resources else None,
+        presentation=presentation,
+    )
+    return {
+        "state": "success",
+        "query": query,
+        "target_count": target_count,
+        "requested_count": requested_count,
+        "found_count": len(matches),
+        "items": resources,
+        "matches": matches,
+        "count": len(matches),
+        "filters": {"tmdb": tmdb_filters, "mteam": mteam_filters},
+        "presentation": presentation,
+        "recommended_index": 1 if resources else None,
+        "mobile_selection": mobile_selection,
+        "checked_works": checked_works,
+        "queries_used": queries_used,
+        "pages_scanned": pages_scanned,
+        "complete": complete,
+        "source": "TMDB API + M-Team API",
+        "queried_at": utc_iso(),
+    }
+
+
+def _basic_media_clues(message: str) -> dict[str, Any]:
+    text = str(message or "").strip()
+    people: list[str] = []
+    person_patterns = (
+        r"(?:男主(?:角)?|女主(?:角)?|主演)\s*(?:是|有)?\s*([\u4e00-\u9fff·]{2,12})",
+        r"(?:^|[，,、；;\s])([\u4e00-\u9fff·]{2,12}?)\s*(?<!导)(?:演的|主演)",
+    )
+    for pattern in person_patterns:
+        for value in re.findall(pattern, text):
+            for name in re.split(r"[、和与及]", str(value).strip()):
+                name = name.strip()
+                if name and name not in people:
+                    people.append(name)
+    director_match = re.search(r"导演\s*(?:是|叫)\s*([\u4e00-\u9fff·]{2,12})", text)
+    if not director_match:
+        director_match = re.search(r"(?:^|[，,、；;\s])([\u4e00-\u9fff·]{2,12})\s*导演", text)
+    year_match = re.search(r"(?<!\d)((?:19|20)\d{2})(?:\s*年)?", text)
+    titles = [value.strip() for value in re.findall(r"《([^》]{1,80})》", text) if value.strip()]
+    return {
+        "people": people[:6],
+        "director": director_match.group(1).strip() if director_match else "",
+        "year": year_match.group(1) if year_match else "",
+        "media_type": "tv" if re.search(r"电视剧|剧集|连续剧", text) else "movie" if "电影" in text else "all",
+        "title_hypotheses": titles[:5],
+        "plot_keywords": [],
+        "wants_details": bool(re.search(r"详细|完整信息|资料|剧情|简介|评分|演员有哪些|主演有哪些|导演是谁|讲什么", text)),
+        "wants_resources": bool(re.search(r"资源|种子|版本|促销|馒头|m[-\s]?team|pt\s*站", text, re.IGNORECASE)),
+    }
+
+
+def _media_clues(ai_adapter: DeepSeekChatAdapter, message: str, session: dict[str, Any], arguments: dict[str, Any]) -> dict[str, Any]:
+    clues = _basic_media_clues(message)
+    extractor = getattr(ai_adapter, "extract_media_clues", None)
+    if callable(extractor):
+        try:
+            extracted = extractor(message, history=list(session.get("history") or []))
+            if isinstance(extracted, dict):
+                for key in ("director", "year", "media_type"):
+                    if extracted.get(key):
+                        clues[key] = extracted[key]
+                for key in ("people", "title_hypotheses", "plot_keywords"):
+                    if isinstance(extracted.get(key), list) and extracted[key]:
+                        clues[key] = extracted[key]
+                clues["wants_details"] = bool(extracted.get("wants_details") or clues["wants_details"])
+                clues["wants_resources"] = bool(extracted.get("wants_resources") or clues["wants_resources"])
+        except (AIServiceError, ValueError, TypeError):
+            pass
+    for key in ("director", "year", "media_type"):
+        if arguments.get(key):
+            clues[key] = str(arguments[key]).strip()
+    for key in ("people", "title_hypotheses"):
+        if isinstance(arguments.get(key), list) and arguments[key]:
+            clues[key] = [str(value).strip() for value in arguments[key] if str(value).strip()]
+    clues["wants_details"] = bool(arguments.get("wants_details") or clues["wants_details"])
+    clues["wants_resources"] = bool(arguments.get("wants_resources") or clues["wants_resources"])
+    return clues
+
+
+def _tmdb_work_key(item: dict[str, Any]) -> str:
+    return f"{item.get('media_type')}:{item.get('tmdb_id') or item.get('id')}"
+
+
+def _same_name(left: str, right: str) -> bool:
+    normalized_left = re.sub(r"[\s·._-]+", "", str(left or "")).casefold()
+    normalized_right = re.sub(r"[\s·._-]+", "", str(right or "")).casefold()
+    return bool(normalized_left and normalized_right and (
+        normalized_left == normalized_right
+        or normalized_left in normalized_right
+        or normalized_right in normalized_left
+    ))
+
+
+def _safe_tmdb_failure_category(exc: Exception) -> str:
+    if isinstance(exc, TmdbConfigError):
+        return "TMDB 还没有配置好"
+    if isinstance(exc, (TimeoutError, SocketTimeout)):
+        return "连接 TMDB 时超时"
+    if isinstance(exc, (TmdbDohError, URLError, HTTPError, ConnectionError)):
+        return "连接 TMDB 时遇到网络问题"
+    return "TMDB 服务暂时没有响应"
+
+
+def _memory_media_hypothesis(
+    ai_adapter: DeepSeekChatAdapter, message: str, session: dict[str, Any]
+) -> dict[str, Any]:
+    guesser = getattr(ai_adapter, "guess_media_from_memory", None)
+    if not callable(guesser):
+        return {}
+    try:
+        candidate = guesser(message, history=list(session.get("history") or []))
+    except (AIServiceError, ValueError, TypeError):
+        return {}
+    return candidate if isinstance(candidate, dict) else {}
+
+
+def resolve_media_from_clues(
+    db: Session,
+    ai_adapter: DeepSeekChatAdapter,
+    message: str,
+    session: dict[str, Any],
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve identity from independent TMDB evidence; model memory is only a verified lookup seed."""
+    clues = _media_clues(ai_adapter, message, session, arguments)
+    memory_candidate: dict[str, Any] = {}
+    tmdb: TmdbAdapter | None = None
+    network_error: Exception | None = None
+    candidates: list[dict[str, Any]] = []
+    matched_people: list[str] = []
+    try:
+        row = get_config(db, "tmdb")
+        if not row or not row.enabled:
+            raise TmdbConfigError("TMDB is not enabled")
+        tmdb = TmdbAdapter(get_decrypted_config(db, "tmdb") or {})
+        credit_maps: list[dict[str, dict[str, Any]]] = []
+        for person_name in clues.get("people") or []:
+            people = tmdb.search_people(str(person_name), limit=4)
+            person = next((value for value in people if _same_name(person_name, value.get("name"))), people[0] if people else None)
+            if not person:
+                continue
+            details = tmdb.get_person_details(str(person.get("person_id") or ""))
+            credit_map = {
+                _tmdb_work_key(item): item
+                for item in details.get("credits") or []
+                if isinstance(item, dict)
+                and item.get("media_type") in {"movie", "tv"}
+                and (clues.get("media_type") not in {"movie", "tv"} or item.get("media_type") == clues.get("media_type"))
+            }
+            if credit_map:
+                credit_maps.append(credit_map)
+                matched_people.append(str(person.get("name") or person_name))
+        if credit_maps and len(credit_maps) == len(clues.get("people") or []):
+            shared_keys = set(credit_maps[0])
+            for credit_map in credit_maps[1:]:
+                shared_keys.intersection_update(credit_map)
+            compact = [credit_maps[0][key] for key in shared_keys]
+            compact.sort(key=lambda item: float(item.get("popularity") or 0), reverse=True)
+            for item in compact[:10]:
+                try:
+                    candidates.append(
+                        tmdb.get_media_details(str(item.get("tmdb_id") or ""), str(item.get("media_type") or "movie"))
+                    )
+                except Exception:
+                    candidates.append(item)
+        if not candidates:
+            for title in clues.get("title_hypotheses") or []:
+                candidates.extend(tmdb.search_media(str(title))[:5])
+    except Exception as exc:
+        network_error = exc
+
+    year = str(clues.get("year") or "").strip()
+    director = str(clues.get("director") or "").strip()
+    ranked: list[tuple[int, dict[str, Any], list[str]]] = []
+    seen: set[str] = set()
+    for item in candidates:
+        key = _tmdb_work_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        mismatches: list[str] = []
+        score = len(matched_people) * 5
+        if year:
+            if str(item.get("year") or "") == year:
+                score += 3
+            else:
+                mismatches.append(f"年份是 {item.get('year') or '未知'}，不是 {year}")
+        if director:
+            if _same_name(director, str(item.get("director") or "")):
+                score += 4
+            else:
+                mismatches.append(f"TMDB 标注的导演是 {item.get('director') or '未知'}，不是 {director}")
+        score += min(3, int(float(item.get("popularity") or 0) // 25))
+        ranked.append((score, item, mismatches))
+    ranked.sort(key=lambda value: (value[0], float(value[1].get("popularity") or 0)), reverse=True)
+
+    exact = [value for value in ranked if not value[2]]
+    if len(exact) == 1:
+        return {
+            "state": "resolved",
+            "item": exact[0][1],
+            "matched_clues": matched_people,
+            "clues": clues,
+            "source": "tmdb",
+        }
+    if len(exact) > 1:
+        return {
+            "state": "multiple",
+            "items": [value[1] for value in exact[:5]],
+            "matched_clues": matched_people,
+            "clues": clues,
+            "source": "tmdb",
+        }
+    if ranked:
+        best = ranked[0]
+        return {
+            "state": "needs_confirmation",
+            "item": best[1],
+            "matched_clues": matched_people,
+            "mismatched_clues": best[2],
+            "clues": clues,
+            "source": "tmdb",
+        }
+
+    memory_candidate = _memory_media_hypothesis(ai_adapter, message, session)
+    title = str(memory_candidate.get("title") or "").strip()
+    if title and tmdb is not None and network_error is None:
+        try:
+            matches = tmdb.search_media(title)
+            verified = next(
+                (
+                    item for item in matches
+                    if _same_name(title, str(item.get("title") or ""))
+                    and (not memory_candidate.get("year") or str(item.get("year") or "") == str(memory_candidate.get("year")))
+                ),
+                None,
+            )
+            if verified:
+                return {
+                    "state": "memory_verified",
+                    "item": verified,
+                    "matched_clues": [],
+                    "clues": clues,
+                    "source": "tmdb",
+                }
+        except Exception as exc:
+            network_error = exc
+    if title and network_error is not None:
+        return {
+            "state": "memory_unverified",
+            "title": title,
+            "year": str(memory_candidate.get("year") or ""),
+            "reason": str(memory_candidate.get("reason") or ""),
+            "failure_category": _safe_tmdb_failure_category(network_error),
+        }
+    return {
+        "state": "not_found",
+        "clues": clues,
+        "message": "这些线索暂时还不足以在 TMDB 中确定唯一作品，可以再告诉我大概年份、导演或一段剧情。",
+        "source": "tmdb",
+    }
+
+
 def execute_media_hub_agent_tool(
     db: Session,
     ai_adapter: DeepSeekChatAdapter,
@@ -2310,6 +3244,15 @@ def execute_media_hub_agent_tool(
     session: dict[str, Any],
     qb2_authorized: bool | None = None,
 ) -> dict[str, Any]:
+    if tool == "resolve_media_from_clues":
+        return resolve_media_from_clues(
+            db,
+            ai_adapter,
+            str(arguments.get("query") or request.message or ""),
+            session,
+            arguments,
+        )
+
     if tool == "tmdb_lookup":
         filters = {
             "media_type": str(arguments.get("media_type") or "all").lower(),
@@ -2355,13 +3298,7 @@ def execute_media_hub_agent_tool(
         return {"state": "success", "item": item, "source": "tmdb"}
 
     if tool == "mteam_search":
-        filters = {
-            "resolution": str(arguments.get("resolution") or "").lower(),
-            "min_size_gb": max(0.0, float(arguments.get("min_size_gb") or 0)),
-            "max_size_gb": max(0.0, float(arguments.get("max_size_gb") or 0)),
-            "promotion": str(arguments.get("promotion") or "any").lower(),
-            "recommend": bool(arguments.get("recommend")),
-        }
+        filters = canonical_mteam_filters(arguments)
         intent = {"intent_type": "mteam_search", "query": str(arguments.get("query") or "").strip(), "mteam_filters": filters}
         result = execute_mobile_agent_intent(db, intent, request, user)
         limit = agent_int_argument(arguments, "limit", 5, 1, 10)
@@ -2374,6 +3311,9 @@ def execute_media_hub_agent_tool(
         )
         return result
 
+    if tool == "find_media_with_mteam":
+        return execute_bounded_media_mteam_search(db, arguments, request)
+
     if tool == "mteam_result_details":
         index = agent_int_argument(arguments, "result_index", 0, 1, 10)
         references = session.get("references") if isinstance(session.get("references"), dict) else {}
@@ -2385,7 +3325,7 @@ def execute_media_hub_agent_tool(
         query = str(search_ref.get("query") or "").strip()
         if not query:
             raise HTTPException(status_code=400, detail="The recent M-Team search expired. Search again.")
-        fresh_items = get_mteam_adapter_or_error(db).search_torrents(query)[:50]
+        fresh_items = search_mteam_with_budget(get_mteam_adapter_or_error(db), query)[:100]
         item = next((value for value in fresh_items if str(value.get("id") or "") == candidate_id), None)
         if item is None:
             item = agent_cached_result_item(session, "mteam_search", index)
@@ -2431,6 +3371,12 @@ def execute_media_hub_agent_tool(
         detail = get_qb_adapter_or_error(db, downloader_id).get_torrent_detail(downloader_id, torrent_hash)
         return {"state": "success", "downloader_id": downloader_id, "result_index": index, "name": candidates[index - 1].get("name"), "detail": detail}
 
+    if tool == "knowledge_search":
+        return search_knowledge(
+            str(arguments.get("query") or request.message or ""),
+            agent_int_argument(arguments, "limit", 3, 1, 5),
+        )
+
     if tool == "prepare_mteam_download":
         index = agent_int_argument(arguments, "result_index", 0, 1, 10)
         candidate = get_wechat_claw_mobile_candidate(db, request, index)
@@ -2438,8 +3384,42 @@ def execute_media_hub_agent_tool(
             candidate = agent_cached_result_item(session, "mteam_search", index)
         if candidate is None or not str(candidate.get("id") or ""):
             return {"intent_type": "download_selected", "state": "selection_missing"}
-        save_wechat_claw_pending_download(db, request, candidate)
-        return {"intent_type": "download_selected", "state": "awaiting_confirmation", "candidate": candidate}
+        recent = session.get("recent_results") if isinstance(session.get("recent_results"), dict) else {}
+        search_result = recent.get("mteam_search") if isinstance(recent.get("mteam_search"), dict) else {}
+        query = str(candidate.get("_search_query") or search_result.get("query") or "").strip()
+        constraints = search_result.get("filters") if isinstance(search_result.get("filters"), dict) else {}
+        if query:
+            fresh_items = search_mteam_with_budget(get_mteam_adapter_or_error(db), query)
+            refreshed = next((item for item in fresh_items if str(item.get("id") or "") == str(candidate.get("id") or "")), None)
+            if refreshed is None:
+                return {"intent_type": "download_selected", "state": "resource_unavailable", "candidate": candidate}
+            matched, _ = rank_mteam_search_items([refreshed], constraints)
+            if not matched:
+                return {"intent_type": "download_selected", "state": "conditions_changed", "candidate": refreshed}
+            original_presentation = (
+                candidate.get("presentation") if isinstance(candidate.get("presentation"), dict) else {}
+            )
+            refreshed["presentation"] = {
+                **(refreshed.get("presentation") if isinstance(refreshed.get("presentation"), dict) else {}),
+                **original_presentation,
+            }
+            refreshed["_search_query"] = query
+            candidate = refreshed
+        operation = save_wechat_claw_pending_download(
+            db,
+            request,
+            candidate,
+            query=query,
+            constraints=constraints,
+            downloader_id=str(arguments.get("downloader_id") or ""),
+            actor_user_id=user.id,
+        )
+        return {
+            "intent_type": "download_selected",
+            "state": "awaiting_confirmation",
+            "candidate": candidate,
+            "operation_id": operation.operation_id,
+        }
 
     if tool == "confirm_mteam_download":
         candidate = get_wechat_claw_pending_download(db, request)
@@ -2447,30 +3427,215 @@ def execute_media_hub_agent_tool(
             return {"intent_type": "download_selected", "state": "selection_missing"}
         if not WECHAT_CLAW_EXPLICIT_DOWNLOAD_CONFIRM_RE.search(request.message or ""):
             return {"intent_type": "download_selected", "state": "confirmation_required", "candidate": candidate}
-        dispatch = download_wechat_claw_selected_torrent(db, str(candidate.get("id") or ""), user, candidate)
-        clear_wechat_claw_pending_download(db, request)
-        return {"intent_type": "download_selected", "state": "accepted", "candidate": candidate, **dispatch}
+        operation_id = str(candidate.get("_operation_id") or "")
+        operation = (
+            db.query(AgentDownloadOperation)
+            .filter(AgentDownloadOperation.operation_id == operation_id)
+            .one_or_none()
+            if operation_id else latest_agent_download_operation(db, request, active_only=True)
+        )
+        if operation is None:
+            return {"intent_type": "download_selected", "state": "selection_missing"}
+        with agent_download_lock(operation.operation_id):
+            db.refresh(operation)
+            if operation.state in {"started", "pending_verification"}:
+                return {"intent_type": "download_selected", **dict(operation.result or {}), "candidate": dict(operation.candidate or {})}
+            refreshed, reason = refresh_agent_download_candidate(db, operation)
+            if reason:
+                operation.state = reason
+                operation.result = {"state": reason, "candidate": agent_safe_payload(refreshed or operation.candidate)}
+                operation.updated_at = utc_now_naive()
+                db.commit()
+                clear_wechat_claw_pending_download(db, request)
+                return {"intent_type": "download_selected", **dict(operation.result or {})}
+            dispatch = download_wechat_claw_selected_torrent(
+                db,
+                operation.torrent_id,
+                user,
+                refreshed or dict(operation.candidate or {}),
+                operation,
+            )
+            clear_wechat_claw_pending_download(db, request)
+            return {"intent_type": "download_selected", **dispatch}
 
     raise HTTPException(status_code=400, detail=f"Agent requested an unknown tool: {tool}")
 
 
+def format_tmdb_detail_reply(result: dict[str, Any]) -> str:
+    item = result.get("item") if isinstance(result.get("item"), dict) else {}
+    if not item:
+        return "这次没有取得可展示的作品详情，请重新查询后再试。"
+    title = tmdb_title_label(item)
+    genres = " / ".join(str(value) for value in item.get("genres") or []) or "-"
+    countries = " / ".join(str(value) for value in item.get("production_countries") or []) or "-"
+    cast = " / ".join(str(value) for value in item.get("cast") or []) or "-"
+    media_type = "电视剧" if item.get("media_type") == "tv" else "电影"
+    lines = [
+        f"【{title}】",
+        f"类型：{media_type} · {genres}",
+        f"年份：{item.get('year') or '-'} · TMDB：{item.get('rating') or '-'}（{item.get('vote_count') or 0} 人评分）",
+        f"国家/地区：{countries} · 原语言：{item.get('original_language') or '-'}",
+        f"时长/季集：{tmdb_runtime_progress_label(item)}",
+        f"导演/主创：{item.get('director') or '-'}",
+        f"主演：{cast}",
+        "",
+        str(item.get("overview") or "暂无简介。").strip(),
+        "",
+        "来源：TMDB API",
+    ]
+    return "\n".join(lines)
+
+
+def format_media_resolution_reply(result: dict[str, Any]) -> str:
+    state = str(result.get("state") or "")
+    if state in {"resolved", "memory_verified"}:
+        item = result.get("item") if isinstance(result.get("item"), dict) else {}
+        if not item:
+            return "这次没有找到可核对的作品信息。"
+        clues = result.get("clues") if isinstance(result.get("clues"), dict) else {}
+        if clues.get("wants_details"):
+            return format_tmdb_detail_reply({"item": item})
+        director = str(item.get("director") or "-")
+        matched = "、".join(str(value) for value in result.get("matched_clues") or [])
+        lines = [f"你找的应该是《{item.get('title') or '-'}》（{item.get('year') or '年份未知'}），导演是 {director}。"]
+        if matched:
+            lines.append(f"TMDB 的演职员信息与“{matched}”这些线索吻合。")
+        return "\n".join(lines)
+    if state == "needs_confirmation":
+        item = result.get("item") if isinstance(result.get("item"), dict) else {}
+        mismatch = "；".join(str(value) for value in result.get("mismatched_clues") or [])
+        prefix = f"按现有线索，最接近的是《{item.get('title') or '-'}》（{item.get('year') or '年份未知'}）"
+        return f"{prefix}。{mismatch}。你找的是这部吗？" if mismatch else f"{prefix}。你找的是这部吗？"
+    if state == "multiple":
+        items = result.get("items") if isinstance(result.get("items"), list) else []
+        lines = ["这些线索在 TMDB 中对应到不止一部作品：", ""]
+        lines.extend(
+            f"{index}. 《{item.get('title') or '-'}》（{item.get('year') or '年份未知'}）· 导演：{item.get('director') or '-'}"
+            for index, item in enumerate(items, 1)
+            if isinstance(item, dict)
+        )
+        lines.extend(["", "告诉我第几部，我就按这部继续查。"])
+        return "\n".join(lines)
+    if state == "memory_unverified":
+        title = str(result.get("title") or "")
+        year = str(result.get("year") or "")
+        failure = str(result.get("failure_category") or "TMDB 暂时没有响应")
+        label = f"《{title}》（{year}）" if year else f"《{title}》"
+        return (
+            f"我根据这些线索想到最可能是{label}。不过刚才{failure}，暂时没能替你核对演员和影片资料，"
+            "所以先把它作为一个可能答案；连接恢复后我可以继续确认。"
+        )
+    return str(result.get("message") or "这些线索暂时还不能确定唯一作品，可以再告诉我大概年份、导演或一段剧情。")
+
+
+def format_mteam_detail_reply(result: dict[str, Any]) -> str:
+    item = result.get("item") if isinstance(result.get("item"), dict) else {}
+    if not item:
+        return "这个资源的最新详情暂时没有取到，请重新搜索后再试。"
+    presentation = (
+        item.get("presentation") if isinstance(item.get("presentation"), dict)
+        else _mteam_fallback_row(item, int(result.get("result_index") or 1))
+    )
+    title = mteam_markdown_cell(presentation.get("title") or item.get("title") or "资源详情", 180)
+    if item.get("is_official"):
+        title = f"{title}【官种】"
+    lines = [
+        "| # | 标题 | 中文信息 | 清晰度 | 大小 | 做种 | 促销 |",
+        "|---|------|----------|--------|------|------|------|",
+        (
+            f"| {result.get('result_index') or 1} | {title} | "
+            f"{mteam_markdown_cell(presentation.get('chinese_info') or item.get('subtitle') or '未标注', 120)} | "
+            f"{mteam_markdown_cell(presentation.get('quality') or item.get('resolution') or '-', 72)} | "
+            f"{mteam_markdown_cell(item.get('size') or '-', 16)} | {item.get('seeders') or 0} | "
+            f"{mteam_markdown_cell(item.get('promotion_label') or '普通', 18)} |"
+        ),
+    ]
+    if item.get("promotion_remaining"):
+        lines.extend(["", f"促销剩余：{item.get('promotion_remaining')}"])
+    lines.extend(["", f"来源：M-Team API · 查询时间：{format_system_datetime(utc_iso())}"])
+    return "\n".join(lines)
+
+
+def format_composite_media_reply(result: dict[str, Any]) -> str:
+    matches = result.get("matches") if isinstance(result.get("matches"), list) else []
+    target = int(result.get("target_count") or 3)
+    requested = int(result.get("requested_count") or target)
+    found = len(matches)
+    if not matches:
+        return (
+            f"这次按全部条件核验了 {result.get('checked_works') or 0} 部候选作品，"
+            f"但没有找到同时满足条件的 M-Team 资源。没有用不符合条件的结果凑数；"
+            "你可以告诉我愿意放宽哪一项。"
+        )
+    if requested > 10:
+        lines = [f"你要找 {requested} 部，我先按单轮上限核验前 10 部；需要的话可以继续下一批。"]
+    elif found < target:
+        lines = [f"你要找 {target} 部，目前只找到 {found} 部完全符合条件的作品；其余候选没有拿不符合条件的资源凑数。"]
+    else:
+        lines = [f"找到 {found} 部作品，并已逐项核验对应的 M-Team 资源："]
+    lines.extend([
+        "",
+        "| # | 作品 | TMDB | M-Team 资源 | 大小 | 做种 | 促销 |",
+        "|---|------|------|-------------|------|------|------|",
+    ])
+    for index, match in enumerate(matches, 1):
+        work = match.get("work") if isinstance(match, dict) and isinstance(match.get("work"), dict) else {}
+        resource = match.get("resource") if isinstance(match, dict) and isinstance(match.get("resource"), dict) else {}
+        presentation = resource.get("presentation") if isinstance(resource.get("presentation"), dict) else {}
+        work_label = mteam_markdown_cell(tmdb_title_label(work), 72)
+        resource_label = mteam_markdown_cell(presentation.get("quality") or resource.get("title") or "-", 100)
+        lines.append(
+            f"| {index} | {work_label} | {work.get('rating') or '-'}（{work.get('vote_count') or 0}） | "
+            f"{resource_label} | {resource.get('size') or '-'} | {resource.get('seeders') or 0} | "
+            f"{resource.get('promotion_label') or '普通'} |"
+        )
+    if result.get("complete") is False:
+        lines.extend(["", "本轮已达到查询预算；上表结果都已核验，但可能还有其他符合条件的候选尚未查完。"])
+    lines.extend([
+        "",
+        "需要下载哪个资源？回复“第 X 个”，我会先展示该资源的最新摘要，再等待一次确认。",
+        "",
+        f"来源：TMDB API + M-Team API · 查询时间：{format_system_datetime(result.get('queried_at'))}",
+    ])
+    return "\n".join(lines)
+
+
+def format_knowledge_reply(result: dict[str, Any]) -> str:
+    items = result.get("items") if isinstance(result.get("items"), list) else []
+    if not items:
+        return "本地知识文档里暂时没有找到可靠说明。为了避免凭印象回答，我先不下结论。"
+    lines = ["【影视中枢知识】"]
+    for item in items:
+        lines.extend([
+            "",
+            f"{item.get('title') or '说明'}",
+            str(item.get("excerpt") or "").strip(),
+            f"来源：{item.get('document') or '-'} · 更新：{item.get('updated_at') or '未标注'}",
+        ])
+    return "\n".join(lines)
+
+
 def fallback_media_hub_agent_reply(tool: str, result: dict[str, Any]) -> str:
+    if result.get("state") == "failed":
+        return f"这次没能完成查询：{trim_wechat_claw_text(result.get('error') or '服务暂时不可用', 300)}"
+    if tool == "resolve_media_from_clues":
+        return format_media_resolution_reply(result)
     if tool == "tmdb_lookup":
         return format_mobile_agent_reply({"intent_type": "tmdb_lookup"}, result)
     if tool == "mteam_search":
         return format_mobile_agent_reply({"intent_type": "mteam_search"}, result)
+    if tool == "find_media_with_mteam":
+        return format_composite_media_reply(result)
+    if tool == "knowledge_search":
+        return format_knowledge_reply(result)
     if tool == "dashboard_query":
         return format_mobile_agent_reply({"intent_type": "dashboard_query"}, result)
     if tool in {"prepare_mteam_download", "confirm_mteam_download"}:
         return format_mobile_agent_reply({"intent_type": "download_selected"}, result)
     if tool == "tmdb_media_details":
-        item = result.get("item") if isinstance(result.get("item"), dict) else {}
-        title = item.get("title") or item.get("name") or "\u5f71\u7247\u8be6\u60c5"
-        overview = str(item.get("overview") or "\u6682\u65f6\u6ca1\u6709\u7b80\u4ecb\u3002").strip()
-        return f"{title}\n{overview}"
+        return format_tmdb_detail_reply(result)
     if tool == "mteam_result_details":
-        item = result.get("item") if isinstance(result.get("item"), dict) else {}
-        return f"{item.get('title') or '\u8d44\u6e90\u8be6\u60c5'}\n{item.get('promotion_label') or '\u666e\u901a'} \u00b7 \u5269\u4f59 {item.get('promotion_remaining') or '-'} \u00b7 {item.get('size') or '-'} \u00b7 {item.get('seeders') or 0} \u4eba\u505a\u79cd"
+        return format_mteam_detail_reply(result)
     if tool == "qb_list_torrents":
         items = result.get("items") if isinstance(result.get("items"), list) else []
         if result.get("state") == "privacy_required":
@@ -2481,6 +3646,396 @@ def fallback_media_hub_agent_reply(tool: str, result: dict[str, Any]) -> str:
     return "\u6211\u5df2\u7ecf\u53d6\u5f97\u4e86\u76f8\u5173\u6570\u636e\uff0c\u4f46\u8fd9\u6b21\u6ca1\u6709\u987a\u5229\u7ec4\u7ec7\u6210\u5b8c\u6574\u56de\u590d\u3002\u4f60\u53ef\u4ee5\u6362\u4e00\u79cd\u8bf4\u6cd5\uff0c\u6211\u4f1a\u63a5\u7740\u5904\u7406\u3002"
 
 
+def agent_ordinal_index(message: str) -> int:
+    match = re.search(r"第\s*([一二三四五六七八九十\d]+)\s*(?:部|步|个|项)", str(message or ""))
+    if not match:
+        return 0
+    token = match.group(1)
+    if token.isdigit():
+        return int(token)
+    values = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+    return values.get(token, 0)
+
+
+AGENT_SHORT_CONTINUE_RE = re.compile(r"^\s*(?:是的|对|好的|可以|行|查|查一下|继续|麻烦了|嗯|好)\s*[。.!！]?\s*$")
+AGENT_AFFIRMATIVE_RE = re.compile(r"^\s*(?:是的|对|对的|没错|就是这部|好的|可以|行|嗯)\s*[。.!！]?\s*$")
+AGENT_NEGATED_TOOL_RE = re.compile(r"(?:不用|不要|别|无需)(?:再)?(?:查|搜索|调用|联网)|(?:只想|只是)(?:聊|讨论)")
+AGENT_RESOURCE_RE = re.compile(r"(?:资源|种子|版本|促销|做种|大小|清晰度|resources?|torrents?)", re.IGNORECASE)
+AGENT_DETAIL_RE = re.compile(r"(?:详细|完整信息|资料|演员|主演|导演|剧情|简介|评分|讲什么|信息)")
+AGENT_FUZZY_IDENTITY_RE = re.compile(r"(?:哪部|什么)(?:电影|电视剧|剧|片)|(?:电影|电视剧|剧|片).*(?:叫什么|片名)|这是哪部")
+
+
+def _current_work_tool_arguments(session: dict[str, Any]) -> dict[str, Any]:
+    current = session.get("current_work") if isinstance(session.get("current_work"), dict) else {}
+    media_id = str(current.get("tmdb_id") or "").strip()
+    media_type = str(current.get("media_type") or "").strip()
+    if not media_id or media_type not in {"movie", "tv"}:
+        return {}
+    return {"media_id": media_id, "media_type": media_type}
+
+
+def determine_agent_tool_obligations(message: str, session: dict[str, Any]) -> list[dict[str, Any]]:
+    """Translate factual user goals into backend-enforced evidence requirements."""
+    text = str(message or "").strip()
+    if not text or AGENT_NEGATED_TOOL_RE.search(text):
+        return []
+    pending = session.get("pending_request") if isinstance(session.get("pending_request"), dict) else {}
+    pending_obligations = pending.get("obligations") if isinstance(pending.get("obligations"), list) else []
+    if pending_obligations and AGENT_SHORT_CONTINUE_RE.fullmatch(text):
+        return [dict(value) for value in pending_obligations if isinstance(value, dict)]
+
+    current = session.get("current_work") if isinstance(session.get("current_work"), dict) else {}
+    memory_candidate = session.get("memory_candidate") if isinstance(session.get("memory_candidate"), dict) else {}
+    current_args = _current_work_tool_arguments(session)
+    obligations: list[dict[str, Any]] = []
+    if AGENT_FUZZY_IDENTITY_RE.search(text):
+        obligations.append(
+            {
+                "capability": "tmdb_fuzzy_resolution",
+                "tool": "resolve_media_from_clues",
+                "arguments": {"query": text},
+            }
+        )
+        return obligations
+
+    if AGENT_RESOURCE_RE.search(text):
+        title = str(current.get("title") or "").strip()
+        quoted = re.search(r"《([^》]{1,100})》", text)
+        query = quoted.group(1).strip() if quoted else title
+        if query:
+            obligations.append(
+                {
+                    "capability": "mteam_current_resources",
+                    "tool": "mteam_search",
+                    "arguments": {"query": query, "limit": 5},
+                }
+            )
+        elif memory_candidate.get("title"):
+            obligations.append(
+                {
+                    "capability": "tmdb_retry_before_resources",
+                    "tool": "resolve_media_from_clues",
+                    "arguments": {
+                        "query": text,
+                        "title_hypotheses": [str(memory_candidate.get("title") or "")],
+                        "wants_resources": True,
+                    },
+                }
+            )
+
+    detail_requested = bool(AGENT_DETAIL_RE.search(text))
+    generic_current_lookup = bool(current_args and re.fullmatch(r"\s*(?:查|查一下|继续)\s*[。.!！]?\s*", text))
+    generic_memory_retry = bool(memory_candidate.get("title") and AGENT_SHORT_CONTINUE_RE.fullmatch(text))
+    if detail_requested or generic_current_lookup or generic_memory_retry:
+        if current_args:
+            obligations.insert(
+                0,
+                {
+                    "capability": "tmdb_current_details",
+                    "tool": "tmdb_media_details",
+                    "arguments": current_args,
+                },
+            )
+        else:
+            quoted = re.search(r"《([^》]{1,100})》", text)
+            if quoted:
+                obligations.insert(
+                    0,
+                    {
+                        "capability": "tmdb_title_lookup",
+                        "tool": "tmdb_lookup",
+                        "arguments": {"query": quoted.group(1).strip(), "limit": 5},
+                    },
+                )
+            elif memory_candidate.get("title"):
+                obligations.insert(
+                    0,
+                    {
+                        "capability": "tmdb_retry_memory_candidate",
+                        "tool": "resolve_media_from_clues",
+                        "arguments": {
+                            "query": text,
+                            "title_hypotheses": [str(memory_candidate.get("title") or "")],
+                            "wants_details": detail_requested,
+                            "wants_resources": bool(AGENT_RESOURCE_RE.search(text)),
+                        },
+                    },
+                )
+
+    if re.search(r"(?:馒头|m[-\s]?team).*(?:站点|状态|数据|账号)|(?:站点|状态).*(?:馒头|m[-\s]?team)", text, re.IGNORECASE):
+        obligations.append(
+            {
+                "capability": "mteam_live_status",
+                "tool": "dashboard_query",
+                "arguments": {"sections": ["mteam"]},
+            }
+        )
+    elif re.search(r"(?:nas).*(?:状态|空间|容量)|(?:状态|空间|容量).*(?:nas)", text, re.IGNORECASE):
+        obligations.append(
+            {
+                "capability": "nas_live_status",
+                "tool": "dashboard_query",
+                "arguments": {"sections": ["nas"]},
+            }
+        )
+    elif re.search(r"(?:下载器|qb[123]?).*(?:状态|任务)|(?:状态|任务).*(?:下载器|qb[123]?)", text, re.IGNORECASE):
+        obligations.append(
+            {
+                "capability": "downloader_live_status",
+                "tool": "dashboard_query",
+                "arguments": {"sections": ["downloads"]},
+            }
+        )
+    if re.search(r"(?:free|2x|hr|分享率|魔力值|官种|促销).*(?:什么意思|规则|解释)|(?:什么是).*(?:free|hr|官种|促销)", text, re.IGNORECASE):
+        obligations.append(
+            {
+                "capability": "media_hub_knowledge",
+                "tool": "knowledge_search",
+                "arguments": {"query": text, "limit": 3},
+            }
+        )
+    return obligations
+
+
+def _obligation_satisfied(obligation: dict[str, Any], tool_calls: list[dict[str, Any]]) -> bool:
+    required_tool = str(obligation.get("tool") or "")
+    return any(str(call.get("tool") or "") == required_tool for call in tool_calls)
+
+
+def _obligation_successfully_satisfied(
+    obligation: dict[str, Any], observations: list[dict[str, Any]]
+) -> bool:
+    required_tool = str(obligation.get("tool") or "")
+    for observation in observations:
+        if str(observation.get("tool") or "") != required_tool:
+            continue
+        result = observation.get("result") if isinstance(observation.get("result"), dict) else {}
+        if result.get("state") != "failed":
+            return True
+    return False
+
+
+def _pending_media_confirmation_reply(session: dict[str, Any], message: str) -> str | None:
+    pending = session.get("pending_confirmation") if isinstance(session.get("pending_confirmation"), dict) else {}
+    if pending.get("kind") != "media_candidate" or not AGENT_AFFIRMATIVE_RE.fullmatch(str(message or "").strip()):
+        return None
+    candidate = pending.get("candidate") if isinstance(pending.get("candidate"), dict) else {}
+    if not candidate:
+        return None
+    session["current_work"] = {
+        "tmdb_id": str(candidate.get("tmdb_id") or candidate.get("id") or ""),
+        "media_type": str(candidate.get("media_type") or ""),
+        "title": str(candidate.get("title") or "")[:160],
+        "year": str(candidate.get("year") or "")[:12],
+        "verified_at": utc_iso(),
+    }
+    session["pending_confirmation"] = {}
+    return f"好，已按《{candidate.get('title') or '-'}》（{candidate.get('year') or '年份未知'}）继续。"
+
+
+def execute_resolved_media_followup(
+    db: Session,
+    ai_adapter: DeepSeekChatAdapter,
+    tool: str,
+    result: dict[str, Any],
+    request: WechatClawMessageRequest,
+    user: User,
+    session: dict[str, Any],
+    qb2_authorized: bool | None,
+    tool_calls: list[dict[str, Any]],
+    observations: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any]]:
+    if tool != "resolve_media_from_clues" or result.get("state") not in {"resolved", "memory_verified"}:
+        return tool, result
+    clues = result.get("clues") if isinstance(result.get("clues"), dict) else {}
+    item = result.get("item") if isinstance(result.get("item"), dict) else {}
+    if not clues.get("wants_resources") or not item.get("title"):
+        return tool, result
+    followup_tool = "mteam_search"
+    followup_arguments = {"query": str(item.get("title") or ""), "limit": 5}
+    try:
+        followup_result = execute_media_hub_agent_tool(
+            db,
+            ai_adapter,
+            followup_tool,
+            followup_arguments,
+            request,
+            user,
+            session,
+            qb2_authorized,
+        )
+    except HTTPException as exc:
+        followup_result = {"state": "failed", "error": str(agent_safe_payload(exc.detail))}
+    except (MTeamApiError, QbittorrentApiError, TmdbConfigError, AIServiceError, ValueError, TypeError) as exc:
+        followup_result = {"state": "failed", "error": str(agent_safe_payload(str(exc)))}
+    tool_calls.append(
+        {"tool": followup_tool, "arguments": agent_safe_payload(followup_arguments), "derived_from": tool}
+    )
+    observations.append({"tool": followup_tool, "result": agent_safe_payload(followup_result)})
+    remember_assistant_agent_result(session, followup_tool, followup_result, followup_arguments)
+    return followup_tool, followup_result
+
+
+def execute_required_agent_tools(
+    db: Session,
+    ai_adapter: DeepSeekChatAdapter,
+    obligations: list[dict[str, Any]],
+    request: WechatClawMessageRequest,
+    user: User,
+    session: dict[str, Any],
+    qb2_authorized: bool | None,
+    tool_calls: list[dict[str, Any]],
+    observations: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any]]:
+    last_tool = ""
+    last_result: dict[str, Any] = {}
+    for obligation in obligations:
+        if _obligation_satisfied(obligation, tool_calls):
+            continue
+        tool = str(obligation.get("tool") or "")
+        arguments = dict(obligation.get("arguments") or {})
+        try:
+            result = execute_media_hub_agent_tool(
+                db, ai_adapter, tool, arguments, request, user, session, qb2_authorized
+            )
+        except HTTPException as exc:
+            result = {"state": "failed", "error": str(agent_safe_payload(exc.detail))}
+        except (MTeamApiError, QbittorrentApiError, TmdbConfigError, AIServiceError, ValueError, TypeError) as exc:
+            result = {"state": "failed", "error": str(agent_safe_payload(str(exc)))}
+        tool_calls.append({"tool": tool, "arguments": agent_safe_payload(arguments), "enforced": True})
+        observations.append({"tool": tool, "result": agent_safe_payload(result)})
+        remember_assistant_agent_result(session, tool, result, arguments)
+        last_tool, last_result = execute_resolved_media_followup(
+            db,
+            ai_adapter,
+            tool,
+            result,
+            request,
+            user,
+            session,
+            qb2_authorized,
+            tool_calls,
+            observations,
+        )
+    return last_tool, last_result
+
+
+def contextual_agent_tool_call(
+    session: dict[str, Any], message: str
+) -> tuple[str, dict[str, Any]] | None:
+    index = agent_ordinal_index(message)
+    if not 1 <= index <= 10:
+        return None
+    current_list = session.get("current_list") if isinstance(session.get("current_list"), dict) else {}
+    kind = str(current_list.get("kind") or "")
+    references = session.get("references") if isinstance(session.get("references"), dict) else {}
+    if kind == "media_resolution":
+        candidates = references.get("media_resolution") if isinstance(references.get("media_resolution"), list) else []
+        if index > len(candidates) or not isinstance(candidates[index - 1], dict):
+            return None
+        candidate = candidates[index - 1]
+        session["current_work"] = {
+            "tmdb_id": str(candidate.get("tmdb_id") or ""),
+            "media_type": str(candidate.get("media_type") or ""),
+            "title": str(candidate.get("title") or "")[:160],
+            "year": str(candidate.get("year") or "")[:12],
+            "verified_at": utc_iso(),
+        }
+        if AGENT_RESOURCE_RE.search(message):
+            return "mteam_search", {"query": str(candidate.get("title") or ""), "limit": 5}
+        return "tmdb_media_details", {
+            "media_id": str(candidate.get("tmdb_id") or ""),
+            "media_type": str(candidate.get("media_type") or ""),
+        }
+    if kind == "tmdb":
+        candidates = references.get("tmdb_lookup") if isinstance(references.get("tmdb_lookup"), list) else []
+        if index > len(candidates):
+            return None
+        if re.search(r"(?:资源|种子|版本|促销|做种|馒头|m[-\s]?team|pt\s*站)", message, re.IGNORECASE):
+            title = str(candidates[index - 1].get("title") or "").strip()
+            return ("mteam_search", {"query": title, "limit": 5}) if title else None
+        if re.search(r"(?:完整|信息|详情|演员|主演|导演|剧情|简介|讲什么)", message):
+            return "tmdb_media_details", {"result_index": index}
+    if kind == "mteam" and re.search(r"(?:完整|信息|详情|促销|做种|大小|清晰度)", message):
+        return "mteam_result_details", {"result_index": index}
+    return None
+
+
+def agent_template_name(tool: str, result: dict[str, Any]) -> str:
+    if tool in {"prepare_mteam_download", "confirm_mteam_download"}:
+        return f"download_{result.get('state') or 'result'}"
+    return {
+        "resolve_media_from_clues": "tmdb_fuzzy_resolution",
+        "tmdb_lookup": "tmdb_list",
+        "tmdb_media_details": "tmdb_detail",
+        "mteam_search": "mteam_table",
+        "mteam_result_details": "mteam_detail_table",
+        "find_media_with_mteam": "composite_table",
+        "dashboard_query": "dashboard",
+        "knowledge_search": "knowledge",
+        "qb_list_torrents": "qb_list",
+        "qb_torrent_details": "qb_detail",
+    }.get(tool, "conversation")
+
+
+def record_agent_run_trace(
+    db: Session,
+    request: WechatClawMessageRequest,
+    tool_calls: list[dict[str, Any]],
+    observations: list[dict[str, Any]],
+    reply: str,
+    started: float,
+    *,
+    status_value: str = "success",
+    obligations: list[dict[str, Any]] | None = None,
+    obligation_violations: int = 0,
+    deterministic_takeover: bool = False,
+) -> None:
+    try:
+        last_tool = str((tool_calls[-1] if tool_calls else {}).get("tool") or "")
+        last_observation = observations[-1].get("result") if observations and isinstance(observations[-1], dict) else {}
+        last_observation = last_observation if isinstance(last_observation, dict) else {}
+        request_summary = trim_wechat_claw_text(
+            redact_wechat_claw_message(redact_ai_user_text(redact_payload(request.message))),
+            200,
+        )
+        timeline = [{
+            "request_summary": request_summary,
+            "tools": [str(item.get("tool") or "") for item in tool_calls[:12]],
+            "tool_count": len(tool_calls),
+            "data_source": str(last_observation.get("source") or ""),
+            "result_state": str(last_observation.get("state") or "success"),
+            "result_count": int(last_observation.get("count") or last_observation.get("found_count") or 0),
+            "complete": last_observation.get("complete"),
+            "template": agent_template_name(last_tool, last_observation),
+            "reply_length": len(reply),
+            "tool_obligations": [
+                {
+                    "capability": str(value.get("capability") or ""),
+                    "tool": str(value.get("tool") or ""),
+                }
+                for value in (obligations or [])[:8]
+                if isinstance(value, dict)
+            ],
+            "obligation_violations": int(obligation_violations),
+            "deterministic_takeover": bool(deterministic_takeover),
+        }]
+        error_summary = ""
+        if status_value != "success":
+            error_summary = trim_wechat_claw_text(last_observation.get("error") or "Agent run failed", 300)
+        db.add(DebugTrace(
+            trace_id=trace_id("AGENT"),
+            event_type="agent_run",
+            status=status_value,
+            timeline=agent_safe_payload(timeline),
+            duration_ms=max(0, int((time.perf_counter() - started) * 1000)),
+            error_summary=error_summary or None,
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
 def run_media_hub_agent(
     db: Session,
     ai_adapter: DeepSeekChatAdapter,
@@ -2489,13 +4044,128 @@ def run_media_hub_agent(
     telemetry: dict[str, Any] | None = None,
     qb2_authorized: bool | None = None,
 ) -> dict[str, Any]:
+    run_started = time.perf_counter()
     session = get_assistant_agent_session(db, request)
+    normalized_message = str(request.message or "").strip()
+    if re.fullmatch(r"(?:取消|算了|不下了|取消下载)[。.!！]?", normalized_message):
+        cancelled = cancel_wechat_claw_pending_download(db, request)
+        result = {"intent_type": "download_selected", "state": "cancelled" if cancelled else "selection_missing"}
+        reply = format_mobile_agent_reply({"intent_type": "download_selected"}, result)
+        append_assistant_agent_turn(session, request.message, reply)
+        save_assistant_agent_session(db, request, session)
+        record_agent_run_trace(db, request, [], [], reply, run_started)
+        return {
+            "reply": reply,
+            "intent": {"intent_type": "agent", "action": "agent", "tools_used": []},
+            "result": {"tool_calls": [], "observations": []},
+            "source": "media_hub_agent",
+            "handled_at": utc_iso(),
+        }
+    if re.search(r"(?:新话题|清空上下文)", normalized_message):
+        cancel_wechat_claw_pending_download(db, request)
+        session = {
+            "history": [],
+            "recent_results": {},
+            "references": {},
+            "current_list": {},
+            "current_work": {},
+            "pending_request": {},
+            "pending_confirmation": {},
+            "memory_candidate": {},
+        }
+    elif re.search(r"(?:搜|查|找).*(?:资源|种子|馒头|m[-\s]?team|pt\s*站)", normalized_message, re.IGNORECASE):
+        cancel_wechat_claw_pending_download(db, request)
+    pending_candidate = get_wechat_claw_pending_download(db, request)
+    if pending_candidate and WECHAT_CLAW_EXPLICIT_DOWNLOAD_CONFIRM_RE.search(normalized_message):
+        result = execute_media_hub_agent_tool(
+            db,
+            ai_adapter,
+            "confirm_mteam_download",
+            {},
+            request,
+            user,
+            session,
+            qb2_authorized,
+        )
+        reply = format_mobile_agent_reply({"intent_type": "download_selected"}, result)
+        append_assistant_agent_turn(session, request.message, reply)
+        save_assistant_agent_session(db, request, session)
+        trace_calls = [{"tool": "confirm_mteam_download", "arguments": {}}]
+        trace_observations = [{"tool": "confirm_mteam_download", "result": agent_safe_payload(result)}]
+        record_agent_run_trace(db, request, trace_calls, trace_observations, reply, run_started)
+        return {
+            "reply": reply,
+            "intent": {"intent_type": "agent", "action": "agent", "tools_used": ["confirm_mteam_download"]},
+            "result": {
+                "tool_calls": trace_calls,
+                "observations": trace_observations,
+            },
+            "source": "media_hub_agent",
+            "handled_at": utc_iso(),
+        }
+    confirmation_reply = _pending_media_confirmation_reply(session, normalized_message)
+    if confirmation_reply:
+        append_assistant_agent_turn(session, request.message, confirmation_reply)
+        save_assistant_agent_session(db, request, session)
+        record_agent_run_trace(db, request, [], [], confirmation_reply, run_started)
+        return {
+            "reply": confirmation_reply,
+            "intent": {"intent_type": "agent", "action": "agent", "tools_used": []},
+            "result": {"tool_calls": [], "observations": []},
+            "source": "media_hub_agent",
+            "handled_at": utc_iso(),
+        }
+    obligations = determine_agent_tool_obligations(normalized_message, session)
+    if obligations:
+        session["pending_request"] = {
+            "obligations": agent_safe_payload(obligations),
+            "created_at": utc_iso(),
+            "original_message": redact_ai_user_text(redact_payload(normalized_message))[:500],
+        }
+    contextual_call = contextual_agent_tool_call(session, normalized_message)
+    if contextual_call:
+        tool, arguments = contextual_call
+        try:
+            result = execute_media_hub_agent_tool(
+                db, ai_adapter, tool, arguments, request, user, session, qb2_authorized
+            )
+        except HTTPException as exc:
+            result = {"state": "failed", "error": str(agent_safe_payload(exc.detail))}
+        remember_assistant_agent_result(session, tool, result, arguments)
+        reply = fallback_media_hub_agent_reply(tool, result)
+        append_assistant_agent_turn(session, request.message, reply)
+        session["pending_request"] = {}
+        save_assistant_agent_session(db, request, session)
+        trace_calls = [{"tool": tool, "arguments": agent_safe_payload(arguments)}]
+        trace_observations = [{"tool": tool, "result": agent_safe_payload(result)}]
+        record_agent_run_trace(
+            db,
+            request,
+            trace_calls,
+            trace_observations,
+            reply,
+            run_started,
+            status_value="failed" if result.get("state") == "failed" else "success",
+            obligations=obligations,
+        )
+        return {
+            "reply": reply,
+            "intent": {"intent_type": "agent", "action": "agent", "tools_used": [tool]},
+            "result": {
+                "tool_calls": trace_calls,
+                "observations": trace_observations,
+            },
+            "source": "media_hub_agent",
+            "handled_at": utc_iso(),
+        }
     observations: list[dict[str, Any]] = []
     tool_calls: list[dict[str, Any]] = []
     seen_calls: set[str] = set()
     last_tool = ""
     last_result: dict[str, Any] = {}
     reply = ""
+    obligation_violations = 0
+    deterministic_takeover = False
     for step_index in range(ASSISTANT_AGENT_MAX_TOOL_STEPS):
         decision_started = time.perf_counter()
         try:
@@ -2506,10 +4176,26 @@ def run_media_hub_agent(
                 observations=observations,
                 tools=AGENT_TOOL_CATALOG,
                 runtime_context=system_time_context(),
+                tool_obligations=obligations,
             )
         except AIServiceError as exc:
             if telemetry is not None:
                 record_wechat_claw_stage(telemetry, "agent_decision", decision_started, status="failed", error=exc)
+            if obligations:
+                deterministic_takeover = True
+                last_tool, last_result = execute_required_agent_tools(
+                    db,
+                    ai_adapter,
+                    obligations,
+                    request,
+                    user,
+                    session,
+                    qb2_authorized,
+                    tool_calls,
+                    observations,
+                )
+                reply = fallback_media_hub_agent_reply(last_tool, last_result)
+                break
             if not observations:
                 raise HTTPException(status_code=502, detail="影视中枢 Agent 暂时无法回复，请稍后重试。") from exc
             reply = fallback_media_hub_agent_reply(last_tool, last_result)
@@ -2517,7 +4203,42 @@ def run_media_hub_agent(
         if telemetry is not None:
             record_wechat_claw_stage(telemetry, "agent_decision", decision_started)
         if decision.get("decision") == "final":
-            reply = str(decision.get("reply") or "").strip()
+            missing_obligations = [
+                value for value in obligations if not _obligation_satisfied(value, tool_calls)
+            ]
+            if missing_obligations:
+                obligation_violations += 1
+                if obligation_violations == 1:
+                    observations.append(
+                        {
+                            "tool": "tool_obligation",
+                            "result": {
+                                "state": "required",
+                                "message": "A factual request is still pending. Call the required tool now.",
+                                "obligations": agent_safe_payload(missing_obligations),
+                            },
+                        }
+                    )
+                    continue
+                deterministic_takeover = True
+                last_tool, last_result = execute_required_agent_tools(
+                    db,
+                    ai_adapter,
+                    missing_obligations,
+                    request,
+                    user,
+                    session,
+                    qb2_authorized,
+                    tool_calls,
+                    observations,
+                )
+                reply = fallback_media_hub_agent_reply(last_tool, last_result)
+                break
+            reply = (
+                fallback_media_hub_agent_reply(last_tool, last_result)
+                if observations
+                else str(decision.get("reply") or "").strip()
+            )
             break
         tool = str(decision.get("tool") or "").strip()
         arguments = decision.get("arguments") if isinstance(decision.get("arguments"), dict) else {}
@@ -2549,11 +4270,70 @@ def run_media_hub_agent(
         remember_assistant_agent_result(session, tool, result, arguments)
         last_tool = tool
         last_result = result
+        last_tool, last_result = execute_resolved_media_followup(
+            db,
+            ai_adapter,
+            tool,
+            result,
+            request,
+            user,
+            session,
+            qb2_authorized,
+            tool_calls,
+            observations,
+        )
+        if tool in {"prepare_mteam_download", "confirm_mteam_download"}:
+            reply = fallback_media_hub_agent_reply(tool, result)
+            break
+    missing_obligations = [
+        value for value in obligations if not _obligation_satisfied(value, tool_calls)
+    ]
+    if missing_obligations and not reply:
+        deterministic_takeover = True
+        enforced_tool, enforced_result = execute_required_agent_tools(
+            db,
+            ai_adapter,
+            missing_obligations,
+            request,
+            user,
+            session,
+            qb2_authorized,
+            tool_calls,
+            observations,
+        )
+        if enforced_tool:
+            last_tool, last_result = enforced_tool, enforced_result
+    if len(obligations) > 1 and all(_obligation_satisfied(value, tool_calls) for value in obligations):
+        required_tools = [str(value.get("tool") or "") for value in obligations]
+        rendered_parts: list[str] = []
+        for observation in observations:
+            observation_tool = str(observation.get("tool") or "")
+            result = observation.get("result") if isinstance(observation.get("result"), dict) else {}
+            if observation_tool in required_tools and result:
+                part = fallback_media_hub_agent_reply(observation_tool, result)
+                if part and part not in rendered_parts:
+                    rendered_parts.append(part)
+        if rendered_parts:
+            reply = "\n\n".join(rendered_parts)
     if not reply:
         reply = fallback_media_hub_agent_reply(last_tool, last_result)
     reply = redact_ai_user_text(redact_payload(reply)).strip()[:6000]
     append_assistant_agent_turn(session, request.message, reply)
+    if obligations and all(_obligation_successfully_satisfied(value, observations) for value in obligations):
+        session["pending_request"] = {}
     save_assistant_agent_session(db, request, session)
+    record_agent_run_trace(
+        db,
+        request,
+        tool_calls,
+        observations,
+        reply,
+        run_started,
+        status_value="failed" if last_result.get("state") == "failed" else "success",
+        obligations=obligations,
+        obligation_violations=obligation_violations,
+        deterministic_takeover=deterministic_takeover,
+    )
     return {
         "reply": reply,
         "intent": {"intent_type": "agent", "action": "agent", "tools_used": [item["tool"] for item in tool_calls]},
@@ -2748,6 +4528,17 @@ def retry_wechat_claw_pending_message(db: Session, pending: dict[str, Any], erro
     return float(delay_seconds)
 
 
+def agent_request_needs_progress(message: str) -> bool:
+    text = str(message or "")
+    work_conditions = re.search(r"(?:近\s*\d+\s*年|高分|评分|科幻|喜剧|动作|恐怖|剧情|电影|剧集|找\s*\d+\s*部)", text)
+    resource_conditions = re.search(
+        r"(?:资源|种子|促销|免费|30%|50%|大小|不超过|做种|馒头|m[-\s]?team|pt\s*站)",
+        text,
+        re.IGNORECASE,
+    )
+    return bool(work_conditions and resource_conditions)
+
+
 def process_wechat_claw_pending_messages(db: Session, adapter: WechatClawAdapter) -> dict[str, Any]:
     state = get_wechat_claw_ilink_state(db)
     pending = get_wechat_claw_pending_messages(state)
@@ -2766,6 +4557,14 @@ def process_wechat_claw_pending_messages(db: Session, adapter: WechatClawAdapter
         try:
             reply = str(item.get("reply") or "").strip()
             if not reply:
+                if not item.get("progress_sent") and agent_request_needs_progress(str(item.get("message") or "")):
+                    progress = adapter.send_text(
+                        str(item.get("user_id") or ""),
+                        "我正在筛选符合条件的作品，并逐一核验 M-Team 资源，查完后把完整结果发给你。",
+                        str(item.get("context_token") or ""),
+                    )
+                    if progress.get("sent"):
+                        update_wechat_claw_pending_message(db, pending_id, progress_sent=True)
                 response = handle_wechat_claw_text(
                     db,
                     WechatClawMessageRequest(
@@ -3252,16 +5051,15 @@ def format_mteam_station_reply(mteam: dict[str, Any]) -> str:
 
     window = str(mteam.get("delta_window_label") or "近5h")
     account_status = ["VIP" if mteam.get("vip") else "非 VIP", "允许下载" if mteam.get("allow_download", True) else "禁止下载", "有警告" if mteam.get("warned") else "无警告"]
-    username = str(mteam.get("username") or "-").strip() or "-"
     source = str(mteam.get("source") or "M-Team 站点数据").strip()
-    updated_at = format_system_datetime(mteam.get("updated_at"))
+    updated_at = format_system_datetime(mteam.get("captured_at") or mteam.get("updated_at"))
     active_delta = str(mteam.get("active_delta_label") or "").strip()
     active_delta_suffix = f"（{window} {active_delta}）" if active_delta else ""
     lines = [
         "M-Team 站点数据",
         "",
         "账号状态",
-        f"- 用户：{username} · 等级：{mteam.get('user_level') or '-'}",
+        f"- 等级：{mteam.get('user_level') or '-'}",
         f"- 注册：{mteam.get('joined_at') or '-'} · {' · '.join(account_status)}",
         "",
         "流量与收益",
@@ -3281,8 +5079,19 @@ def format_mteam_station_reply(mteam: dict[str, Any]) -> str:
         f"- 本周：上传 {latest_mteam_traffic_label(mteam, 'week')} · 下载 {latest_mteam_traffic_label(mteam, 'week', 'download_total')}",
         f"- 本月：上传 {latest_mteam_traffic_label(mteam, 'month')} · 下载 {latest_mteam_traffic_label(mteam, 'month', 'download_total')}",
     ]
+    if mteam.get("live_query") is False:
+        age_seconds = int(mteam.get("historical_age_seconds") or 0)
+        age_label = f"{age_seconds // 3600} 小时前" if age_seconds >= 3600 else f"{max(1, age_seconds // 60)} 分钟前"
+        lines[0:0] = [
+            "这次没能完成 M-Team 实时查询，下面是最后一次成功采集的历史数据。",
+            f"历史数据时间：{updated_at or '-'}（约 {age_label}）",
+            "",
+        ]
     if updated_at:
-        lines.extend(["", f"数据更新：{updated_at} · 来源：{source}"])
+        label = "历史采集时间" if mteam.get("live_query") is False else "查询时间"
+        lines.extend(["", f"{label}：{updated_at} · 来源：{source}"])
+        if mteam.get("live_query") is not False:
+            lines.append(f"数据更新：{updated_at}")
     return "\n".join(lines)
 
 
@@ -3320,7 +5129,7 @@ def format_mobile_agent_reply(intent: dict[str, Any], result: dict[str, Any]) ->
         return "\n".join(lines)
     if intent_type == "mteam_search":
         if result.get("state") == "selection_expired":
-            return "【M-Team 完整结果已过期】\n请重新搜索资源后，再回复“查看全部”。"
+            return "刚才那份 M-Team 结果已经超过可继续选择的时间了。请重新搜索一次，我会按同样的表格为你列出最新结果。"
         items = result.get("items") or []
         if not items:
             return "【M-Team 资源搜索】\n没有找到匹配资源。建议换用片名、英文名或降低筛选条件。"
@@ -3339,6 +5148,8 @@ def format_mobile_agent_reply(intent: dict[str, Any], result: dict[str, Any]) ->
             promotion = item.get("promotion_label") or "普通"
             presentation = item.get("presentation") if isinstance(item.get("presentation"), dict) else presentation_map.get(str(item.get("id") or ""), _mteam_fallback_row(item, index))
             title = mteam_markdown_cell(presentation.get("title") or _mteam_fallback_row(item, index)["title"], 180)
+            if item.get("is_official"):
+                title = f"{title}【官种】"
             chinese_info = mteam_markdown_cell(presentation.get("chinese_info") or _mteam_fallback_row(item, index)["chinese_info"], 120)
             quality = mteam_markdown_cell(presentation.get("quality") or _mteam_fallback_row(item, index)["quality"], 72)
             size = mteam_markdown_cell(presentation.get("size") or item.get("size"), 16)
@@ -3350,10 +5161,15 @@ def format_mobile_agent_reply(intent: dict[str, Any], result: dict[str, Any]) ->
             lines.append(f"| {index} | {title} | {chinese_info} | {quality} | {size} | {seeders} | {mteam_markdown_cell(promotion, 18)} |")
         if result.get("recommended_index"):
             lines.extend(["", f"**{result.get('recommendation_note') or mteam_default_recommendation(items, result.get('recommended_index'))}**"])
+        if result.get("complete") is False:
+            lines.extend(["", "我先列出已经核验过的结果。M-Team 还有一部分候选没能查完，所以符合条件的资源可能不止这些。"])
         if result.get("show_all"):
             lines.extend(["", "需要下载哪个资源？回复“第 X 个”或“下载推荐的那个”，我会先展示下载摘要，再等待确认。"])
         else:
             lines.extend(["", "需要下载哪个资源？回复“第 X 个”或“下载推荐的那个”；想看完整列表可回复“查看全部”。"])
+        queried_at = format_system_datetime(result.get("queried_at"))
+        if queried_at:
+            lines.extend(["", f"来源：M-Team API · 查询时间：{queried_at}"])
         return "\n".join(lines)
     if intent_type == "dashboard_query":
         overview = result.get("overview") or {}
@@ -3415,13 +5231,43 @@ def format_mobile_agent_reply(intent: dict[str, Any], result: dict[str, Any]) ->
     if intent_type == "download_selected":
         state = str(result.get("state") or "")
         candidate = result.get("candidate") or {}
-        title = candidate.get("title") or result.get("title") or "该资源"
+        presentation = candidate.get("presentation") if isinstance(candidate.get("presentation"), dict) else {}
+        title = presentation.get("title") or candidate.get("title") or result.get("title") or "该资源"
+        quality = presentation.get("quality") or " · ".join(
+            value for value in [
+                str(candidate.get("resolution") or "").strip(),
+                str(candidate.get("codec") or "").strip(),
+                str(candidate.get("hdr") or "").strip(),
+                str(candidate.get("group") or "").strip(),
+            ] if value
+        )
+        promotion = candidate.get("promotion_label") or "普通"
         if state == "awaiting_confirmation":
-            return f"【下载确认】\n已选择：{title}\n{candidate.get('resolution') or '-'} · {candidate.get('size') or '-'}\n回复“确认”“就它”或“开始下载”即可推送到默认下载器。"
-        if state == "accepted":
-            return f"【已添加下载】\n{title}\n已推送到 {result.get('downloader_id')}。"
+            official = " · 官种" if candidate.get("is_official") else ""
+            return (
+                "【下载确认】\n"
+                f"作品：{title}\n"
+                f"资源：{candidate.get('title') or '-'}\n"
+                f"中文信息：{presentation.get('chinese_info') or candidate.get('subtitle') or '未标注'}\n"
+                f"清晰度：{quality or '-'}\n"
+                f"大小：{candidate.get('size') or '-'} · 做种：{candidate.get('seeders') or 0}\n"
+                f"促销：{promotion}{official}\n"
+                "回复“确认”“就它”或“开始下载”即可。"
+            )
+        if state == "started":
+            version = " · ".join(value for value in [quality, str(candidate.get("size") or "").strip()] if value)
+            suffix = f" · {version}" if version else ""
+            return f"【已开始下载】\n{title}{suffix} 已开始下载。"
+        if state in {"pending_verification", "accepted"}:
+            return f"【正在确认下载】\n{title}\n下载任务正在核验中，确认开始后我会通知你。"
+        if state == "conditions_changed":
+            return "刚刚复核时发现，这个资源已经不再满足你设定的下载条件。为了避免下载到不符合预期的版本，我没有开始下载。你可以重新选择一个资源，或者告诉我哪些条件可以放宽。"
+        if state == "resource_unavailable" or state == "unavailable":
+            return "刚刚复核时发现，这个资源目前已经不可用，所以没有开始下载。我可以继续帮你寻找符合原有条件的其他资源。"
+        if state == "cancelled":
+            return "好的，这次下载已经取消。"
         if state == "selection_missing":
-            return "【未找到待选资源】\n请先搜索 M-Team 资源，再选择编号或推荐资源。"
+            return "我这边已经找不到刚才待确认的资源了。请重新选择一个资源，我会接着帮你处理。"
         return f"【添加下载失败】\n{result.get('message') or '请检查默认下载器、M-Team 和 qB 配置。'}"
     return "【影视中枢 Agent】\n请告诉我想查的电影、资源、仪表盘信息，或聊聊你的观影计划。"
 
@@ -3547,6 +5393,13 @@ def get_mteam_adapter_or_error(db: Session) -> MTeamAdapter:
         return MTeamAdapter(get_decrypted_config(db, "mteam") or {})
     except MTeamConfigError as exc:
         raise HTTPException(status_code=409, detail="M-Team API Key 未配置。") from exc
+
+
+def search_mteam_with_budget(adapter: Any, query: str, max_pages: int = 5) -> list[dict[str, Any]]:
+    try:
+        return adapter.search_torrents(query, {"page_size": 20, "max_pages": max_pages})
+    except TypeError:
+        return adapter.search_torrents(query)
 
 
 def qb_webui_url_from_config(config: dict[str, Any] | None) -> str | None:
@@ -4348,17 +6201,24 @@ def test_integration(provider: str, request: IntegrationPayload | None = None, u
     if provider == "tmdb":
         config = get_decrypted_config(db, provider) or {}
         network_detail = tmdb_network_detail_from_config(config)
+        adapter: TmdbAdapter | None = None
         try:
             adapter = TmdbAdapter(config)
             detail = adapter.test_connection().get("network") or adapter.network_detail()
-            result = tmdb_test_result(True, test_trace_id, "TMDB 连接成功。", "应用已经成功访问 TMDB，并验证了当前 Bearer Token 可以使用。", "你现在可以点击“启用”，然后回到“发现”页查看真实 TMDB 数据。", None, 200, detail)
+            if detail.get("proxy_enabled"):
+                result = tmdb_test_result(True, test_trace_id, "TMDB 代理访问已启用。", "应用已经通过 NAS Mihomo 访问 TMDB 数据接口和图片资源，并验证了当前 Bearer Token。", "可以回到“发现”页使用 TMDB；后续请求将强制经过这条代理路线。", None, 200, detail)
+            else:
+                result = tmdb_test_result(True, test_trace_id, "TMDB DoH 直连已启用。", "应用已经通过现有 DoH 链路访问 TMDB 数据接口和图片资源，并验证了当前 Bearer Token。", "可以回到“发现”页使用 TMDB。", None, 200, detail)
         except Exception as exc:
             result = classify_tmdb_test_error(exc, test_trace_id)
-            result["detail"] = network_detail
+            diagnostic_detail = getattr(exc, "network_detail", None)
+            if not diagnostic_detail and adapter is not None:
+                diagnostic_detail = adapter.network_detail()
+            result["detail"] = {**network_detail, **(diagnostic_detail or {})}
             if network_detail.get("proxy_enabled") and result.get("error_type") in {"network_error", "timeout", "unknown_error"}:
-                result["message"] = "无法通过 mihomo 代理连接 TMDB。"
+                result["message"] = "无法通过 NAS Mihomo 连接 TMDB。"
                 result["explanation"] = "当前代理未能完成连接。"
-                result["next_step"] = "请检查高级设置中的代理地址后重试。"
+                result["next_step"] = "请检查 Mihomo 容器、当前节点和代理配置后重试。"
         result["config_version"] = row.config_version if row else 0
     elif provider == "mteam":
         try:
@@ -4478,7 +6338,10 @@ def test_integration(provider: str, request: IntegrationPayload | None = None, u
         raise HTTPException(status_code=404, detail="Unknown provider")
     if provider == "wechat_claw" and result.get("success") is not True and row is not None:
         row.enabled = False
-    return serialize_config(record_test_result(db, provider, result, actor_user_id=user.id))
+    recorded = record_test_result(db, provider, result, actor_user_id=user.id)
+    if provider == "tmdb" and result.get("success") is True:
+        recorded = set_enabled(db, provider, True, actor_user_id=user.id)
+    return serialize_config(recorded)
 
 
 @router.post("/admin/integrations/tmdb/cloudflare-secrets")
@@ -6300,11 +8163,11 @@ def run_live_diagnostic_module(db: Session, module: str) -> dict[str, Any]:
 
 
 @router.post("/diagnostics/modules/{module}/check")
-def check_diagnostic_module(module: str, _: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+def check_diagnostic_module(module: str, _: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     return run_live_diagnostic_module(db, module)
 
 @router.get("/diagnostics/health")
-def diagnostics_health(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+def diagnostics_health(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     integrations = {row.provider: row for row in db.query(IntegrationConfig).all()}
     bindings = ensure_wechat_claw_bindings(db)
     member_statuses = [wechat_claw_binding_status(db, binding) for binding in bindings]
@@ -6333,6 +8196,12 @@ def diagnostics_health(_: User = Depends(require_admin), db: Session = Depends(g
 
 
 @router.get("/diagnostics/traces")
-def diagnostics_traces(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
-    rows = db.query(DebugTrace).order_by(DebugTrace.created_at.desc()).limit(50).all()
+def diagnostics_traces(_: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    rows = (
+        db.query(DebugTrace)
+        .filter(DebugTrace.event_type == "agent_run")
+        .order_by(DebugTrace.created_at.desc())
+        .limit(100)
+        .all()
+    )
     return {"items": [{"trace_id": row.trace_id, "event_type": row.event_type, "status": row.status, "timeline": row.timeline, "duration_ms": row.duration_ms, "config_version": row.config_version, "error_summary": row.error_summary, "created_at": utc_iso(row.created_at)} for row in rows]}

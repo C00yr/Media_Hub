@@ -8,12 +8,16 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from app.adapters.base import MetadataAdapter
 from app.config.settings import get_settings
-from app.services.integrations import TMDB_PROXY_DOMAIN_ALLOWLIST
+from app.services.integrations import (
+    TMDB_PROXY_DEFAULT_HOST,
+    TMDB_PROXY_DEFAULT_PORT,
+    TMDB_PROXY_DOMAIN_ALLOWLIST,
+)
 
 
 TMDB_API_BASE = "https://api.themoviedb.org/3"
@@ -111,6 +115,13 @@ class TmdbImageError(RuntimeError):
         self.network_detail = network_detail or {}
 
 
+class TmdbProxyError(RuntimeError):
+    def __init__(self, message: str, error_type: str, network_detail: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.error_type = error_type
+        self.network_detail = network_detail or {}
+
+
 class TmdbAdapter(MetadataAdapter):
     def __init__(self, config: dict[str, Any]):
         self.api_key = str(config.get("api_key") or "").strip()
@@ -120,6 +131,7 @@ class TmdbAdapter(MetadataAdapter):
         self.proxy_enabled, self.proxy_url, self.proxy_domains = resolve_tmdb_proxy_settings(config)
         self.base_url = str(config.get("endpoint") or TMDB_API_BASE).strip().rstrip("/")
         self.timeout = int(config.get("timeout") or 12)
+        self._last_network_detail = tmdb_network_detail(self.proxy_enabled, self.proxy_url, self.proxy_domains)
         if not self.api_key and not self.bearer_token:
             raise TmdbConfigError("TMDB API Key or Bearer Token is not configured")
 
@@ -144,6 +156,26 @@ class TmdbAdapter(MetadataAdapter):
         with ThreadPoolExecutor(max_workers=min(4, len(items)), thread_name_prefix="tmdb-search-detail") as executor:
             return list(executor.map(hydrate, items))
 
+    def search_people(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        """Resolve a person name before intersecting cast and crew credits."""
+        if not query.strip():
+            return []
+        payload = self._get("/search/person", {"query": query, "include_adult": "false"})
+        results = payload.get("results") if isinstance(payload.get("results"), list) else []
+        people: list[dict[str, Any]] = []
+        for item in results[: max(1, min(int(limit or 5), 10))]:
+            if not isinstance(item, dict) or not item.get("id"):
+                continue
+            people.append(
+                {
+                    "person_id": item.get("id"),
+                    "name": item.get("name") or "",
+                    "known_for_department": item.get("known_for_department") or "",
+                    "popularity": round(float(item.get("popularity") or 0), 1),
+                }
+            )
+        return people
+
     def lookup_media(self, query: str, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Search by title when available, otherwise use TMDB Discover with natural-language filters."""
         filters = dict(filters or {})
@@ -154,7 +186,12 @@ class TmdbAdapter(MetadataAdapter):
             media_types = [media_type] if media_type in {"movie", "tv"} else ["movie", "tv"]
             items = []
             for current_type in media_types:
-                discover_filters = {**filters, "media_type": current_type, "include_options": False, "pages": 1}
+                discover_filters = {
+                    **filters,
+                    "media_type": current_type,
+                    "include_options": False,
+                    "pages": max(1, min(int(filters.get("pages") or 1), 4)),
+                }
                 genre = str(filters.get("genre") or "").strip()
                 if genre:
                     genre_id = next((item["id"] for item in self._genres(current_type) if genre.lower() in str(item.get("name") or "").lower()), "")
@@ -171,8 +208,11 @@ class TmdbAdapter(MetadataAdapter):
             filtered.sort(key=lambda item: str(item.get("release_date") or ""), reverse=True)
         else:
             filtered.sort(key=lambda item: float(item.get("popularity") or 0), reverse=True)
-        candidates = filtered[:10]
+        candidate_limit = max(1, min(int(filters.get("limit") or 10), 40))
+        candidates = filtered[:candidate_limit]
         if query.strip():
+            return candidates
+        if filters.get("hydrate") is False:
             return candidates
 
         # Discover responses omit credits and episode metadata. Hydrate the
@@ -192,6 +232,15 @@ class TmdbAdapter(MetadataAdapter):
         if media_type in {"movie", "tv"} and item.get("media_type") != media_type:
             return False
         if float(item.get("rating") or 0) < float(filters.get("min_rating") or 0):
+            return False
+        if int(item.get("vote_count") or 0) < int(filters.get("min_vote_count") or 0):
+            return False
+        release_date = str(item.get("release_date") or "")
+        release_date_from = str(filters.get("release_date_from") or "").strip()
+        release_date_to = str(filters.get("release_date_to") or "").strip()
+        if release_date_from and (not release_date or release_date < release_date_from):
+            return False
+        if release_date_to and (not release_date or release_date > release_date_to):
             return False
         language = str(filters.get("language") or "").lower()
         if language and str(item.get("original_language") or "").lower() != language:
@@ -221,13 +270,26 @@ class TmdbAdapter(MetadataAdapter):
         cast = credits.get("cast") if isinstance(credits.get("cast"), list) else []
         crew = credits.get("crew") if isinstance(credits.get("crew"), list) else []
         work_by_id: dict[str, dict[str, Any]] = {}
-        for item in [*cast, *crew]:
-            media_type = item.get("media_type")
-            if media_type not in {"movie", "tv"}:
-                continue
-            normalized = self._normalize_item(item)
-            work_by_id[str(normalized["id"])] = normalized
+        normalized_credits: list[dict[str, Any]] = []
+        for credit_type, values in (("cast", cast), ("crew", crew)):
+            for item in values:
+                media_type = item.get("media_type")
+                if media_type not in {"movie", "tv"}:
+                    continue
+                normalized = self._normalize_item(item)
+                work_key = f"{media_type}:{item.get('id')}"
+                work_by_id[work_key] = normalized
+                normalized_credits.append(
+                    {
+                        **normalized,
+                        "credit_type": credit_type,
+                        "character": item.get("character") or "",
+                        "job": item.get("job") or "",
+                        "department": item.get("department") or "",
+                    }
+                )
         known_for = sorted(work_by_id.values(), key=lambda value: float(value.get("popularity") or 0), reverse=True)
+        normalized_credits.sort(key=lambda value: float(value.get("popularity") or 0), reverse=True)
         external_ids = payload.get("external_ids") if isinstance(payload.get("external_ids"), dict) else {}
         profile_path = payload.get("profile_path")
         return {
@@ -244,6 +306,7 @@ class TmdbAdapter(MetadataAdapter):
             "gender": payload.get("gender"),
             "imdb_id": external_ids.get("imdb_id") or "",
             "known_for": known_for[:24],
+            "credits": normalized_credits[:120],
         }
 
     def get_discover_lists(self) -> dict[str, Any]:
@@ -274,13 +337,15 @@ class TmdbAdapter(MetadataAdapter):
             "include_adult": "false",
             "include_video": "false",
             "sort_by": sort_by,
-            "vote_count.gte": 20,
+            "vote_count.gte": max(0, int(filters.get("min_vote_count") or 20)),
         }
         genre = str(filters.get("genre") or "").strip()
         region = str(filters.get("region") or "").strip().upper()
         language = str(filters.get("language") or "").strip().lower()
         year = str(filters.get("year") or "").strip()
         min_rating = str(filters.get("min_rating") or "").strip()
+        release_date_from = str(filters.get("release_date_from") or "").strip()
+        release_date_to = str(filters.get("release_date_to") or "").strip()
         page = max(1, min(int(filters.get("page") or 1), 500))
         pages = max(1, min(int(filters.get("pages") or 1), 4))
         if genre:
@@ -303,6 +368,11 @@ class TmdbAdapter(MetadataAdapter):
             params["primary_release_year" if media_type == "movie" else "first_air_date_year"] = year
         if min_rating:
             params["vote_average.gte"] = min_rating
+        date_field = "primary_release_date" if media_type == "movie" else "first_air_date"
+        if release_date_from:
+            params[f"{date_field}.gte"] = release_date_from
+        if release_date_to:
+            params[f"{date_field}.lte"] = release_date_to
         genre_map = self._genre_map(media_type)
         normalized = []
         total_pages = 1
@@ -348,11 +418,34 @@ class TmdbAdapter(MetadataAdapter):
         }
 
     def test_connection(self) -> dict[str, Any]:
-        payload = self._get("/configuration", {})
+        network = tmdb_network_detail(self.proxy_enabled, self.proxy_url, self.proxy_domains)
+        if self.proxy_enabled:
+            try:
+                network["proxy_probe"] = _probe_proxy_endpoint(self.proxy_url, self.timeout)
+            except TmdbProxyError as exc:
+                network["proxy_probe"] = {
+                    "dns_resolved": exc.error_type != "proxy_dns_error",
+                    "tcp_connected": False,
+                    "error_type": exc.error_type,
+                }
+                self._last_network_detail = network
+                exc.network_detail = network
+                raise
+        self._last_network_detail = network
+        try:
+            payload = self._get("/configuration", {})
+        except Exception as exc:
+            network["api_probe"] = {"checked": True, "ok": False, "host": "api.themoviedb.org"}
+            self._last_network_detail = network
+            if isinstance(exc, TmdbProxyError):
+                exc.network_detail = network
+            raise
+        network["api_probe"] = {"checked": True, "ok": True, "host": "api.themoviedb.org"}
+        self._last_network_detail = network
         image_probe = self._test_image_connection()
-        network = self.network_detail()
         network["image_host"] = "image.tmdb.org"
         network["image_probe"] = image_probe
+        self._last_network_detail = network
         return {
             "ok": True,
             "images": isinstance(payload.get("images"), dict),
@@ -361,7 +454,7 @@ class TmdbAdapter(MetadataAdapter):
         }
 
     def network_detail(self) -> dict[str, Any]:
-        return tmdb_network_detail(self.proxy_enabled, self.proxy_url, self.proxy_domains)
+        return dict(self._last_network_detail)
 
     def _test_image_connection(self) -> dict[str, Any]:
         payload = self._get("/trending/all/day", {"include_adult": "false"})
@@ -590,17 +683,12 @@ def resolve_tmdb_proxy_settings(config: dict[str, Any] | None = None) -> tuple[b
     else:
         enabled = str(settings.tmdb_mode or "direct").strip().lower() == "proxy"
 
-    raw_domains = config.get("proxy_domains") if "proxy_domains" in config else list(TMDB_PROXY_DOMAIN_ALLOWLIST)
-    if not isinstance(raw_domains, (list, tuple, set, frozenset)):
-        raw_domains = []
-    domains = frozenset(domain for domain in TMDB_PROXY_DOMAIN_ALLOWLIST if domain in raw_domains)
-    proxy_url = str(config.get("proxy_url") or settings.tmdb_proxy_url or "").strip()
+    domains = frozenset(TMDB_PROXY_DOMAIN_ALLOWLIST)
+    proxy_url = _tmdb_proxy_url_from_config(config, str(settings.tmdb_proxy_url or "").strip())
     if enabled:
         parsed = urlparse(proxy_url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise TmdbConfigError("代理地址必须是有效的 http:// 或 https:// 地址")
-        if not domains:
-            raise TmdbConfigError("启用代理时至少选择一个需要代理的网站")
+            raise TmdbConfigError("代理主机、端口或协议无效")
     return enabled, proxy_url, domains
 
 
@@ -619,14 +707,70 @@ def tmdb_network_detail(proxy_enabled: bool, proxy_url: str, proxy_domains: set[
     }
     active_proxy_domains = [domain for domain in TMDB_PROXY_DOMAIN_ALLOWLIST if routes[domain] == "proxy"]
     return {
-        "network_mode": "selective_proxy" if active_proxy_domains else "direct",
-        "route_label": "TMDB：精细代理" if active_proxy_domains else "TMDB：直连 + DoH",
+        "network_mode": "nas_proxy" if active_proxy_domains else "direct",
+        "route_label": "TMDB：NAS 代理" if active_proxy_domains else "TMDB：直连 + DoH",
         "proxy_enabled": bool(active_proxy_domains),
         "proxy_url": _display_proxy_url(proxy_url) if active_proxy_domains else "",
         "proxy_domains": active_proxy_domains,
         "domain_routes": routes,
         "non_tmdb_policy": "direct_only",
     }
+
+
+def _tmdb_proxy_url_from_config(config: dict[str, Any], environment_fallback: str = "") -> str:
+    has_structured_config = any(
+        key in config for key in ("proxy_scheme", "proxy_host", "proxy_port", "proxy_username", "proxy_password")
+    )
+    if not has_structured_config:
+        return str(config.get("proxy_url") or environment_fallback or "").strip()
+
+    scheme = str(config.get("proxy_scheme") or "http").strip().lower()
+    host = str(config.get("proxy_host") or TMDB_PROXY_DEFAULT_HOST).strip()
+    try:
+        port = int(config.get("proxy_port") or TMDB_PROXY_DEFAULT_PORT)
+    except (TypeError, ValueError) as exc:
+        raise TmdbConfigError("代理端口必须是 1 到 65535 之间的数字") from exc
+    if scheme not in {"http", "https"}:
+        raise TmdbConfigError("代理协议必须是 HTTP 或 HTTPS")
+    if not host or any(character in host for character in "/?#@ "):
+        raise TmdbConfigError("代理主机必须是有效的容器名称、域名或 IP 地址")
+    if not 1 <= port <= 65535:
+        raise TmdbConfigError("代理端口必须是 1 到 65535 之间的数字")
+    display_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    username = str(config.get("proxy_username") or "")
+    password = str(config.get("proxy_password") or "")
+    credentials = ""
+    if username:
+        credentials = quote(username, safe="")
+        if password:
+            credentials += f":{quote(password, safe='')}"
+        credentials += "@"
+    return f"{scheme}://{credentials}{display_host}:{port}"
+
+
+def _probe_proxy_endpoint(proxy_url: str, timeout: int) -> dict[str, Any]:
+    parsed = urlparse(proxy_url)
+    host = str(parsed.hostname or "")
+    port = int(parsed.port or (443 if parsed.scheme == "https" else TMDB_PROXY_DEFAULT_PORT))
+    detail = {
+        "endpoint": _display_proxy_url(proxy_url),
+        "dns_resolved": False,
+        "tcp_connected": False,
+    }
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise TmdbProxyError(f"无法解析代理主机 {host}", "proxy_dns_error", detail) from exc
+    if not addresses:
+        raise TmdbProxyError(f"代理主机 {host} 没有可用地址", "proxy_dns_error", detail)
+    detail["dns_resolved"] = True
+    try:
+        with socket.create_connection((host, port), timeout=max(2, min(timeout, 5))):
+            pass
+    except (OSError, TimeoutError) as exc:
+        raise TmdbProxyError(f"无法连接代理端口 {_display_proxy_url(proxy_url)}", "proxy_tcp_error", detail) from exc
+    detail["tcp_connected"] = True
+    return detail
 
 
 def _tmdb_image_url(size: str, image_path: Any, fallback: str) -> str:
@@ -661,7 +805,7 @@ def open_tmdb_network_request(
     request.tmdb_proxy_url = proxy_url
     request.tmdb_proxy_domains = frozenset(proxy_domains)
     request.tmdb_network_mode = "proxy" if use_proxy else "direct"
-    opener = _urlopen_with_proxy if use_proxy else _urlopen_with_doh_ipv4
+    opener = _urlopen_with_proxy_retry if use_proxy else _urlopen_with_doh_ipv4
     return opener(request, timeout=timeout)
 
 
@@ -687,6 +831,30 @@ def _urlopen_with_proxy(request: Request, timeout: int):
         _SameHostProxyRedirectHandler(original_host, allowed_domains),
     )
     return opener.open(request, timeout=timeout)
+
+
+def _urlopen_with_proxy_retry(request: Request, timeout: int):
+    delays = (0.0, 0.2, 0.5)
+    last_error: Exception | None = None
+    for attempt, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        try:
+            return _urlopen_with_proxy(request, timeout=timeout)
+        except HTTPError as exc:
+            if exc.code not in {502, 503, 504} or attempt == len(delays) - 1:
+                raise
+            exc.close()
+            last_error = exc
+        except (TimeoutError, OSError, URLError) as exc:
+            last_error = exc
+            if attempt == len(delays) - 1:
+                if "tunnel connection failed" in str(exc).lower():
+                    raise TmdbProxyError("Mihomo 无法建立到 TMDB 的代理隧道", "proxy_tunnel_error") from exc
+                raise
+    if last_error:
+        raise last_error
+    raise URLError("TMDB proxy request failed")
 
 
 class _SameHostProxyRedirectHandler(HTTPRedirectHandler):

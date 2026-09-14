@@ -24,6 +24,12 @@ docker compose up --build
 
 Open `http://localhost:8000`.
 
+## Windows 本地一键启动
+
+在项目根目录双击 `启动影视中枢.cmd`，脚本会在后台启动本地后端（8001）和前端（5173），等待健康检查通过后自动打开浏览器。双击 `关闭影视中枢.cmd` 可关闭由该脚本启动的前后端进程，不会按名称批量终止电脑上的其他 Python 或 Node 程序。
+
+首次运行时，如果缺少本地依赖，启动脚本会自动创建 `backend/.venv`、安装后端依赖并执行 `npm ci`。运行状态和启动日志保存在被 Git 忽略的 `.tmp-local-run` 目录。
+
 The app generates its runtime encryption/JWT secrets on first start and stores them in
 `data/runtime-secrets.json`. Keep the `data` folder when upgrading or recreating containers.
 Advanced users can still create `.env` from `.env.example` to override network/storage defaults.
@@ -32,23 +38,16 @@ Browser timestamps, request-time calendar labels, and AI replies use the viewer 
 
 ## Media Search Proxy
 
-The Settings > Media Search page can connect TMDB to an existing HTTP/HTTPS proxy such as Mihomo. Use `http://mihomo:7890` for a private unauthenticated Docker-only endpoint, or an authenticated URL such as `http://mediahub:PASSWORD@mihomo:7890` with the bundled example. Proxy routing is controlled by a fixed application allowlist:
+The Settings > Media Search page can route TMDB through an existing Mihomo container. Media Hub and Mihomo join the private external Docker network `media-hub-egress`; Mihomo receives the stable alias `tmdb-egress-proxy`. The UI stores protocol, host, port, optional username, and optional password as separate fields. Proxy routing is controlled by a fixed application allowlist:
 
 - `api.themoviedb.org`: search, discover, details, people, trends, and filters.
 - `image.tmdb.org`: posters, backdrops, profiles, and logos.
 
-Each domain can be enabled independently. Unselected domains connect directly with DoH + IPv4 fallback, even while the proxy switch is on.
+The proxy switch always routes both allowed domains together. When it is off, the existing DoH path is unchanged. When it is on, both domains must use Mihomo; failures are retried only through the proxy and never silently fall back to direct access.
 
 qBittorrent, M-Team, NAS storage checks, login, and all other app traffic are direct-only. Do not add global `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` variables to `pt-media-hub`.
 
-For unattended NAS/Compose deployment, `.env` can optionally provide fallback values:
-
-```bash
-TMDB_MODE=direct
-TMDB_PROXY_URL=http://mihomo:7890
-```
-
-Values saved in the Settings page take priority over `.env`; legacy `TMDB_MODE=proxy` enables both allowed TMDB domains. The default `docker-compose.yml` does not start Mihomo. Direct mode needs no proxy files, while proxy mode requires an existing proxy that the Media Hub container can reach. Domain choices are managed in the Media Hub UI and do not need to be duplicated in Media Hub's Compose YAML.
+The default `docker-compose.yml` does not start Mihomo. Use `docker-compose.tmdb-proxy.yml` only when connecting an existing Mihomo container. Full setup instructions, including the companion Mihomo network fragment, are in [docs/nas-mihomo-tmdb-proxy.md](docs/nas-mihomo-tmdb-proxy.md).
 
 ## Media Hub Agent
 
@@ -114,7 +113,7 @@ docker compose up -d --build
 
 ## Mihomo 连接
 
-Mihomo 不由本项目自动启动。先确认 Media Hub 容器能访问 Mihomo 的 HTTP 代理端口，再在“设置 > 媒体搜索 > 网络连接”中填写地址并保存测试。Mihomo 与 Media Hub 在同一 Compose 网络时可使用 `http://mihomo:7890`；Mihomo 暴露在 NAS 主机时可尝试 `http://host.docker.internal:7890`。只有界面勾选的 TMDB 域名会走代理，其余业务流量保持直连。
+Mihomo 不由本项目自动启动。已有 Mihomo 的用户先创建 `media-hub-egress` 外部 bridge 网络，让 Mihomo 以别名 `tmdb-egress-proxy` 加入，再用 `docker-compose.tmdb-proxy.yml` 部署 Media Hub。设置页默认填写主机 `tmdb-egress-proxy` 和端口 `7890`，点击“测试并启用”后会逐层验证容器名称解析、TCP 端口、认证、TMDB API 与图片 CDN。完整操作见 [NAS Mihomo 接入 TMDB](docs/nas-mihomo-tmdb-proxy.md)。
 
 
 ## Deployment Notes

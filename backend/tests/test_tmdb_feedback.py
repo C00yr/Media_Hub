@@ -10,7 +10,7 @@ from app.adapters.ai.client import DeepSeekChatAdapter
 from app.adapters.mteam.client import MTeamAdapter
 from app.adapters.qbittorrent.client import QbittorrentWebAdapter
 from app.adapters.tmdb import client as tmdb_client
-from app.adapters.tmdb.client import TmdbAdapter, TmdbConfigError, TmdbDohError, TmdbImageError, tmdb_request_uses_proxy
+from app.adapters.tmdb.client import TmdbAdapter, TmdbConfigError, TmdbDohError, TmdbImageError, TmdbProxyError, tmdb_request_uses_proxy
 from app.adapters.wechat_claw import WechatClawAdapter
 from app.api import routes
 from app.api.routes import classify_tmdb_gateway_test_error, classify_tmdb_test_error
@@ -83,7 +83,8 @@ def test_tmdb_gateway_feedback_is_removed_compatibility():
 def test_tmdb_gateway_payload_normalizes_to_direct():
     payload = normalize_payload("tmdb", {"mode": "gateway", "gateway_url": "https://example.workers.dev", "gateway_key": "secret", "bearer_token": "token"})
     assert payload["proxy_enabled"] is False
-    assert payload["proxy_domains"] == ["api.themoviedb.org", "image.tmdb.org"]
+    assert payload["proxy_host"] == "tmdb-egress-proxy"
+    assert payload["proxy_port"] == 7890
     assert "gateway_url" not in payload
     assert "gateway_key" not in payload
 
@@ -120,9 +121,14 @@ def test_tmdb_proxy_uses_proxy_opener(monkeypatch):
         return FakeResponse()
 
     monkeypatch.setattr(tmdb_client, "_urlopen_with_proxy", fake_proxy)
+    monkeypatch.setattr(
+        tmdb_client,
+        "_probe_proxy_endpoint",
+        lambda *_args: {"endpoint": "mihomo:7890", "dns_resolved": True, "tcp_connected": True},
+    )
     result = TmdbAdapter({"mode": "proxy", "bearer_token": "token", "proxy_url": "http://mihomo:7890"}).test_connection()
     assert calls and calls[0][0] == "http://mihomo:7890"
-    assert result["network"]["network_mode"] == "selective_proxy"
+    assert result["network"]["network_mode"] == "nas_proxy"
     assert result["network"]["domain_routes"] == {
         "api.themoviedb.org": "proxy",
         "image.tmdb.org": "proxy",
@@ -171,27 +177,58 @@ def test_tmdb_private_proxy_opener_has_a_second_policy_guard():
         tmdb_client._urlopen_with_proxy(request, timeout=12)
 
 
-def test_tmdb_proxy_payload_filters_unknown_domains_and_validates():
+def test_tmdb_proxy_payload_uses_structured_endpoint_and_fixed_allowlist():
     payload = normalize_payload("tmdb", {
         "bearer_token": "token",
         "proxy_enabled": True,
-        "proxy_url": "http://mihomo:7890",
-        "proxy_domains": ["image.tmdb.org", "example.com"],
+        "proxy_scheme": "http",
+        "proxy_host": "tmdb-egress-proxy",
+        "proxy_port": "7890",
+        "proxy_username": "media hub",
+        "proxy_password": "p@ss/word",
     })
-    assert payload["proxy_domains"] == ["image.tmdb.org"]
+    assert payload["proxy_host"] == "tmdb-egress-proxy"
+    assert payload["proxy_port"] == 7890
+    assert "proxy_url" not in payload
+    assert "proxy_domains" not in payload
 
-    with pytest.raises(ValueError, match="至少选择一个"):
-        normalize_payload("tmdb", {"proxy_enabled": True, "proxy_url": "http://mihomo:7890", "proxy_domains": []})
-    with pytest.raises(ValueError, match="http://"):
-        normalize_payload("tmdb", {"proxy_enabled": True, "proxy_url": "socks5://mihomo:7890", "proxy_domains": ["api.themoviedb.org"]})
-    with pytest.raises(ValueError, match="http://"):
-        normalize_payload("tmdb", {"proxy_enabled": True, "proxy_domains": ["api.themoviedb.org"]})
+    enabled, proxy_url, domains = tmdb_client.resolve_tmdb_proxy_settings(payload)
+    assert enabled is True
+    assert proxy_url == "http://media%20hub:p%40ss%2Fword@tmdb-egress-proxy:7890"
+    assert domains == {"api.themoviedb.org", "image.tmdb.org"}
+
+    with pytest.raises(ValueError, match="端口"):
+        normalize_payload("tmdb", {"proxy_enabled": True, "proxy_host": "tmdb-egress-proxy", "proxy_port": 70000})
+    with pytest.raises(ValueError, match="协议"):
+        normalize_payload("tmdb", {"proxy_enabled": True, "proxy_scheme": "socks5", "proxy_host": "mihomo"})
+    with pytest.raises(ValueError, match="代理主机"):
+        normalize_payload("tmdb", {"proxy_enabled": True, "proxy_host": "bad host"})
 
 
-def test_tmdb_legacy_proxy_mode_selects_both_domains():
-    payload = normalize_payload("tmdb", {"mode": "proxy", "proxy_url": "http://mihomo:7890", "bearer_token": "token"})
+def test_tmdb_legacy_proxy_url_migrates_to_structured_config():
+    payload = normalize_payload("tmdb", {"mode": "proxy", "proxy_url": "http://mediahub:p%40ss@mihomo:7891", "bearer_token": "token"})
     assert payload["proxy_enabled"] is True
-    assert payload["proxy_domains"] == ["api.themoviedb.org", "image.tmdb.org"]
+    assert payload["proxy_scheme"] == "http"
+    assert payload["proxy_host"] == "mihomo"
+    assert payload["proxy_port"] == 7891
+    assert payload["proxy_username"] == "mediahub"
+    assert payload["proxy_password"] == "p@ss"
+    assert "proxy_url" not in payload
+
+
+def test_tmdb_proxy_password_can_be_explicitly_cleared():
+    payload = normalize_payload(
+        "tmdb",
+        {
+            "proxy_enabled": True,
+            "proxy_host": "tmdb-egress-proxy",
+            "proxy_port": 7890,
+            "proxy_password": "",
+        },
+    )
+
+    assert "proxy_password" in payload
+    assert payload["proxy_password"] == ""
 
 
 def test_tmdb_environment_proxy_remains_a_fallback(monkeypatch):
@@ -217,7 +254,7 @@ def test_tmdb_proxy_address_has_no_implicit_default(monkeypatch):
     assert proxy_url == ""
     assert domains == {"api.themoviedb.org", "image.tmdb.org"}
 
-    with pytest.raises(TmdbConfigError, match="http://"):
+    with pytest.raises(TmdbConfigError, match="无效"):
         tmdb_client.resolve_tmdb_proxy_settings({"proxy_enabled": True, "proxy_domains": ["api.themoviedb.org"]})
 
 
@@ -232,6 +269,51 @@ def test_tmdb_proxy_blocks_cross_host_redirects():
             {},
             "https://image.tmdb.org/t/p/w92/poster.jpg",
         )
+
+
+def test_tmdb_proxy_retries_only_inside_proxy_route(monkeypatch):
+    calls = []
+
+    def flaky_proxy(request, timeout):
+        calls.append((request.full_url, timeout))
+        if len(calls) < 3:
+            raise URLError("temporary proxy failure")
+        return object()
+
+    monkeypatch.setattr(tmdb_client, "_urlopen_with_proxy", flaky_proxy)
+    monkeypatch.setattr(tmdb_client.time, "sleep", lambda _seconds: None)
+    result = tmdb_client.open_tmdb_network_request(
+        Request("https://api.themoviedb.org/3/configuration"),
+        True,
+        "http://tmdb-egress-proxy:7890",
+        frozenset({"api.themoviedb.org", "image.tmdb.org"}),
+        12,
+    )
+
+    assert result is not None
+    assert len(calls) == 3
+
+
+def test_tmdb_proxy_dns_failure_has_actionable_stage(monkeypatch):
+    monkeypatch.setattr(tmdb_client.socket, "getaddrinfo", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("missing")))
+
+    with pytest.raises(TmdbProxyError) as raised:
+        tmdb_client._probe_proxy_endpoint("http://tmdb-egress-proxy:7890", 12)
+
+    assert raised.value.error_type == "proxy_dns_error"
+    result = classify_tmdb_test_error(raised.value, "CFGTEST-PROXY-DNS")
+    assert result["error_type"] == "proxy_dns_error"
+    assert "Docker" in result["explanation"]
+
+
+def test_tmdb_proxy_auth_failure_is_not_reported_as_tmdb_credentials():
+    result = classify_tmdb_test_error(
+        HTTPError("https://api.themoviedb.org/3/configuration", 407, "Proxy Authentication Required", {}, None),
+        "CFGTEST-PROXY-AUTH",
+    )
+
+    assert result["error_type"] == "proxy_auth_error"
+    assert "代理认证" in result["message"]
 
 
 def test_tmdb_test_connection_reports_image_host_failure(monkeypatch):
@@ -556,6 +638,48 @@ def test_tmdb_enable_requires_successful_connection_test():
 
     enabled = client.post("/api/admin/integrations/tmdb/enable", headers=auth_headers(token))
     assert enabled.status_code == 409
+
+
+def test_tmdb_successful_test_enables_configuration_atomically(monkeypatch):
+    token = admin_token()
+
+    class SuccessfulTmdbAdapter:
+        def __init__(self, _config):
+            pass
+
+        def test_connection(self):
+            return {
+                "network": {
+                    "network_mode": "nas_proxy",
+                    "proxy_enabled": True,
+                    "domain_routes": {
+                        "api.themoviedb.org": "proxy",
+                        "image.tmdb.org": "proxy",
+                    },
+                }
+            }
+
+        def network_detail(self):
+            return {}
+
+    monkeypatch.setattr(routes, "TmdbAdapter", SuccessfulTmdbAdapter)
+    tested = client.post(
+        "/api/admin/integrations/tmdb/test",
+        headers=auth_headers(token),
+        json={
+            "payload": {
+                "bearer_token": "token",
+                "proxy_enabled": True,
+                "proxy_scheme": "http",
+                "proxy_host": "tmdb-egress-proxy",
+                "proxy_port": 7890,
+            }
+        },
+    )
+
+    assert tested.status_code == 200
+    assert tested.json()["enabled"] is True
+    assert tested.json()["last_test_result"]["success"] is True
 
 
 @pytest.mark.parametrize(

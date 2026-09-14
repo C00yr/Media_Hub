@@ -14,8 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf 
 COPY backend/pyproject.toml /app/backend/pyproject.toml
 RUN pip install --no-cache-dir /app/backend
 COPY backend /app/backend
+COPY docs /app/docs
 COPY --from=frontend /src/frontend/dist /app/static
 RUN mkdir -p /data
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--app-dir", "/app/backend"]
-

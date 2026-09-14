@@ -1,0 +1,15 @@
+# Merge this file with the Compose file that already runs Mihomo.
+# The service key below must match the Mihomo service key in that file.
+services:
+  mihomo:
+    networks:
+      default:
+      media-hub-egress:
+        aliases:
+          - tmdb-egress-proxy
+
+networks:
+  default: {}
+  media-hub-egress:
+    external: true
+    name: ${MEDIA_HUB_EGRESS_NETWORK:-media-hub-egress}

@@ -8,7 +8,7 @@ Check `/api/setup/status`. If it returns `{"initialized": true}`, at least one u
 
 Saving only stores a draft. Use “保存并测试”, confirm the connection test succeeds, and then enable the module. The diagnostics page performs a fresh check and shows the current failure reason. Verify the service address from inside the Media Hub container; a NAS browser being able to open an address does not prove the container can reach it.
 
-For TMDB through Mihomo, verify the HTTP proxy port and use a hostname reachable from the container, such as `mihomo` on the same Docker network or `host.docker.internal` for a host-published port.
+For TMDB through Mihomo, verify that both containers joined the external `media-hub-egress` network, Mihomo has the alias `tmdb-egress-proxy`, and the configured port matches its HTTP/Mixed proxy port. See `docs/nas-mihomo-tmdb-proxy.md` for the full procedure.
 
 ## qB 2 Is Locked
 
@@ -21,4 +21,3 @@ Use Debug -> Export safe JSON. The export must not contain API keys, cookies, pa
 ## Key Rotation
 
 `APP_CONFIG_ENCRYPTION_KEY` encrypts service credentials. Rotating it requires decrypting existing rows with the old key and re-encrypting with the new key. Do not change it casually on a live deployment.
-

@@ -79,9 +79,16 @@ How you work:
 - You are not constrained by a fixed intent taxonomy. TMDB, M-Team, dashboard, qB and download flows are optional tools.
 - Treat runtime_context as the only authoritative clock. Resolve now, today, weekdays, and relative dates from its current_time, current_date, timezone, and utc_offset. Never infer time or timezone from the model provider, server region, language, or training defaults.
 - Use recent conversation and recent_results to resolve references such as "the fourth one", "the second resource", "it", or "that movie". Call a detail tool when complete or current data is needed.
+- In this Agent context, 馒头、馒头站点、M-Team and PT站 refer to M-Team unless the user explicitly marks one as a work title such as 电影《馒头》.
+- A bare title search normally uses TMDB. Requests mentioning resources, torrents, versions, promotions, size, seeders, M-Team/PT站/馒头, or downloading use M-Team. Requests combining work qualities with resource constraints use find_media_with_mteam.
+- Treat numbered references as references to the most recent visible list; never reinterpret “第一部/第二部/第一步” as a literal title when that list exists.
 - Claim current TMDB, M-Team, qB, NAS or app data only when an observation from that tool exists. Never invent missing data.
+- tool_obligations are backend requirements, not suggestions. If any capability is still pending, call a matching tool instead of returning a conversational final answer.
+- User constraints are hard filters unless the user explicitly says “优先”“更好” or equivalent. Never fill a requested count with mismatches. Respect an explicit requested count from 1 to 10.
 - Downloads have side effects. Call confirm_mteam_download only when the current user message explicitly confirms; otherwise use prepare_mteam_download.
-- Final replies must be natural, warm, concise Simplified Chinese. Do not sound like a form or use Markdown tables.
+- Promotion means M-Team accounting, not a coupon the Agent applies: 普通=1.0, 30%=0.3, 50%=0.5, 免费=0 download accounting; upload is always 1.0. M-Team currently has no HR resources.
+- Tool observations are rendered by deterministic backend templates. After enough evidence exists, return a brief final decision; do not restyle, reinterpret, or invent a tool result.
+- Final replies for pure conversation must be natural, warm, concise Simplified Chinese.
 
 Absolute privacy rules:
 - Never request, repeat, infer, or disclose API keys, cookies, tokens, credentials, Authorization values, webhook secrets, internal paths, or IP addresses.
@@ -203,6 +210,7 @@ class DeepSeekChatAdapter:
         observations: list[dict[str, Any]] | None = None,
         tools: list[dict[str, Any]] | None = None,
         runtime_context: dict[str, Any] | None = None,
+        tool_obligations: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Let the model autonomously choose the next tool or compose the final reply."""
         user_message = redact_ai_user_text(user_text).strip()
@@ -218,6 +226,7 @@ class DeepSeekChatAdapter:
             "observations": observations or [],
             "available_tools": tools or [],
             "runtime_context": runtime_context or {},
+            "tool_obligations": tool_obligations or [],
         }
         content = self._chat(
             [
@@ -248,6 +257,102 @@ class DeepSeekChatAdapter:
                 "reason": str(decision.get("reason") or "").strip()[:240],
             }
         raise AIServiceError("AI agent returned an unsupported decision")
+
+    def extract_media_clues(self, user_text: str, history: list[dict[str, str]] | None = None) -> dict[str, Any]:
+        """Extract search clues only. The output is never treated as a factual answer."""
+        content = self._chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Extract clues for identifying one movie or TV work. Do not answer the identity. "
+                        "Return strict JSON: {\"people\":[],\"director\":\"\",\"year\":\"\","
+                        "\"media_type\":\"movie|tv|all\",\"title_hypotheses\":[],"
+                        "\"plot_keywords\":[],\"wants_details\":false,\"wants_resources\":false}. "
+                        "people contains only person names explicitly supplied by the user. "
+                        "Set wants_details/resources only when explicitly requested."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "message": redact_ai_user_text(user_text),
+                            "recent_conversation": [
+                                {
+                                    "role": str(item.get("role") or ""),
+                                    "content": redact_ai_user_text(item.get("content")),
+                                }
+                                for item in (history or [])[-6:]
+                                if isinstance(item, dict)
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            json_mode=True,
+            max_tokens=700,
+        )
+        payload = _json_loads(content)
+        if not isinstance(payload, dict):
+            raise AIServiceError("AI clue extraction did not return an object")
+        return {
+            "people": [str(value).strip()[:80] for value in payload.get("people") or [] if str(value).strip()][:6],
+            "director": str(payload.get("director") or "").strip()[:80],
+            "year": str(payload.get("year") or "").strip()[:12],
+            "media_type": str(payload.get("media_type") or "all").strip().lower(),
+            "title_hypotheses": [
+                str(value).strip()[:160] for value in payload.get("title_hypotheses") or [] if str(value).strip()
+            ][:5],
+            "plot_keywords": [
+                str(value).strip()[:80] for value in payload.get("plot_keywords") or [] if str(value).strip()
+            ][:8],
+            "wants_details": bool(payload.get("wants_details")),
+            "wants_resources": bool(payload.get("wants_resources")),
+        }
+
+    def guess_media_from_memory(self, user_text: str, history: list[dict[str, str]] | None = None) -> dict[str, Any]:
+        """Produce a title hypothesis for later TMDB verification, never factual details."""
+        content = self._chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Suggest at most one likely movie or TV title from memory. This is only a search hypothesis. "
+                        "Return strict JSON: {\"title\":\"\",\"year\":\"\",\"reason\":\"\"}. "
+                        "Leave title empty when there is no useful guess."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "message": redact_ai_user_text(user_text),
+                            "recent_conversation": [
+                                {
+                                    "role": str(item.get("role") or ""),
+                                    "content": redact_ai_user_text(item.get("content")),
+                                }
+                                for item in (history or [])[-6:]
+                                if isinstance(item, dict)
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            json_mode=True,
+            max_tokens=400,
+        )
+        payload = _json_loads(content)
+        if not isinstance(payload, dict):
+            raise AIServiceError("AI memory hypothesis did not return an object")
+        return {
+            "title": str(payload.get("title") or "").strip()[:160],
+            "year": str(payload.get("year") or "").strip()[:12],
+            "reason": str(payload.get("reason") or "").strip()[:240],
+        }
 
 
     def describe_mteam_presentation(self, query: str, items: list[dict[str, Any]], recommended_index: int | None) -> dict[str, Any]:

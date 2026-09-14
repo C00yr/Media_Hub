@@ -7,6 +7,24 @@ def qb_adapter() -> QbittorrentWebAdapter:
     return QbittorrentWebAdapter({"base_url": "http://qb.local:8080", "username": "user", "password": "password"})
 
 
+def test_torrents_are_sorted_by_added_time_newest_first(monkeypatch):
+    adapter = qb_adapter()
+    monkeypatch.setattr(
+        adapter,
+        "_json_request",
+        lambda *_args, **_kwargs: [
+            {"hash": "older", "added_on": 100},
+            {"hash": "missing", "added_on": 0},
+            {"hash": "newest", "added_on": 300},
+            {"hash": "newer", "added_on": 200},
+        ],
+    )
+
+    torrents = adapter.get_torrents("qb1")
+
+    assert [item["hash"] for item in torrents] == ["newest", "newer", "older", "missing"]
+
+
 def test_pause_falls_back_to_qb5_stop_and_verifies_state(monkeypatch):
     adapter = qb_adapter()
     commands: list[str] = []
